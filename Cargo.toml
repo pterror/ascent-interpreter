@@ -32,3 +32,6 @@ ascent-syntax.workspace = true
 ascent-ir.workspace = true
 ascent-eval.workspace = true
 syn.workspace = true
+
+[dev-dependencies]
+ascent = "0.8"

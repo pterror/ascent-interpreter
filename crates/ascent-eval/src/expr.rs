@@ -39,6 +39,11 @@ pub fn eval_expr(expr: &Expr, bindings: &Bindings) -> Option<Value> {
         Expr::Cast(cast) => eval_cast(cast, bindings),
         Expr::If(if_expr) => eval_if(if_expr, bindings),
         Expr::Block(block) => eval_block(block, bindings),
+        Expr::Array(arr) => {
+            let values: Option<Vec<Value>> =
+                arr.elems.iter().map(|e| eval_expr(e, bindings)).collect();
+            values.map(Value::tuple)
+        }
         _ => None,
     }
 }
@@ -257,6 +262,8 @@ pub fn expand_range(range: &Value) -> Option<Vec<Value>> {
             };
             Some(values)
         }
+        // Array/tuple literals expand to their elements
+        Value::Tuple(elements) => Some(elements.as_ref().clone()),
         _ => None,
     }
 }
