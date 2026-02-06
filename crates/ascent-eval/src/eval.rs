@@ -130,29 +130,64 @@ impl Engine {
     }
 
     /// Derive all tuples from a rule.
+    ///
+    /// In semi-naive mode, for each clause position that has recent tuples,
+    /// evaluate the rule with that clause using recent and all others using full.
+    /// This ensures we discover all new derivations regardless of which clause
+    /// received new data.
     fn derive_tuples(&self, rule: &Rule, use_recent: bool) -> Vec<(String, Tuple)> {
         let mut results = Vec::new();
 
-        let initial_bindings = vec![Bindings::new()];
-        let final_bindings = self.process_body(&rule.body, initial_bindings, use_recent);
+        if !use_recent {
+            // Initial iteration: all clauses use full
+            let final_bindings = self.process_body(&rule.body, vec![Bindings::new()], None);
+            self.collect_head_tuples(rule, &final_bindings, &mut results);
+            return results;
+        }
 
-        for bindings in final_bindings {
-            for head in &rule.heads {
-                if let Some(tuple) = self.eval_head_tuple(head, &bindings) {
-                    results.push((head.relation.clone(), tuple));
-                }
+        // Semi-naive: try each clause position with recent data
+        for (idx, item) in rule.body.iter().enumerate() {
+            let rel_name = match item {
+                BodyItem::Clause(c) => &c.relation,
+                _ => continue,
+            };
+            if let Some(rel) = self.relations.get(rel_name)
+                && rel.iter_recent().next().is_some()
+            {
+                let final_bindings =
+                    self.process_body(&rule.body, vec![Bindings::new()], Some(idx));
+                self.collect_head_tuples(rule, &final_bindings, &mut results);
             }
         }
 
         results
     }
 
+    /// Collect head tuples from a set of bindings.
+    fn collect_head_tuples(
+        &self,
+        rule: &Rule,
+        bindings: &[Bindings],
+        results: &mut Vec<(String, Tuple)>,
+    ) {
+        for binding in bindings {
+            for head in &rule.heads {
+                if let Some(tuple) = self.eval_head_tuple(head, binding) {
+                    results.push((head.relation.clone(), tuple));
+                }
+            }
+        }
+    }
+
     /// Process body items, producing all valid bindings.
+    ///
+    /// `recent_clause_idx`: if Some(i), clause at position i uses recent tuples,
+    /// all other clauses use full. If None, all use full (initial iteration).
     fn process_body(
         &self,
         body: &[BodyItem],
         bindings: Vec<Bindings>,
-        use_recent: bool,
+        recent_clause_idx: Option<usize>,
     ) -> Vec<Bindings> {
         let mut current = bindings;
 
@@ -163,8 +198,8 @@ impl Engine {
 
             current = match item {
                 BodyItem::Clause(clause) => {
-                    let use_recent_for_this = use_recent && i == 0;
-                    self.process_clause(clause, current, use_recent_for_this)
+                    let use_recent = recent_clause_idx == Some(i);
+                    self.process_clause(clause, current, use_recent)
                 }
                 BodyItem::Generator(generator) => self.process_generator(generator, current),
                 BodyItem::Condition(cond) => self.process_condition(cond, current),
