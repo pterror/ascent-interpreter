@@ -211,7 +211,7 @@ impl Engine {
         current
     }
 
-    /// Process a clause against the relation.
+    /// Process a clause against the relation using index lookups when possible.
     fn process_clause(
         &self,
         clause: &Clause,
@@ -224,23 +224,65 @@ impl Engine {
 
         let mut results = Vec::new();
 
-        let tuples: Vec<_> = if use_recent {
-            rel.iter_recent().collect()
-        } else {
-            rel.iter_full().collect()
-        };
+        for binding in &bindings {
+            // Find the best column to index on: a bound variable or evaluable expression
+            let index_col = self.find_index_column(clause, binding);
 
-        for binding in bindings {
-            for tuple in &tuples {
-                if let Some(new_binding) = self.match_clause(clause, tuple, binding.clone())
-                    && let Some(final_binding) = self.check_clause_conditions(clause, new_binding)
-                {
-                    results.push(final_binding);
+            if let Some((col, value)) = index_col {
+                // Use index lookup: only check matching tuples
+                let indices = rel.lookup(col, &value);
+                for &idx in indices {
+                    if use_recent && !rel.is_recent(idx) {
+                        continue;
+                    }
+                    let tuple = rel.get(idx);
+                    if let Some(new_binding) = self.match_clause(clause, tuple, binding.clone())
+                        && let Some(final_binding) =
+                            self.check_clause_conditions(clause, new_binding)
+                    {
+                        results.push(final_binding);
+                    }
+                }
+            } else {
+                // No bound columns: full scan
+                let iter: Box<dyn Iterator<Item = &Tuple>> = if use_recent {
+                    Box::new(rel.iter_recent())
+                } else {
+                    Box::new(rel.iter_full())
+                };
+                for tuple in iter {
+                    if let Some(new_binding) = self.match_clause(clause, tuple, binding.clone())
+                        && let Some(final_binding) =
+                            self.check_clause_conditions(clause, new_binding)
+                    {
+                        results.push(final_binding);
+                    }
                 }
             }
         }
 
         results
+    }
+
+    /// Find the best column to use for index lookup.
+    ///
+    /// Returns Some((column_index, value)) if a clause arg is already bound.
+    fn find_index_column(&self, clause: &Clause, binding: &Bindings) -> Option<(usize, Value)> {
+        for (col, arg) in clause.args.iter().enumerate() {
+            match arg {
+                ClauseArg::Var(var) => {
+                    if let Some(val) = binding.get(var) {
+                        return Some((col, val.clone()));
+                    }
+                }
+                ClauseArg::Expr(expr) => {
+                    if let Some(val) = eval_expr(expr, binding) {
+                        return Some((col, val));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Try to match a clause against a tuple, extending bindings.
