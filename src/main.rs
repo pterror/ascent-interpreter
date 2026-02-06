@@ -117,13 +117,25 @@ fn repl() {
                         dump_all(&engine, &program);
                     }
                 }
-                ":query" => {
+                ":query" | ":q" => {
                     if arg.is_empty() {
-                        eprintln!("usage: :query <relation>");
+                        eprintln!("usage: :query <relation> or :query rel(pattern, ...)");
                     } else if source.is_empty() {
                         eprintln!("(no program)");
                     } else if let Ok((engine, _)) = eval_source(&source) {
                         query_relation(&engine, arg);
+                    }
+                }
+                ":count" => {
+                    if arg.is_empty() {
+                        eprintln!("usage: :count <relation>");
+                    } else if source.is_empty() {
+                        eprintln!("(no program)");
+                    } else if let Ok((engine, _)) = eval_source(&source) {
+                        match engine.relation(arg) {
+                            Some(rel) => eprintln!("  {arg}: {}", rel.len()),
+                            None => eprintln!("  unknown relation: {arg}"),
+                        }
                     }
                 }
                 ":relations" | ":rels" => {
@@ -166,13 +178,15 @@ fn repl() {
 
 fn print_help() {
     eprintln!("Commands:");
-    eprintln!("  :help       Show this help");
-    eprintln!("  :relations  List all relations and their sizes");
-    eprintln!("  :query <r>  Show contents of relation r");
-    eprintln!("  :dump       Show all non-empty relations");
-    eprintln!("  :source     Show accumulated program source");
-    eprintln!("  :clear      Clear program and start over");
-    eprintln!("  :quit       Exit the REPL");
+    eprintln!("  :help             Show this help");
+    eprintln!("  :relations        List all relations and their sizes");
+    eprintln!("  :query <rel>      Show all tuples in a relation");
+    eprintln!("  :query rel(1, _)  Filter tuples by pattern (_, int, \"str\", bool)");
+    eprintln!("  :count <rel>      Show number of tuples in a relation");
+    eprintln!("  :dump             Show all non-empty relations");
+    eprintln!("  :source           Show accumulated program source");
+    eprintln!("  :clear            Clear program and start over");
+    eprintln!("  :quit             Exit the REPL");
     eprintln!();
     eprintln!("Enter Ascent statements (relations, rules, facts) ending with ';'.");
     eprintln!("Multi-line input continues until ';'. Empty line cancels.");
@@ -217,11 +231,104 @@ fn list_relations(engine: &Engine, program: &Program) {
     }
 }
 
-fn query_relation(engine: &Engine, name: &str) {
+fn query_relation(engine: &Engine, input: &str) {
+    let (name, pattern) = parse_query(input);
+
     match engine.relation(name) {
         Some(rel) if rel.is_empty() => eprintln!("  (empty)"),
-        Some(rel) => print_tuples(name, rel),
+        Some(rel) => {
+            if let Some(ref pats) = pattern {
+                print_filtered(name, rel, pats);
+            } else {
+                print_tuples(name, rel);
+            }
+        }
         None => eprintln!("  unknown relation: {name}"),
+    }
+}
+
+/// Parse a query like `path` or `path(1, _)` into (name, optional patterns).
+fn parse_query(input: &str) -> (&str, Option<Vec<QueryPat>>) {
+    if let Some(paren) = input.find('(') {
+        let name = input[..paren].trim();
+        let rest = input[paren + 1..].trim();
+        let rest = rest.strip_suffix(')').unwrap_or(rest);
+        let pats = rest.split(',').map(|s| parse_query_pat(s.trim())).collect();
+        (name, Some(pats))
+    } else {
+        (input.trim(), None)
+    }
+}
+
+#[derive(Debug)]
+enum QueryPat {
+    Wild,
+    Int(i32),
+    Str(String),
+    Bool(bool),
+}
+
+fn parse_query_pat(s: &str) -> QueryPat {
+    if s == "_" {
+        return QueryPat::Wild;
+    }
+    if s == "true" {
+        return QueryPat::Bool(true);
+    }
+    if s == "false" {
+        return QueryPat::Bool(false);
+    }
+    if let Ok(n) = s.parse::<i32>() {
+        return QueryPat::Int(n);
+    }
+    // Strip quotes for string literals
+    if let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return QueryPat::Str(inner.to_string());
+    }
+    QueryPat::Str(s.to_string())
+}
+
+fn matches_pattern(value: &Value, pat: &QueryPat) -> bool {
+    match pat {
+        QueryPat::Wild => true,
+        QueryPat::Int(n) => value.as_i64().is_some_and(|v| v == *n as i64),
+        QueryPat::Str(s) => matches!(value, Value::String(vs) if vs.as_ref() == s),
+        QueryPat::Bool(b) => matches!(value, Value::Bool(vb) if vb == b),
+    }
+}
+
+fn print_filtered(name: &str, rel: &RelationStorage, pats: &[QueryPat]) {
+    let mut tuples: Vec<&Vec<Value>> = rel
+        .iter()
+        .filter(|tuple| {
+            tuple.len() >= pats.len()
+                && tuple
+                    .iter()
+                    .zip(pats.iter())
+                    .all(|(v, p)| matches_pattern(v, p))
+        })
+        .collect();
+    tuples.sort_by(|a, b| cmp_tuples(a, b));
+
+    if tuples.is_empty() {
+        eprintln!("  (no matches)");
+        return;
+    }
+
+    println!(
+        "{name} ({} match{}):",
+        tuples.len(),
+        if tuples.len() == 1 { "" } else { "es" }
+    );
+    for tuple in tuples {
+        print!("  (");
+        for (i, val) in tuple.iter().enumerate() {
+            if i > 0 {
+                print!(", ");
+            }
+            print!("{val:?}");
+        }
+        println!(")");
     }
 }
 

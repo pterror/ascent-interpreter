@@ -23,7 +23,7 @@
 - [x] REPL for interactive Datalog queries
 - [x] File-based program execution
 - [ ] Incremental evaluation (add/retract facts)
-- [ ] Query interface (ask questions about computed relations)
+- [x] Query interface (:query rel(pattern, ...) with wildcards, int/string/bool filters)
 
 ## JIT (Future)
 
