@@ -33,7 +33,7 @@
 
 ## Testing
 
-- [ ] Port ascent test suite
+- [x] Port ascent test suite (24 compat tests: fizzbuzz, factorial, negation, aggregation, joins, etc.)
 - [ ] Comparison tests: run same program in ascent macro vs interpreter, compare results
 - [ ] Performance benchmarks (transitive closure, graph algorithms)
 
