@@ -609,3 +609,41 @@ fn compare_rule_chaining() {
     assert_eq!(interp1(&engine, "step2"), set1(prog.step2), "step2");
     assert_eq!(interp1(&engine, "step3"), set1(prog.step3), "step3");
 }
+
+// ─── Cascading Aggregation ──────────────────────────────────────────
+
+#[test]
+fn compare_cascading_aggregation() {
+    let engine = run("
+        relation score(i32, i32);
+        relation best(i32, i32);
+        relation overall_best(i32);
+
+        score(1, 10); score(1, 20);
+        score(2, 30); score(2, 15);
+
+        best(player, m) <-- score(player, _), agg m = max(s) in score(player, s);
+        overall_best(m) <-- agg m = max(s) in best(_, s);
+    ");
+
+    ascent! {
+        relation score(i32, i32);
+        relation best(i32, i32);
+        relation overall_best(i32);
+
+        score(1, 10); score(1, 20);
+        score(2, 30); score(2, 15);
+
+        best(player, m) <-- score(player, _), agg m = max(s) in score(player, s);
+        overall_best(m) <-- agg m = max(s) in best(_, s);
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(interp2(&engine, "best"), set2(prog.best), "best");
+    assert_eq!(
+        interp1(&engine, "overall_best"),
+        set1(prog.overall_best),
+        "overall_best"
+    );
+}

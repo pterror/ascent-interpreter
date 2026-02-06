@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 
 use ascent_ir::{Aggregation, BodyItem, Clause, ClauseArg, Condition, Program, Rule};
+use petgraph::algo::{condensation, toposort};
+use petgraph::graph::DiGraph;
 
 use crate::aggregators::apply_aggregator;
 use crate::expr::{eval_expr, expand_range};
@@ -51,17 +53,16 @@ impl Engine {
         }
     }
 
-    /// Run the program to fixpoint using semi-naive evaluation with stratification.
+    /// Run the program to fixpoint using semi-naive evaluation with SCC-based stratification.
     ///
-    /// Rules are partitioned into strata: non-aggregation rules first, then
-    /// aggregation rules. Each stratum runs to fixpoint before the next begins.
-    /// This ensures aggregation sees complete input relations.
+    /// Rules are grouped into strongly connected components and processed in
+    /// topological order. Each SCC runs to fixpoint before dependent SCCs begin.
     pub fn run(&mut self, program: &Program) {
-        let (base_rules, agg_rules): (Vec<_>, Vec<_>) =
-            program.rules.iter().partition(|r| !rule_has_aggregation(r));
-
-        self.run_stratum(&base_rules);
-        self.run_stratum(&agg_rules);
+        let sccs = compute_rule_sccs(program);
+        for scc_indices in &sccs {
+            let rules: Vec<&Rule> = scc_indices.iter().map(|&i| &program.rules[i]).collect();
+            self.run_stratum(&rules);
+        }
     }
 
     /// Run a set of rules to fixpoint.
@@ -449,11 +450,52 @@ impl Engine {
     }
 }
 
-/// Check if a rule contains any aggregation body items.
-fn rule_has_aggregation(rule: &Rule) -> bool {
-    rule.body
-        .iter()
-        .any(|item| matches!(item, BodyItem::Aggregation(_)))
+/// Compute strongly connected components of the rule dependency graph.
+///
+/// Returns rule indices grouped by SCC, in topological order (dependencies first).
+fn compute_rule_sccs(program: &Program) -> Vec<Vec<usize>> {
+    let n = program.rules.len();
+    if n == 0 {
+        return vec![];
+    }
+
+    // Map: relation_name → rule indices that produce it (appear in head)
+    let mut producers: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, rule) in program.rules.iter().enumerate() {
+        for head in &rule.heads {
+            producers.entry(&head.relation).or_default().push(i);
+        }
+    }
+
+    // Build directed graph: edge from producer → consumer
+    let mut graph = DiGraph::<usize, ()>::new();
+    let nodes: Vec<_> = (0..n).map(|i| graph.add_node(i)).collect();
+
+    for (consumer_idx, rule) in program.rules.iter().enumerate() {
+        for item in &rule.body {
+            let rel_name = match item {
+                BodyItem::Clause(c) => Some(c.relation.as_str()),
+                BodyItem::Aggregation(a) => Some(a.relation.as_str()),
+                _ => None,
+            };
+            if let Some(rel) = rel_name
+                && let Some(prod_indices) = producers.get(rel)
+            {
+                for &prod_idx in prod_indices {
+                    graph.add_edge(nodes[prod_idx], nodes[consumer_idx], ());
+                }
+            }
+        }
+    }
+
+    // Condensation: collapse SCCs into single nodes in a DAG
+    let condensed = condensation(graph, true);
+
+    // Topological sort of the condensation DAG
+    let order = toposort(&condensed, None).expect("condensation is always a DAG");
+
+    // Extract rule indices for each SCC in topological order
+    order.iter().map(|&idx| condensed[idx].clone()).collect()
 }
 
 /// Match a pattern against a value, extending bindings on success.
@@ -943,5 +985,171 @@ mod tests {
         assert!(unreachable.contains(&vec![Value::I32(4)]));
         assert!(unreachable.contains(&vec![Value::I32(1)]));
         assert_eq!(unreachable.len(), 2);
+    }
+
+    // ─── SCC stratification tests ────────────────────────────────────
+
+    #[test]
+    fn test_scc_multi_stratum_chain() {
+        // Three strata: base facts → recursive path → aggregation on path
+        let engine = run_program(
+            r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            relation path_count(i32);
+            relation max_dest(i32, i32);
+
+            edge(1, 2);
+            edge(2, 3);
+            edge(3, 4);
+
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- edge(x, y), path(y, z);
+
+            path_count(c) <-- agg c = count() in path(_, _);
+            max_dest(src, m) <-- path(src, _), agg m = max(d) in path(src, d);
+        "#,
+        );
+
+        // 6 paths: (1,2),(1,3),(1,4),(2,3),(2,4),(3,4)
+        assert_eq!(engine.relation("path").unwrap().len(), 6);
+        assert!(
+            engine
+                .relation("path_count")
+                .unwrap()
+                .contains(&vec![Value::I32(6)])
+        );
+        // max_dest: 1→4, 2→4, 3→4
+        let max_dest = engine.relation("max_dest").unwrap();
+        assert!(max_dest.contains(&vec![Value::I32(1), Value::I32(4)]));
+        assert!(max_dest.contains(&vec![Value::I32(2), Value::I32(4)]));
+        assert!(max_dest.contains(&vec![Value::I32(3), Value::I32(4)]));
+        assert_eq!(max_dest.len(), 3);
+    }
+
+    #[test]
+    fn test_scc_independent_sccs() {
+        // Two independent recursive computations that don't depend on each other
+        let engine = run_program(
+            r#"
+            relation a_edge(i32, i32);
+            relation a_path(i32, i32);
+            relation b_edge(i32, i32);
+            relation b_path(i32, i32);
+
+            a_edge(1, 2);
+            a_edge(2, 3);
+            a_path(x, y) <-- a_edge(x, y);
+            a_path(x, z) <-- a_edge(x, y), a_path(y, z);
+
+            b_edge(10, 20);
+            b_edge(20, 30);
+            b_edge(30, 40);
+            b_path(x, y) <-- b_edge(x, y);
+            b_path(x, z) <-- b_edge(x, y), b_path(y, z);
+        "#,
+        );
+
+        // a_path: (1,2),(1,3),(2,3)
+        assert_eq!(engine.relation("a_path").unwrap().len(), 3);
+        // b_path: (10,20),(10,30),(10,40),(20,30),(20,40),(30,40)
+        assert_eq!(engine.relation("b_path").unwrap().len(), 6);
+    }
+
+    #[test]
+    fn test_scc_aggregation_feeds_downstream() {
+        // Aggregation result used by a subsequent non-aggregation rule
+        let engine = run_program(
+            r#"
+            relation score(i32, i32);
+            relation total(i32);
+            relation is_high(i32);
+
+            score(1, 10);
+            score(2, 20);
+            score(3, 30);
+
+            total(s) <-- agg s = sum(x) in score(_, x);
+            is_high(t) <-- total(t), if *t > 50;
+        "#,
+        );
+
+        assert!(
+            engine
+                .relation("total")
+                .unwrap()
+                .contains(&vec![Value::I32(60)])
+        );
+        // 60 > 50, so is_high should have (60)
+        assert!(
+            engine
+                .relation("is_high")
+                .unwrap()
+                .contains(&vec![Value::I32(60)])
+        );
+    }
+
+    #[test]
+    fn test_scc_cascading_aggregations() {
+        // Multiple layers of aggregation: data → grouped agg → global agg
+        let engine = run_program(
+            r#"
+            relation score(i32, i32);
+            relation best(i32, i32);
+            relation overall_best(i32);
+
+            score(1, 10);
+            score(1, 20);
+            score(2, 30);
+            score(2, 15);
+
+            best(player, m) <-- score(player, _), agg m = max(s) in score(player, s);
+            overall_best(m) <-- agg m = max(s) in best(_, s);
+        "#,
+        );
+
+        let best = engine.relation("best").unwrap();
+        assert!(best.contains(&vec![Value::I32(1), Value::I32(20)]));
+        assert!(best.contains(&vec![Value::I32(2), Value::I32(30)]));
+        assert_eq!(best.len(), 2);
+
+        // overall_best: max(20, 30) = 30
+        assert!(
+            engine
+                .relation("overall_best")
+                .unwrap()
+                .contains(&vec![Value::I32(30)])
+        );
+    }
+
+    #[test]
+    fn test_scc_negation_after_recursion() {
+        // Negation (desugared to aggregation) depends on recursive relation
+        let engine = run_program(
+            r#"
+            relation edge(i32, i32);
+            relation node(i32);
+            relation reach(i32, i32);
+            relation isolated(i32);
+
+            node(1); node(2); node(3); node(4); node(5);
+            edge(1, 2); edge(2, 3);
+
+            reach(x, y) <-- edge(x, y);
+            reach(x, z) <-- edge(x, y), reach(y, z);
+
+            isolated(x) <-- node(x), !reach(x, _), !reach(_, x);
+        "#,
+        );
+
+        let reach = engine.relation("reach").unwrap();
+        // reach: (1,2),(1,3),(2,3)
+        assert_eq!(reach.len(), 3);
+
+        let isolated = engine.relation("isolated").unwrap();
+        // Nodes 4 and 5 have no edges at all
+        assert!(isolated.contains(&vec![Value::I32(4)]));
+        assert!(isolated.contains(&vec![Value::I32(5)]));
+        assert_eq!(isolated.len(), 2);
     }
 }

@@ -18,6 +18,7 @@ proc-macro2 = "1.0"
 quote = "1.0"
 derive-syn-parse = "0.2"
 itertools = "0.14"
+petgraph = "0.6"
 
 [package]
 name = "ascent-interpreter"

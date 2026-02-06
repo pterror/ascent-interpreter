@@ -16,7 +16,7 @@
 - [x] Expression evaluation (arithmetic, comparisons, ranges, generators)
 - [x] Stratification (aggregation rules run after base rules reach fixpoint)
 - [x] Pattern matching in conditions (if let)
-- [ ] Full dependency-based stratification (SCC analysis)
+- [x] Full dependency-based stratification (SCC analysis via petgraph)
 
 ## Runtime
 

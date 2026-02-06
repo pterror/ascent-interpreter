@@ -11,3 +11,4 @@ ascent-ir.workspace = true
 ascent-syntax.workspace = true
 syn.workspace = true
 itertools.workspace = true
+petgraph.workspace = true
