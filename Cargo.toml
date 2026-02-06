@@ -1,0 +1,9 @@
+[package]
+name = "ascent-interpreter"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Interpreter and JIT for Ascent Datalog programs"
+repository = "https://github.com/pterror/ascent-interpreter"
+
+[dependencies]
