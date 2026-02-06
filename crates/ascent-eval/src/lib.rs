@@ -33,6 +33,7 @@
 //! assert_eq!(path.len(), 3); // (1,2), (2,3), (1,3)
 //! ```
 
+pub mod aggregators;
 mod eval;
 pub mod expr;
 mod relation;

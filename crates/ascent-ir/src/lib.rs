@@ -187,8 +187,15 @@ impl BodyItem {
             }
             BodyItemNode::Cond(cond) => BodyItem::Condition(Condition::from_ast(cond)),
             BodyItemNode::Agg(agg) => BodyItem::Aggregation(Aggregation::from_ast(agg)),
-            BodyItemNode::Negation(_) => {
-                panic!("negation should be desugared to aggregation")
+            BodyItemNode::Negation(neg) => {
+                // Lower negation directly to aggregation with "not"
+                BodyItem::Aggregation(Aggregation {
+                    result_vars: vec![],
+                    aggregator: syn::parse_str("not").unwrap(),
+                    bound_vars: vec![],
+                    relation: neg.rel.to_string(),
+                    args: neg.args.into_iter().collect(),
+                })
             }
             BodyItemNode::Disjunction(_) => {
                 panic!("disjunction should be desugared to multiple rules")

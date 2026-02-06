@@ -2,8 +2,9 @@
 
 use std::collections::HashMap;
 
-use ascent_ir::{BodyItem, Clause, ClauseArg, Condition, Program, Rule};
+use ascent_ir::{Aggregation, BodyItem, Clause, ClauseArg, Condition, Program, Rule};
 
+use crate::aggregators::apply_aggregator;
 use crate::expr::{eval_expr, expand_range};
 use crate::relation::RelationStorage;
 use crate::value::{Tuple, Value};
@@ -146,10 +147,7 @@ impl Engine {
                 }
                 BodyItem::Generator(generator) => self.process_generator(generator, current),
                 BodyItem::Condition(cond) => self.process_condition(cond, current),
-                BodyItem::Aggregation(_agg) => {
-                    // TODO: implement aggregation
-                    current
-                }
+                BodyItem::Aggregation(agg) => self.process_aggregation(agg, current),
             };
         }
 
@@ -258,6 +256,87 @@ impl Engine {
         results
     }
 
+    /// Process an aggregation clause.
+    fn process_aggregation(&self, agg: &Aggregation, bindings: Vec<Bindings>) -> Vec<Bindings> {
+        let Some(rel) = self.relations.get(&agg.relation) else {
+            return vec![];
+        };
+
+        // Resolve aggregator name from the expression
+        let agg_name = resolve_aggregator_name(&agg.aggregator);
+
+        let mut results = Vec::new();
+
+        for binding in &bindings {
+            // Find all matching tuples and extract bound variables
+            let mut collected: Vec<Vec<Value>> = Vec::new();
+
+            for tuple in rel.iter_full() {
+                if let Some(match_binding) = self.match_agg_args(agg, tuple, binding.clone()) {
+                    // Extract bound variable values
+                    let bound_vals: Vec<Value> = agg
+                        .bound_vars
+                        .iter()
+                        .filter_map(|var| match_binding.get(var).cloned())
+                        .collect();
+                    collected.push(bound_vals);
+                }
+            }
+
+            // Apply aggregator
+            let agg_results = apply_aggregator(&agg_name, collected);
+
+            // Bind results to output pattern variables
+            for result_tuple in agg_results {
+                let mut new_binding = binding.clone();
+                for (var, val) in agg.result_vars.iter().zip(result_tuple) {
+                    new_binding.insert(var.clone(), val);
+                }
+                results.push(new_binding);
+            }
+        }
+
+        results
+    }
+
+    /// Match aggregation relation arguments against a tuple.
+    fn match_agg_args(
+        &self,
+        agg: &Aggregation,
+        tuple: &Tuple,
+        mut bindings: Bindings,
+    ) -> Option<Bindings> {
+        if agg.args.len() != tuple.len() {
+            return None;
+        }
+
+        for (arg_expr, value) in agg.args.iter().zip(tuple.iter()) {
+            // Check if the argument is a simple variable (bound var)
+            if let syn::Expr::Path(p) = arg_expr
+                && let Some(ident) = p.path.get_ident()
+            {
+                let name = ident.to_string();
+                if let Some(existing) = bindings.get(&name) {
+                    if existing != value {
+                        return None;
+                    }
+                } else {
+                    bindings.insert(name, value.clone());
+                }
+                continue;
+            }
+
+            // Otherwise evaluate and compare
+            if let Some(evaluated) = eval_expr(arg_expr, &bindings)
+                && evaluated != *value
+            {
+                return None;
+            }
+        }
+
+        Some(bindings)
+    }
+
     /// Process a condition filter.
     fn process_condition(&self, cond: &Condition, bindings: Vec<Bindings>) -> Vec<Bindings> {
         bindings
@@ -296,6 +375,22 @@ impl Engine {
         }
 
         Some(tuple)
+    }
+}
+
+/// Extract the aggregator name from an expression.
+/// Handles both simple paths (`min`) and qualified paths (`ascent::aggregators::min`).
+fn resolve_aggregator_name(expr: &syn::Expr) -> String {
+    match expr {
+        syn::Expr::Path(p) => {
+            // Use the last segment of the path
+            p.path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default()
+        }
+        _ => String::new(),
     }
 }
 
@@ -516,5 +611,101 @@ mod tests {
         assert!(fib.contains(&vec![Value::I32(3), Value::I32(3)]));
         assert!(fib.contains(&vec![Value::I32(4), Value::I32(5)]));
         assert!(fib.contains(&vec![Value::I32(5), Value::I32(8)]));
+    }
+
+    #[test]
+    fn test_aggregation_min() {
+        let engine = run_program(
+            r#"
+            relation number(i32);
+            relation lowest(i32);
+            number(5);
+            number(3);
+            number(8);
+            number(1);
+            number(7);
+            lowest(y) <-- agg y = min(x) in number(x);
+        "#,
+        );
+
+        let lowest = engine.relation("lowest").unwrap();
+        assert_eq!(lowest.len(), 1);
+        assert!(lowest.contains(&vec![Value::I32(1)]));
+    }
+
+    #[test]
+    fn test_aggregation_max() {
+        let engine = run_program(
+            r#"
+            relation number(i32);
+            relation highest(i32);
+            number(5);
+            number(3);
+            number(8);
+            highest(y) <-- agg y = max(x) in number(x);
+        "#,
+        );
+
+        let highest = engine.relation("highest").unwrap();
+        assert_eq!(highest.len(), 1);
+        assert!(highest.contains(&vec![Value::I32(8)]));
+    }
+
+    #[test]
+    fn test_aggregation_sum() {
+        let engine = run_program(
+            r#"
+            relation number(i32);
+            relation total(i32);
+            number(1);
+            number(2);
+            number(3);
+            total(s) <-- agg s = sum(x) in number(x);
+        "#,
+        );
+
+        let total = engine.relation("total").unwrap();
+        assert_eq!(total.len(), 1);
+        assert!(total.contains(&vec![Value::I32(6)]));
+    }
+
+    #[test]
+    fn test_aggregation_count() {
+        let engine = run_program(
+            r#"
+            relation number(i32);
+            relation card(i32);
+            number(10);
+            number(20);
+            number(30);
+            card(n) <-- agg n = count() in number(_);
+        "#,
+        );
+
+        let card = engine.relation("card").unwrap();
+        assert_eq!(card.len(), 1);
+        assert!(card.contains(&vec![Value::I32(3)]));
+    }
+
+    #[test]
+    fn test_negation_as_aggregation() {
+        let engine = run_program(
+            r#"
+            relation a(i32);
+            relation b(i32);
+            relation only_a(i32);
+            a(1);
+            a(2);
+            a(3);
+            b(2);
+            only_a(x) <-- a(x), !b(x);
+        "#,
+        );
+
+        let only_a = engine.relation("only_a").unwrap();
+        assert!(only_a.contains(&vec![Value::I32(1)]));
+        assert!(only_a.contains(&vec![Value::I32(3)]));
+        assert!(!only_a.contains(&vec![Value::I32(2)]));
+        assert_eq!(only_a.len(), 2);
     }
 }
