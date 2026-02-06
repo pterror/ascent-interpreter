@@ -37,8 +37,10 @@ pub mod aggregators;
 mod eval;
 pub mod expr;
 mod relation;
+#[cfg(feature = "serde")]
+pub mod serde_bridge;
 pub mod value;
 
-pub use eval::{Bindings, Engine, TypeRegistry};
+pub use eval::{Bindings, Engine, TypeRegistry, ValueDestructor};
 pub use relation::RelationStorage;
 pub use value::{DynValue, Tuple, Value};

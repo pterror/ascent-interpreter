@@ -38,8 +38,8 @@
 - [x] `DynValue` trait + `Value::Custom` variant for user-defined types
 - [x] `TypeRegistry` on Engine for registering custom constructors
 - [x] Thread relation attributes through IR (`attrs: Vec<Attribute>`)
-- [ ] Pattern matching support for custom types (destructuring in clauses)
-- [ ] Serde-based automatic `DynValue` registration
+- [x] Pattern matching support for custom types (destructuring in clauses)
+- [x] Serde-based automatic `DynValue` registration
 
 ## JIT (Future)
 

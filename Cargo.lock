@@ -68,6 +68,7 @@ dependencies = [
  "ascent-syntax",
  "itertools 0.14.0",
  "petgraph",
+ "serde",
  "syn",
 ]
 

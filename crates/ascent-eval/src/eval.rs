@@ -18,9 +18,13 @@ pub type Bindings = HashMap<String, Value>;
 /// Constructor function for a custom type: takes arguments, returns a Value.
 pub type ValueConstructor = Box<dyn Fn(&[Value]) -> Option<Value> + Send + Sync>;
 
-/// Registry of user-defined types and their constructors.
+/// Destructor function for a custom type: takes a Value, returns its fields.
+pub type ValueDestructor = Box<dyn Fn(&Value) -> Option<Vec<Value>> + Send + Sync>;
+
+/// Registry of user-defined types and their constructors/destructors.
 pub struct TypeRegistry {
     constructors: HashMap<String, ValueConstructor>,
+    destructors: HashMap<String, ValueDestructor>,
 }
 
 impl TypeRegistry {
@@ -28,12 +32,18 @@ impl TypeRegistry {
     pub fn new() -> Self {
         TypeRegistry {
             constructors: HashMap::new(),
+            destructors: HashMap::new(),
         }
     }
 
     /// Look up a constructor by name.
     pub fn get(&self, name: &str) -> Option<&ValueConstructor> {
         self.constructors.get(name)
+    }
+
+    /// Look up a destructor by name.
+    pub fn destructor(&self, name: &str) -> Option<&ValueDestructor> {
+        self.destructors.get(name)
     }
 }
 
@@ -79,29 +89,43 @@ impl Engine {
         }
     }
 
-    /// Register a custom type constructor.
+    /// Register a custom type with constructor and destructor.
     ///
     /// The `name` is what appears in Ascent source (e.g., `MyPoint`).
     /// The `constructor` takes a slice of `Value` arguments and returns a
     /// `Value::Custom` wrapping the user's type.
+    /// The `destructor` takes a `Value` and returns its fields if it matches
+    /// the type, enabling pattern destructuring like `if let MyPoint(x, y) = expr`.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// engine.register_type("MyPoint", |args| {
-    ///     let x = args.get(0)?.as_i32()?;
-    ///     let y = args.get(1)?.as_i32()?;
-    ///     Some(Value::custom(MyPoint { x, y }))
-    /// });
+    /// engine.register_type(
+    ///     "MyPoint",
+    ///     |args| {
+    ///         let x = args.get(0)?.as_i32()?;
+    ///         let y = args.get(1)?.as_i32()?;
+    ///         Some(Value::custom(MyPoint { x, y }))
+    ///     },
+    ///     |val| {
+    ///         let p = Engine::downcast_custom::<MyPoint>(val)?;
+    ///         Some(vec![Value::I32(p.x), Value::I32(p.y)])
+    ///     },
+    /// );
     /// ```
     pub fn register_type(
         &mut self,
         name: &str,
         constructor: impl Fn(&[Value]) -> Option<Value> + Send + Sync + 'static,
+        destructor: impl Fn(&Value) -> Option<Vec<Value>> + Send + Sync + 'static,
     ) {
+        let name = name.to_string();
         self.type_registry
             .constructors
-            .insert(name.to_string(), Box::new(constructor));
+            .insert(name.clone(), Box::new(constructor));
+        self.type_registry
+            .destructors
+            .insert(name, Box::new(destructor));
     }
 
     /// Downcast a custom value to a concrete type.
@@ -540,7 +564,12 @@ impl Engine {
             Condition::IfLet { pattern, expr } => {
                 let value = eval_expr_with_registry(expr, &bindings, &self.type_registry)?;
                 let mut new_bindings = bindings;
-                if match_pattern(pattern, &value, &mut new_bindings) {
+                if match_pattern(
+                    pattern,
+                    &value,
+                    &mut new_bindings,
+                    Some(&self.type_registry),
+                ) {
                     Some(new_bindings)
                 } else {
                     None
@@ -549,7 +578,12 @@ impl Engine {
             Condition::Let { pattern, expr } => {
                 let value = eval_expr_with_registry(expr, &bindings, &self.type_registry)?;
                 let mut new_bindings = bindings;
-                if match_pattern(pattern, &value, &mut new_bindings) {
+                if match_pattern(
+                    pattern,
+                    &value,
+                    &mut new_bindings,
+                    Some(&self.type_registry),
+                ) {
                     Some(new_bindings)
                 } else {
                     None
@@ -623,7 +657,12 @@ fn compute_rule_sccs(program: &Program) -> Vec<Vec<usize>> {
 }
 
 /// Match a pattern against a value, extending bindings on success.
-fn match_pattern(pat: &syn::Pat, value: &Value, bindings: &mut Bindings) -> bool {
+fn match_pattern(
+    pat: &syn::Pat,
+    value: &Value,
+    bindings: &mut Bindings,
+    registry: Option<&TypeRegistry>,
+) -> bool {
     match pat {
         // Wildcard: always matches, binds nothing
         syn::Pat::Wild(_) => true,
@@ -637,7 +676,7 @@ fn match_pattern(pat: &syn::Pat, value: &Value, bindings: &mut Bindings) -> bool
             }
             // If there's a subpattern (`name @ pattern`), match it too
             if let Some((_, sub_pat)) = &ident.subpat
-                && !match_pattern(sub_pat, value, bindings)
+                && !match_pattern(sub_pat, value, bindings, registry)
             {
                 return false;
             }
@@ -656,7 +695,7 @@ fn match_pattern(pat: &syn::Pat, value: &Value, bindings: &mut Bindings) -> bool
         }
 
         // Reference pattern: `&x` — in Datalog context, match the inner pattern
-        syn::Pat::Reference(r) => match_pattern(&r.pat, value, bindings),
+        syn::Pat::Reference(r) => match_pattern(&r.pat, value, bindings, registry),
 
         // Tuple pattern: `(a, b, c)`
         syn::Pat::Tuple(tuple) => {
@@ -665,7 +704,7 @@ fn match_pattern(pat: &syn::Pat, value: &Value, bindings: &mut Bindings) -> bool
                     return false;
                 }
                 for (pat_elem, val) in tuple.elems.iter().zip(vals.iter()) {
-                    if !match_pattern(pat_elem, val, bindings) {
+                    if !match_pattern(pat_elem, val, bindings, registry) {
                         return false;
                     }
                 }
@@ -675,7 +714,7 @@ fn match_pattern(pat: &syn::Pat, value: &Value, bindings: &mut Bindings) -> bool
             }
         }
 
-        // Tuple struct pattern: `Some(x)`, `Ok(v)`
+        // Tuple struct pattern: `Some(x)`, `Dual(x)`, or custom types
         syn::Pat::TupleStruct(ts) => {
             let path_str = path_to_string(&ts.path);
             match path_str.as_str() {
@@ -683,7 +722,7 @@ fn match_pattern(pat: &syn::Pat, value: &Value, bindings: &mut Bindings) -> bool
                     if let Value::Option(Some(inner)) = value
                         && ts.elems.len() == 1
                     {
-                        match_pattern(&ts.elems[0], inner, bindings)
+                        match_pattern(&ts.elems[0], inner, bindings, registry)
                     } else {
                         false
                     }
@@ -692,13 +731,28 @@ fn match_pattern(pat: &syn::Pat, value: &Value, bindings: &mut Bindings) -> bool
                     if let Value::Dual(inner) = value
                         && ts.elems.len() == 1
                     {
-                        match_pattern(&ts.elems[0], inner, bindings)
+                        match_pattern(&ts.elems[0], inner, bindings, registry)
                     } else {
                         false
                     }
                 }
                 "None" => matches!(value, Value::Option(None)),
-                _ => false,
+                _ => {
+                    if let Some(reg) = registry
+                        && let Some(destructor) = reg.destructor(&path_str)
+                        && let Some(fields) = destructor(value)
+                        && fields.len() == ts.elems.len()
+                    {
+                        for (pat_elem, val) in ts.elems.iter().zip(fields.iter()) {
+                            if !match_pattern(pat_elem, val, bindings, registry) {
+                                return false;
+                            }
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
             }
         }
 
@@ -717,7 +771,7 @@ fn match_pattern(pat: &syn::Pat, value: &Value, bindings: &mut Bindings) -> bool
         syn::Pat::Or(or_pat) => {
             for case in &or_pat.cases {
                 let mut trial = bindings.clone();
-                if match_pattern(case, value, &mut trial) {
+                if match_pattern(case, value, &mut trial, registry) {
                     *bindings = trial;
                     return true;
                 }
@@ -726,7 +780,7 @@ fn match_pattern(pat: &syn::Pat, value: &Value, bindings: &mut Bindings) -> bool
         }
 
         // Parenthesized: `(pattern)`
-        syn::Pat::Paren(p) => match_pattern(&p.pat, value, bindings),
+        syn::Pat::Paren(p) => match_pattern(&p.pat, value, bindings, registry),
 
         _ => false,
     }
@@ -753,6 +807,36 @@ fn resolve_aggregator_name(expr: &syn::Expr) -> String {
                 .unwrap_or_default()
         }
         _ => String::new(),
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Engine {
+    /// Register a custom type using serde for automatic constructor/destructor.
+    ///
+    /// This is a convenience wrapper around [`Engine::register_type`] that uses
+    /// serde's `Serialize`/`Deserialize` to automatically convert between
+    /// `T` and `Vec<Value>`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord,
+    ///          serde::Serialize, serde::Deserialize)]
+    /// struct Point { x: i32, y: i32 }
+    ///
+    /// engine.register_serde_type::<Point>("Point");
+    /// ```
+    pub fn register_serde_type<T>(&mut self, name: &str)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + DynValue + 'static,
+    {
+        use crate::serde_bridge::{from_values, to_values};
+        self.register_type(
+            name,
+            |args| from_values::<T>(args).ok().map(Value::custom),
+            |val| Engine::downcast_custom::<T>(val).and_then(|t| to_values(t).ok()),
+        );
     }
 }
 
@@ -1491,11 +1575,18 @@ mod tests {
         let program = Program::from_ast(ast);
         let mut engine = Engine::new(&program);
 
-        engine.register_type("Point", |args| {
-            let x = args.first()?.as_i32()?;
-            let y = args.get(1)?.as_i32()?;
-            Some(Value::custom(Point { x, y }))
-        });
+        engine.register_type(
+            "Point",
+            |args| {
+                let x = args.first()?.as_i32()?;
+                let y = args.get(1)?.as_i32()?;
+                Some(Value::custom(Point { x, y }))
+            },
+            |val| {
+                let p = Engine::downcast_custom::<Point>(val)?;
+                Some(vec![Value::I32(p.x), Value::I32(p.y)])
+            },
+        );
 
         engine.run(&program);
 
@@ -1511,5 +1602,200 @@ mod tests {
         let point = Engine::downcast_custom::<Point>(&v).unwrap();
         assert_eq!(point.x, 5);
         assert_eq!(point.y, 10);
+    }
+
+    // ─── Custom type destructuring tests ──────────────────────────────
+
+    fn register_point(engine: &mut Engine) {
+        engine.register_type(
+            "Point",
+            |args| {
+                let x = args.first()?.as_i32()?;
+                let y = args.get(1)?.as_i32()?;
+                Some(Value::custom(Point { x, y }))
+            },
+            |val| {
+                let p = Engine::downcast_custom::<Point>(val)?;
+                Some(vec![Value::I32(p.x), Value::I32(p.y)])
+            },
+        );
+    }
+
+    #[test]
+    fn test_custom_type_if_let_destructure() {
+        // Destructure a custom type via `if let Point(x, y) = expr`
+        let ast: AscentProgram = syn::parse_str(
+            r#"
+            relation data(i32, i32);
+            relation coords(i32, i32, i32);
+            coords(id, x, y) <-- data(id, p), if let Point(x, y) = p;
+            "#,
+        )
+        .unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        register_point(&mut engine);
+
+        engine.insert(
+            "data",
+            vec![Value::I32(1), Value::custom(Point { x: 10, y: 20 })],
+        );
+        engine.insert(
+            "data",
+            vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })],
+        );
+        engine.run(&program);
+
+        let coords = engine.relation("coords").unwrap();
+        assert_eq!(coords.len(), 2);
+        assert!(coords.contains(&vec![Value::I32(1), Value::I32(10), Value::I32(20)]));
+        assert!(coords.contains(&vec![Value::I32(2), Value::I32(30), Value::I32(40)]));
+    }
+
+    #[test]
+    fn test_custom_type_clause_pattern_arg() {
+        // Use `?Point(x, y)` in clause body (desugared to if-let by parser)
+        let ast: AscentProgram = syn::parse_str(
+            r#"
+            relation data(i32, i32);
+            relation coords(i32, i32, i32);
+            coords(id, x, y) <-- data(id, ?Point(x, y));
+            "#,
+        )
+        .unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        register_point(&mut engine);
+
+        engine.insert(
+            "data",
+            vec![Value::I32(1), Value::custom(Point { x: 5, y: 15 })],
+        );
+        engine.run(&program);
+
+        let coords = engine.relation("coords").unwrap();
+        assert_eq!(coords.len(), 1);
+        assert!(coords.contains(&vec![Value::I32(1), Value::I32(5), Value::I32(15)]));
+    }
+
+    #[test]
+    fn test_custom_type_destructure_with_wildcard() {
+        // Destructure with wildcard: `if let Point(x, _) = p`
+        let ast: AscentProgram = syn::parse_str(
+            r#"
+            relation data(i32, i32);
+            relation x_only(i32, i32);
+            x_only(id, x) <-- data(id, p), if let Point(x, _) = p;
+            "#,
+        )
+        .unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        register_point(&mut engine);
+
+        engine.insert(
+            "data",
+            vec![Value::I32(1), Value::custom(Point { x: 7, y: 99 })],
+        );
+        engine.run(&program);
+
+        let x_only = engine.relation("x_only").unwrap();
+        assert_eq!(x_only.len(), 1);
+        assert!(x_only.contains(&vec![Value::I32(1), Value::I32(7)]));
+    }
+
+    #[test]
+    fn test_custom_type_destructure_wrong_type() {
+        // Destructuring a non-matching value returns false, doesn't crash
+        let ast: AscentProgram = syn::parse_str(
+            r#"
+            relation data(i32, i32);
+            relation coords(i32, i32, i32);
+            coords(id, x, y) <-- data(id, p), if let Point(x, y) = p;
+            "#,
+        )
+        .unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        register_point(&mut engine);
+
+        // Insert a plain i32 instead of a Point — should not match
+        engine.insert("data", vec![Value::I32(1), Value::I32(42)]);
+        engine.run(&program);
+
+        let coords = engine.relation("coords").unwrap();
+        assert_eq!(coords.len(), 0);
+    }
+
+    #[test]
+    fn test_custom_type_construct_and_destructure() {
+        // Round-trip: construct with Point(x, y) in head, destructure in body
+        let ast: AscentProgram = syn::parse_str(
+            r#"
+            relation input(i32, i32, i32);
+            relation wrapped(i32, i32);
+            relation unwrapped(i32, i32, i32);
+            input(1, 10, 20);
+            input(2, 30, 40);
+            wrapped(id, Point(x, y)) <-- input(id, x, y);
+            unwrapped(id, a, b) <-- wrapped(id, p), if let Point(a, b) = p;
+            "#,
+        )
+        .unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        register_point(&mut engine);
+        engine.run(&program);
+
+        let unwrapped = engine.relation("unwrapped").unwrap();
+        assert_eq!(unwrapped.len(), 2);
+        assert!(unwrapped.contains(&vec![Value::I32(1), Value::I32(10), Value::I32(20)]));
+        assert!(unwrapped.contains(&vec![Value::I32(2), Value::I32(30), Value::I32(40)]));
+    }
+
+    // ─── Serde registration tests ───────────────────────────────────
+
+    #[cfg(feature = "serde")]
+    mod serde_tests {
+        use super::*;
+
+        #[derive(
+            Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+        )]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        impl fmt::Display for Point {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "({}, {})", self.x, self.y)
+            }
+        }
+
+        #[test]
+        fn test_register_serde_type_round_trip() {
+            let ast: AscentProgram = syn::parse_str(
+                r#"
+                relation input(i32, i32, i32);
+                relation wrapped(i32, i32);
+                relation unwrapped(i32, i32, i32);
+                input(1, 10, 20);
+                input(2, 30, 40);
+                wrapped(id, Point(x, y)) <-- input(id, x, y);
+                unwrapped(id, a, b) <-- wrapped(id, p), if let Point(a, b) = p;
+                "#,
+            )
+            .unwrap();
+            let program = Program::from_ast(ast);
+            let mut engine = Engine::new(&program);
+            engine.register_serde_type::<Point>("Point");
+            engine.run(&program);
+
+            let unwrapped = engine.relation("unwrapped").unwrap();
+            assert_eq!(unwrapped.len(), 2);
+            assert!(unwrapped.contains(&vec![Value::I32(1), Value::I32(10), Value::I32(20)]));
+            assert!(unwrapped.contains(&vec![Value::I32(2), Value::I32(30), Value::I32(40)]));
+        }
     }
 }
