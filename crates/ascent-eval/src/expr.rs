@@ -5,11 +5,28 @@
 
 use syn::Expr;
 
-use crate::eval::Bindings;
+use crate::eval::{Bindings, TypeRegistry};
 use crate::value::Value;
 
 /// Evaluate a syn expression with the given variable bindings.
 pub fn eval_expr(expr: &Expr, bindings: &Bindings) -> Option<Value> {
+    eval_expr_inner(expr, bindings, None)
+}
+
+/// Evaluate a syn expression with bindings and a type registry for custom constructors.
+pub fn eval_expr_with_registry(
+    expr: &Expr,
+    bindings: &Bindings,
+    registry: &TypeRegistry,
+) -> Option<Value> {
+    eval_expr_inner(expr, bindings, Some(registry))
+}
+
+fn eval_expr_inner(
+    expr: &Expr,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+) -> Option<Value> {
     match expr {
         Expr::Lit(lit) => eval_lit(&lit.lit),
         Expr::Path(p) => {
@@ -25,23 +42,26 @@ pub fn eval_expr(expr: &Expr, bindings: &Bindings) -> Option<Value> {
                 None
             }
         }
-        Expr::Binary(bin) => eval_binary(bin, bindings),
-        Expr::Unary(unary) => eval_unary(unary, bindings),
-        Expr::Paren(paren) => eval_expr(&paren.expr, bindings),
-        Expr::Range(range) => eval_range(range, bindings),
-        Expr::Tuple(tuple) => eval_tuple(tuple, bindings),
-        Expr::Call(call) => eval_call(call, bindings),
-        Expr::MethodCall(mc) => eval_method_call(mc, bindings),
+        Expr::Binary(bin) => eval_binary(bin, bindings, registry),
+        Expr::Unary(unary) => eval_unary(unary, bindings, registry),
+        Expr::Paren(paren) => eval_expr_inner(&paren.expr, bindings, registry),
+        Expr::Range(range) => eval_range(range, bindings, registry),
+        Expr::Tuple(tuple) => eval_tuple(tuple, bindings, registry),
+        Expr::Call(call) => eval_call(call, bindings, registry),
+        Expr::MethodCall(mc) => eval_method_call(mc, bindings, registry),
         Expr::Reference(r) => {
             // For &x in Datalog context, just evaluate x
-            eval_expr(&r.expr, bindings)
+            eval_expr_inner(&r.expr, bindings, registry)
         }
-        Expr::Cast(cast) => eval_cast(cast, bindings),
-        Expr::If(if_expr) => eval_if(if_expr, bindings),
-        Expr::Block(block) => eval_block(block, bindings),
+        Expr::Cast(cast) => eval_cast(cast, bindings, registry),
+        Expr::If(if_expr) => eval_if(if_expr, bindings, registry),
+        Expr::Block(block) => eval_block(block, bindings, registry),
         Expr::Array(arr) => {
-            let values: Option<Vec<Value>> =
-                arr.elems.iter().map(|e| eval_expr(e, bindings)).collect();
+            let values: Option<Vec<Value>> = arr
+                .elems
+                .iter()
+                .map(|e| eval_expr_inner(e, bindings, registry))
+                .collect();
             values.map(Value::tuple)
         }
         _ => None,
@@ -92,30 +112,34 @@ fn eval_lit(lit: &syn::Lit) -> Option<Value> {
 }
 
 /// Evaluate a binary expression.
-fn eval_binary(bin: &syn::ExprBinary, bindings: &Bindings) -> Option<Value> {
+fn eval_binary(
+    bin: &syn::ExprBinary,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+) -> Option<Value> {
     // Short-circuit for && and ||
     match bin.op {
         syn::BinOp::And(_) => {
-            let left = eval_expr(&bin.left, bindings)?;
+            let left = eval_expr_inner(&bin.left, bindings, registry)?;
             if !left.as_bool()? {
                 return Some(Value::Bool(false));
             }
-            let right = eval_expr(&bin.right, bindings)?;
+            let right = eval_expr_inner(&bin.right, bindings, registry)?;
             return Some(Value::Bool(right.as_bool()?));
         }
         syn::BinOp::Or(_) => {
-            let left = eval_expr(&bin.left, bindings)?;
+            let left = eval_expr_inner(&bin.left, bindings, registry)?;
             if left.as_bool()? {
                 return Some(Value::Bool(true));
             }
-            let right = eval_expr(&bin.right, bindings)?;
+            let right = eval_expr_inner(&bin.right, bindings, registry)?;
             return Some(Value::Bool(right.as_bool()?));
         }
         _ => {}
     }
 
-    let left = eval_expr(&bin.left, bindings)?;
-    let right = eval_expr(&bin.right, bindings)?;
+    let left = eval_expr_inner(&bin.left, bindings, registry)?;
+    let right = eval_expr_inner(&bin.right, bindings, registry)?;
 
     match bin.op {
         syn::BinOp::Add(_) => left.add(&right),
@@ -143,8 +167,12 @@ fn eval_binary(bin: &syn::ExprBinary, bindings: &Bindings) -> Option<Value> {
 }
 
 /// Evaluate a unary expression.
-fn eval_unary(unary: &syn::ExprUnary, bindings: &Bindings) -> Option<Value> {
-    let val = eval_expr(&unary.expr, bindings)?;
+fn eval_unary(
+    unary: &syn::ExprUnary,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+) -> Option<Value> {
+    let val = eval_expr_inner(&unary.expr, bindings, registry)?;
     match unary.op {
         syn::UnOp::Neg(_) => val.neg(),
         syn::UnOp::Not(_) => val.not(),
@@ -154,9 +182,19 @@ fn eval_unary(unary: &syn::ExprUnary, bindings: &Bindings) -> Option<Value> {
 }
 
 /// Evaluate a range expression.
-fn eval_range(range: &syn::ExprRange, bindings: &Bindings) -> Option<Value> {
-    let start = range.start.as_ref().and_then(|e| eval_expr(e, bindings));
-    let end = range.end.as_ref().and_then(|e| eval_expr(e, bindings));
+fn eval_range(
+    range: &syn::ExprRange,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+) -> Option<Value> {
+    let start = range
+        .start
+        .as_ref()
+        .and_then(|e| eval_expr_inner(e, bindings, registry));
+    let end = range
+        .end
+        .as_ref()
+        .and_then(|e| eval_expr_inner(e, bindings, registry));
     let inclusive = matches!(range.limits, syn::RangeLimits::Closed(_));
 
     match (start, end) {
@@ -170,38 +208,69 @@ fn eval_range(range: &syn::ExprRange, bindings: &Bindings) -> Option<Value> {
 }
 
 /// Evaluate a tuple expression.
-fn eval_tuple(tuple: &syn::ExprTuple, bindings: &Bindings) -> Option<Value> {
-    let values: Option<Vec<_>> = tuple.elems.iter().map(|e| eval_expr(e, bindings)).collect();
+fn eval_tuple(
+    tuple: &syn::ExprTuple,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+) -> Option<Value> {
+    let values: Option<Vec<_>> = tuple
+        .elems
+        .iter()
+        .map(|e| eval_expr_inner(e, bindings, registry))
+        .collect();
     values.map(Value::tuple)
 }
 
 /// Evaluate a function call (limited support).
-fn eval_call(call: &syn::ExprCall, bindings: &Bindings) -> Option<Value> {
+fn eval_call(
+    call: &syn::ExprCall,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+) -> Option<Value> {
     if let Expr::Path(p) = &*call.func
         && let Some(ident) = p.path.get_ident()
-        && call.args.len() == 1
     {
         let name = ident.to_string();
-        let val = eval_expr(&call.args[0], bindings)?;
-        return match name.as_str() {
-            "Some" => Some(Value::Option(Some(Box::new(val)))),
-            "Dual" => Some(Value::Dual(Box::new(val))),
-            _ => None,
-        };
+
+        // Built-in single-arg constructors
+        if call.args.len() == 1 {
+            let val = eval_expr_inner(&call.args[0], bindings, registry)?;
+            match name.as_str() {
+                "Some" => return Some(Value::Option(Some(Box::new(val)))),
+                "Dual" => return Some(Value::Dual(Box::new(val))),
+                _ => {}
+            }
+        }
+
+        // Check type registry for custom constructors
+        if let Some(reg) = registry
+            && let Some(constructor) = reg.get(&name)
+        {
+            let args: Option<Vec<Value>> = call
+                .args
+                .iter()
+                .map(|e| eval_expr_inner(e, bindings, registry))
+                .collect();
+            return args.and_then(|a| constructor(&a));
+        }
     }
     None
 }
 
 /// Evaluate a method call (limited support).
-fn eval_method_call(mc: &syn::ExprMethodCall, bindings: &Bindings) -> Option<Value> {
-    let receiver = eval_expr(&mc.receiver, bindings)?;
+fn eval_method_call(
+    mc: &syn::ExprMethodCall,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+) -> Option<Value> {
+    let receiver = eval_expr_inner(&mc.receiver, bindings, registry)?;
     let method = mc.method.to_string();
 
     match method.as_str() {
         "clone" => Some(receiver),
         "abs" => receiver.abs(),
         "eq" if mc.args.len() == 1 => {
-            let arg = eval_expr(&mc.args[0], bindings)?;
+            let arg = eval_expr_inner(&mc.args[0], bindings, registry)?;
             Some(Value::Bool(receiver == arg))
         }
         _ => None,
@@ -209,8 +278,12 @@ fn eval_method_call(mc: &syn::ExprMethodCall, bindings: &Bindings) -> Option<Val
 }
 
 /// Evaluate a cast expression (e.g., `x as i32`).
-fn eval_cast(cast: &syn::ExprCast, bindings: &Bindings) -> Option<Value> {
-    let val = eval_expr(&cast.expr, bindings)?;
+fn eval_cast(
+    cast: &syn::ExprCast,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+) -> Option<Value> {
+    let val = eval_expr_inner(&cast.expr, bindings, registry)?;
 
     if let syn::Type::Path(tp) = &*cast.ty
         && let Some(ident) = tp.path.get_ident()
@@ -221,29 +294,41 @@ fn eval_cast(cast: &syn::ExprCast, bindings: &Bindings) -> Option<Value> {
 }
 
 /// Evaluate an if expression.
-fn eval_if(if_expr: &syn::ExprIf, bindings: &Bindings) -> Option<Value> {
-    let cond = eval_expr(&if_expr.cond, bindings)?;
+fn eval_if(
+    if_expr: &syn::ExprIf,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+) -> Option<Value> {
+    let cond = eval_expr_inner(&if_expr.cond, bindings, registry)?;
     if cond.as_bool()? {
-        eval_block_stmts(&if_expr.then_branch, bindings)
+        eval_block_stmts(&if_expr.then_branch, bindings, registry)
     } else if let Some((_, else_branch)) = &if_expr.else_branch {
-        eval_expr(else_branch, bindings)
+        eval_expr_inner(else_branch, bindings, registry)
     } else {
         Some(Value::Unit)
     }
 }
 
 /// Evaluate a block expression.
-fn eval_block(block: &syn::ExprBlock, bindings: &Bindings) -> Option<Value> {
-    eval_block_stmts(&block.block, bindings)
+fn eval_block(
+    block: &syn::ExprBlock,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+) -> Option<Value> {
+    eval_block_stmts(&block.block, bindings, registry)
 }
 
 /// Evaluate the last expression in a block.
-fn eval_block_stmts(block: &syn::Block, bindings: &Bindings) -> Option<Value> {
+fn eval_block_stmts(
+    block: &syn::Block,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+) -> Option<Value> {
     // Only handle blocks with a single trailing expression
     if block.stmts.len() == 1
         && let syn::Stmt::Expr(expr, _) = &block.stmts[0]
     {
-        return eval_expr(expr, bindings);
+        return eval_expr_inner(expr, bindings, registry);
     }
     None
 }

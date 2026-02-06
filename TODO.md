@@ -33,6 +33,14 @@
 - [x] `?pattern` prefix for lattice value pattern matching
 - [x] Port lattice tests from ascent (shortest path, etc.)
 
+## Custom Types (BYOD)
+
+- [x] `DynValue` trait + `Value::Custom` variant for user-defined types
+- [x] `TypeRegistry` on Engine for registering custom constructors
+- [x] Thread relation attributes through IR (`attrs: Vec<Attribute>`)
+- [ ] Pattern matching support for custom types (destructuring in clauses)
+- [ ] Serde-based automatic `DynValue` registration
+
 ## JIT (Future)
 
 - [ ] Cranelift backend for hot loops

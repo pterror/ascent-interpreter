@@ -31,6 +31,8 @@ pub struct Relation {
     pub is_lattice: bool,
     /// Initial values (if any).
     pub initialization: Option<Expr>,
+    /// Attributes on the relation declaration (e.g., `#[ds(btree)]`).
+    pub attrs: Vec<syn::Attribute>,
 }
 
 /// A rule: head <- body.
@@ -137,6 +139,7 @@ impl Program {
                     column_types: rel.field_types.into_iter().collect(),
                     is_lattice: rel.is_lattice,
                     initialization: rel.initialization,
+                    attrs: rel.attrs,
                 },
             );
         }
@@ -397,5 +400,23 @@ mod tests {
             // Should have a condition for equality check
             assert!(!cl.conditions.is_empty());
         }
+    }
+
+    #[test]
+    fn test_attributes_preserved() {
+        let prog = parse_and_lower(
+            r#"
+            #[ds(btree)]
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+        "#,
+        );
+
+        let edge = prog.relations.get("edge").unwrap();
+        assert_eq!(edge.attrs.len(), 1);
+
+        let path = prog.relations.get("path").unwrap();
+        assert!(path.attrs.is_empty());
     }
 }

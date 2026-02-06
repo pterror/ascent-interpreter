@@ -1,24 +1,63 @@
 //! Semi-naive evaluation engine.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use ascent_ir::{Aggregation, BodyItem, Clause, ClauseArg, Condition, Program, Rule};
 use petgraph::algo::{condensation, toposort};
 use petgraph::graph::DiGraph;
 
 use crate::aggregators::apply_aggregator;
-use crate::expr::{eval_expr, expand_range};
+use crate::expr::{eval_expr, eval_expr_with_registry, expand_range};
 use crate::relation::RelationStorage;
-use crate::value::{Tuple, Value};
+use crate::value::{DynValue, Tuple, Value};
 
 /// Variable bindings during rule evaluation.
 pub type Bindings = HashMap<String, Value>;
+
+/// Constructor function for a custom type: takes arguments, returns a Value.
+pub type ValueConstructor = Box<dyn Fn(&[Value]) -> Option<Value> + Send + Sync>;
+
+/// Registry of user-defined types and their constructors.
+pub struct TypeRegistry {
+    constructors: HashMap<String, ValueConstructor>,
+}
+
+impl TypeRegistry {
+    /// Create an empty type registry.
+    pub fn new() -> Self {
+        TypeRegistry {
+            constructors: HashMap::new(),
+        }
+    }
+
+    /// Look up a constructor by name.
+    pub fn get(&self, name: &str) -> Option<&ValueConstructor> {
+        self.constructors.get(name)
+    }
+}
+
+impl Default for TypeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for TypeRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TypeRegistry")
+            .field("types", &self.constructors.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
 
 /// The evaluation engine state.
 #[derive(Debug)]
 pub struct Engine {
     /// Storage for each relation.
     relations: HashMap<String, RelationStorage>,
+    /// Registry of custom type constructors.
+    pub type_registry: TypeRegistry,
 }
 
 impl Engine {
@@ -34,7 +73,44 @@ impl Engine {
             );
         }
 
-        Engine { relations }
+        Engine {
+            relations,
+            type_registry: TypeRegistry::new(),
+        }
+    }
+
+    /// Register a custom type constructor.
+    ///
+    /// The `name` is what appears in Ascent source (e.g., `MyPoint`).
+    /// The `constructor` takes a slice of `Value` arguments and returns a
+    /// `Value::Custom` wrapping the user's type.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// engine.register_type("MyPoint", |args| {
+    ///     let x = args.get(0)?.as_i32()?;
+    ///     let y = args.get(1)?.as_i32()?;
+    ///     Some(Value::custom(MyPoint { x, y }))
+    /// });
+    /// ```
+    pub fn register_type(
+        &mut self,
+        name: &str,
+        constructor: impl Fn(&[Value]) -> Option<Value> + Send + Sync + 'static,
+    ) {
+        self.type_registry
+            .constructors
+            .insert(name.to_string(), Box::new(constructor));
+    }
+
+    /// Downcast a custom value to a concrete type.
+    pub fn downcast_custom<T: DynValue + 'static>(value: &Value) -> Option<&T> {
+        if let Value::Custom(v) = value {
+            v.as_any().downcast_ref::<T>()
+        } else {
+            None
+        }
     }
 
     /// Get a relation by name.
@@ -279,7 +355,7 @@ impl Engine {
                     }
                 }
                 ClauseArg::Expr(expr) => {
-                    if let Some(val) = eval_expr(expr, binding) {
+                    if let Some(val) = eval_expr_with_registry(expr, binding, &self.type_registry) {
                         return Some((col, val));
                     }
                 }
@@ -311,7 +387,8 @@ impl Engine {
                     }
                 }
                 ClauseArg::Expr(expr) => {
-                    if let Some(evaluated) = eval_expr(expr, &bindings)
+                    if let Some(evaluated) =
+                        eval_expr_with_registry(expr, &bindings, &self.type_registry)
                         && evaluated != *value
                     {
                         return None;
@@ -340,7 +417,8 @@ impl Engine {
         let mut results = Vec::new();
 
         for binding in bindings {
-            if let Some(range_val) = eval_expr(&generator.expr, &binding)
+            if let Some(range_val) =
+                eval_expr_with_registry(&generator.expr, &binding, &self.type_registry)
                 && let Some(values) = expand_range(&range_val)
             {
                 for value in values {
@@ -427,7 +505,8 @@ impl Engine {
             }
 
             // Otherwise evaluate and compare
-            if let Some(evaluated) = eval_expr(arg_expr, &bindings)
+            if let Some(evaluated) =
+                eval_expr_with_registry(arg_expr, &bindings, &self.type_registry)
                 && evaluated != *value
             {
                 return None;
@@ -449,7 +528,7 @@ impl Engine {
     fn eval_condition(&self, cond: &Condition, bindings: Bindings) -> Option<Bindings> {
         match cond {
             Condition::If(expr) => {
-                if eval_expr(expr, &bindings)
+                if eval_expr_with_registry(expr, &bindings, &self.type_registry)
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
                 {
@@ -459,7 +538,7 @@ impl Engine {
                 }
             }
             Condition::IfLet { pattern, expr } => {
-                let value = eval_expr(expr, &bindings)?;
+                let value = eval_expr_with_registry(expr, &bindings, &self.type_registry)?;
                 let mut new_bindings = bindings;
                 if match_pattern(pattern, &value, &mut new_bindings) {
                     Some(new_bindings)
@@ -468,7 +547,7 @@ impl Engine {
                 }
             }
             Condition::Let { pattern, expr } => {
-                let value = eval_expr(expr, &bindings)?;
+                let value = eval_expr_with_registry(expr, &bindings, &self.type_registry)?;
                 let mut new_bindings = bindings;
                 if match_pattern(pattern, &value, &mut new_bindings) {
                     Some(new_bindings)
@@ -484,7 +563,7 @@ impl Engine {
         let mut tuple = Vec::with_capacity(head.args.len());
 
         for arg in &head.args {
-            if let Some(value) = eval_expr(arg, bindings) {
+            if let Some(value) = eval_expr_with_registry(arg, bindings, &self.type_registry) {
                 tuple.push(value);
             } else {
                 return None;
@@ -1328,5 +1407,109 @@ mod tests {
         let result = engine.relation("result").unwrap();
         assert!(result.contains(&vec![Value::I32(1), Value::I32(5)]));
         assert!(result.contains(&vec![Value::I32(2), Value::I32(3)]));
+    }
+
+    // ─── Custom type (BYOD) tests ──────────────────────────────────
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    impl std::fmt::Display for Point {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "({}, {})", self.x, self.y)
+        }
+    }
+
+    #[test]
+    fn test_custom_type_in_relation() {
+        // Insert custom values directly and query them
+        let ast: AscentProgram = syn::parse_str(
+            r#"
+            relation point(i32, i32);
+            relation has_point(i32);
+            has_point(id) <-- point(id, _);
+            "#,
+        )
+        .unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+
+        engine.insert(
+            "point",
+            vec![Value::I32(1), Value::custom(Point { x: 10, y: 20 })],
+        );
+        engine.insert(
+            "point",
+            vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })],
+        );
+        engine.run(&program);
+
+        let hp = engine.relation("has_point").unwrap();
+        assert!(hp.contains(&vec![Value::I32(1)]));
+        assert!(hp.contains(&vec![Value::I32(2)]));
+        assert_eq!(hp.len(), 2);
+    }
+
+    #[test]
+    fn test_custom_type_equality_join() {
+        // Two relations sharing custom values can join on equality
+        let ast: AscentProgram = syn::parse_str(
+            r#"
+            relation r(i32, i32);
+            relation s(i32, i32);
+            relation joined(i32, i32);
+            joined(a, c) <-- r(a, b), s(b, c);
+            "#,
+        )
+        .unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+
+        let p = Value::custom(Point { x: 1, y: 2 });
+        engine.insert("r", vec![Value::I32(1), p.clone()]);
+        engine.insert("s", vec![p, Value::I32(99)]);
+        engine.run(&program);
+
+        let joined = engine.relation("joined").unwrap();
+        assert!(joined.contains(&vec![Value::I32(1), Value::I32(99)]));
+        assert_eq!(joined.len(), 1);
+    }
+
+    #[test]
+    fn test_register_type_constructor() {
+        let ast: AscentProgram = syn::parse_str(
+            r#"
+            relation data(i32, i32);
+            data(1, Point(10, 20));
+            data(2, Point(30, 40));
+            "#,
+        )
+        .unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+
+        engine.register_type("Point", |args| {
+            let x = args.first()?.as_i32()?;
+            let y = args.get(1)?.as_i32()?;
+            Some(Value::custom(Point { x, y }))
+        });
+
+        engine.run(&program);
+
+        let data = engine.relation("data").unwrap();
+        assert_eq!(data.len(), 2);
+        assert!(data.contains(&vec![Value::I32(1), Value::custom(Point { x: 10, y: 20 })]));
+        assert!(data.contains(&vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })]));
+    }
+
+    #[test]
+    fn test_downcast_custom() {
+        let v = Value::custom(Point { x: 5, y: 10 });
+        let point = Engine::downcast_custom::<Point>(&v).unwrap();
+        assert_eq!(point.x, 5);
+        assert_eq!(point.y, 10);
     }
 }

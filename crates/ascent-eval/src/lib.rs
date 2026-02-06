@@ -39,6 +39,6 @@ pub mod expr;
 mod relation;
 pub mod value;
 
-pub use eval::{Bindings, Engine};
+pub use eval::{Bindings, Engine, TypeRegistry};
 pub use relation::RelationStorage;
-pub use value::{Tuple, Value};
+pub use value::{DynValue, Tuple, Value};

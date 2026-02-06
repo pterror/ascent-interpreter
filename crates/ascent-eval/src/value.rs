@@ -1,12 +1,72 @@
 //! Runtime values for the interpreter.
 
+use std::any::Any;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
+/// Object-safe trait for user-defined types in the interpreter.
+///
+/// Library consumers implement this (typically via the blanket impl) to register
+/// custom Rust types that work with Ascent programs.
+pub trait DynValue: Any + Send + Sync {
+    fn clone_box(&self) -> Box<dyn DynValue>;
+    fn eq_box(&self, other: &dyn DynValue) -> bool;
+    fn hash_box(&self, state: &mut dyn Hasher);
+    fn cmp_box(&self, other: &dyn DynValue) -> Option<Ordering>;
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+    fn display_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+    fn as_any(&self) -> &dyn Any;
+    fn type_name(&self) -> &'static str;
+}
+
+impl<T> DynValue for T
+where
+    T: Clone + Eq + Hash + Ord + fmt::Debug + fmt::Display + Any + Send + Sync + 'static,
+{
+    fn clone_box(&self) -> Box<dyn DynValue> {
+        Box::new(self.clone())
+    }
+    fn eq_box(&self, other: &dyn DynValue) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<T>()
+            .is_some_and(|o| self == o)
+    }
+    fn hash_box(&self, state: &mut dyn Hasher) {
+        self.hash(&mut HasherWrapper(state));
+    }
+    fn cmp_box(&self, other: &dyn DynValue) -> Option<Ordering> {
+        other.as_any().downcast_ref::<T>().map(|o| self.cmp(o))
+    }
+    fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+    fn display_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
+}
+
+/// Adapter to bridge `&mut dyn Hasher` (not object-safe) with the `Hash` trait.
+struct HasherWrapper<'a>(&'a mut dyn Hasher);
+
+impl Hasher for HasherWrapper<'_> {
+    fn finish(&self) -> u64 {
+        self.0.finish()
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+}
+
 /// A runtime value in the interpreter.
-#[derive(Clone)]
 pub enum Value {
     /// Unit value.
     Unit,
@@ -45,6 +105,46 @@ pub enum Value {
         end: Box<Value>,
         inclusive: bool,
     },
+    /// A user-defined custom type.
+    Custom(Box<dyn DynValue>),
+}
+
+impl Clone for Value {
+    fn clone(&self) -> Self {
+        match self {
+            Value::Unit => Value::Unit,
+            Value::Bool(v) => Value::Bool(*v),
+            Value::I8(v) => Value::I8(*v),
+            Value::I16(v) => Value::I16(*v),
+            Value::I32(v) => Value::I32(*v),
+            Value::I64(v) => Value::I64(*v),
+            Value::I128(v) => Value::I128(*v),
+            Value::Isize(v) => Value::Isize(*v),
+            Value::U8(v) => Value::U8(*v),
+            Value::U16(v) => Value::U16(*v),
+            Value::U32(v) => Value::U32(*v),
+            Value::U64(v) => Value::U64(*v),
+            Value::U128(v) => Value::U128(*v),
+            Value::Usize(v) => Value::Usize(*v),
+            Value::F32(v) => Value::F32(*v),
+            Value::F64(v) => Value::F64(*v),
+            Value::Char(v) => Value::Char(*v),
+            Value::String(v) => Value::String(v.clone()),
+            Value::Tuple(v) => Value::Tuple(v.clone()),
+            Value::Option(v) => Value::Option(v.clone()),
+            Value::Dual(v) => Value::Dual(v.clone()),
+            Value::Range {
+                start,
+                end,
+                inclusive,
+            } => Value::Range {
+                start: start.clone(),
+                end: end.clone(),
+                inclusive: *inclusive,
+            },
+            Value::Custom(v) => Value::Custom(v.clone_box()),
+        }
+    }
 }
 
 /// Wrapper for floats that implements Hash and Eq via total ordering.
@@ -127,6 +227,7 @@ impl PartialEq for Value {
             (Value::Tuple(a), Value::Tuple(b)) => a == b,
             (Value::Option(a), Value::Option(b)) => a == b,
             (Value::Dual(a), Value::Dual(b)) => a == b,
+            (Value::Custom(a), Value::Custom(b)) => a.eq_box(b.as_ref()),
             _ => false,
         }
     }
@@ -168,6 +269,7 @@ impl Hash for Value {
                 end.hash(state);
                 inclusive.hash(state);
             }
+            Value::Custom(v) => v.hash_box(state),
         }
     }
 }
@@ -220,6 +322,7 @@ impl fmt::Debug for Value {
                     write!(f, "{start:?}..{end:?}")
                 }
             }
+            Value::Custom(v) => v.debug_fmt(f),
         }
     }
 }
@@ -229,6 +332,7 @@ impl fmt::Display for Value {
         match self {
             Value::String(s) => write!(f, "{s}"),
             Value::Char(c) => write!(f, "{c}"),
+            Value::Custom(v) => v.display_fmt(f),
             other => write!(f, "{other:?}"),
         }
     }
@@ -241,6 +345,11 @@ impl Value {
     /// Create a tuple value.
     pub fn tuple(values: Vec<Value>) -> Self {
         Value::Tuple(Rc::new(values))
+    }
+
+    /// Create a custom value from any type implementing the required traits.
+    pub fn custom<T: DynValue + 'static>(v: T) -> Self {
+        Value::Custom(Box::new(v))
     }
 
     /// Create a string value.
@@ -287,7 +396,6 @@ impl Value {
         match self {
             Value::Bool(v) => *v,
             Value::Option(None) => false,
-            Value::Option(Some(_)) => true,
             _ => true,
         }
     }
@@ -421,6 +529,7 @@ impl Value {
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
             // Dual reverses the ordering
             (Value::Dual(a), Value::Dual(b)) => b.partial_cmp_val(a),
+            (Value::Custom(a), Value::Custom(b)) => a.cmp_box(b.as_ref()),
             _ => None,
         }
     }
@@ -534,5 +643,130 @@ impl From<String> for Value {
 impl<T: Into<Value>> From<Option<T>> for Value {
     fn from(v: Option<T>) -> Self {
         Value::Option(v.map(|x| Box::new(x.into())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    impl fmt::Display for Point {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "({}, {})", self.x, self.y)
+        }
+    }
+
+    #[test]
+    fn test_custom_clone() {
+        let v = Value::custom(Point { x: 1, y: 2 });
+        let v2 = v.clone();
+        assert_eq!(v, v2);
+    }
+
+    #[test]
+    fn test_custom_eq() {
+        let a = Value::custom(Point { x: 1, y: 2 });
+        let b = Value::custom(Point { x: 1, y: 2 });
+        let c = Value::custom(Point { x: 3, y: 4 });
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_custom_eq_different_types() {
+        // Different concrete types are never equal
+        let a = Value::custom(Point { x: 1, y: 2 });
+        let b = Value::custom(42i64);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_custom_hash() {
+        let a = Value::custom(Point { x: 1, y: 2 });
+        let b = Value::custom(Point { x: 1, y: 2 });
+        let hash_a = {
+            let mut h = DefaultHasher::new();
+            a.hash(&mut h);
+            h.finish()
+        };
+        let hash_b = {
+            let mut h = DefaultHasher::new();
+            b.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn test_custom_debug() {
+        let v = Value::custom(Point { x: 1, y: 2 });
+        let dbg = format!("{v:?}");
+        assert!(dbg.contains("Point"));
+        assert!(dbg.contains("1"));
+        assert!(dbg.contains("2"));
+    }
+
+    #[test]
+    fn test_custom_display() {
+        let v = Value::custom(Point { x: 1, y: 2 });
+        let disp = format!("{v}");
+        assert_eq!(disp, "(1, 2)");
+    }
+
+    #[test]
+    fn test_custom_cmp() {
+        let a = Value::custom(Point { x: 1, y: 2 });
+        let b = Value::custom(Point { x: 3, y: 4 });
+        assert_eq!(a.partial_cmp_val(&b), Some(Ordering::Less));
+    }
+
+    #[test]
+    fn test_custom_no_arithmetic() {
+        let a = Value::custom(Point { x: 1, y: 2 });
+        let b = Value::custom(Point { x: 3, y: 4 });
+        assert!(a.add(&b).is_none());
+        assert!(a.neg().is_none());
+        assert!(a.not().is_none());
+        assert!(a.abs().is_none());
+    }
+
+    #[test]
+    fn test_custom_truthy() {
+        let v = Value::custom(Point { x: 0, y: 0 });
+        assert!(v.is_truthy());
+    }
+
+    #[test]
+    fn test_custom_cast_to_none() {
+        let v = Value::custom(Point { x: 1, y: 2 });
+        assert!(v.cast_to("i32").is_none());
+    }
+
+    #[test]
+    fn test_custom_lattice_join() {
+        let a = Value::custom(Point { x: 1, y: 2 });
+        let b = Value::custom(Point { x: 3, y: 4 });
+        // lattice_join uses partial_cmp_val → max
+        let joined = a.lattice_join(&b).unwrap();
+        assert_eq!(joined, Value::custom(Point { x: 3, y: 4 }));
+    }
+
+    #[test]
+    fn test_custom_downcast() {
+        let v = Value::custom(Point { x: 1, y: 2 });
+        if let Value::Custom(inner) = &v {
+            let point = inner.as_any().downcast_ref::<Point>().unwrap();
+            assert_eq!(point.x, 1);
+            assert_eq!(point.y, 2);
+        } else {
+            panic!("expected Custom");
+        }
     }
 }
