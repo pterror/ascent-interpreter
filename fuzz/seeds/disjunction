@@ -1,0 +1,4 @@
+relation a(i32);
+relation b(i32);
+relation c(i32);
+c(x) <-- (a(x) | b(x));

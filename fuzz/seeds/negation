@@ -1,0 +1,3 @@
+relation a(i32);
+relation b(i32);
+a(x) <-- b(x), !a(x);

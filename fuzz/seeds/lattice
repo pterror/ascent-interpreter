@@ -1,0 +1,4 @@
+lattice shortest(i32, i32, Dual<u32>);
+relation edge(i32, i32, u32);
+shortest(x, y, Dual(w)) <-- edge(x, y, w);
+shortest(x, z, Dual(w + l)) <-- edge(x, y, w), shortest(y, z, ?Dual(l));

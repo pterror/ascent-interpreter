@@ -1,0 +1,3 @@
+relation edge(i32, i32);
+relation self_loop(i32);
+self_loop(x) <-- edge(x, x);

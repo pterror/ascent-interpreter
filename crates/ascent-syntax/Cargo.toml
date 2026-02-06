@@ -12,3 +12,6 @@ proc-macro2.workspace = true
 quote.workspace = true
 derive-syn-parse.workspace = true
 itertools.workspace = true
+
+[dev-dependencies]
+proptest = "1"

@@ -3,8 +3,8 @@
 ## Parser
 
 - [x] Add desugaring pass (disjunctions → multiple rules, negation → aggregation, pattern args → if-let, wildcards → fresh vars)
-- [ ] Fuzz test parser against ascent_macro to verify 1:1 syntax parity
-- [ ] Property-based test: generate random valid ASTs, serialize, re-parse
+- [x] Fuzz test parser against ascent_macro to verify 1:1 syntax parity
+- [x] Property-based test: generate random valid ASTs, serialize, re-parse
 
 ## Interpreter Core
 

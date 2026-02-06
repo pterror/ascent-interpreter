@@ -1,0 +1,3 @@
+relation number(i32);
+relation even(i32);
+even(x) <-- number(x), if x % 2 == 0;

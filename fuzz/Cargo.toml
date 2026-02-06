@@ -1,0 +1,28 @@
+[package]
+name = "ascent-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+syn = { version = "2.0", features = ["full", "derive", "extra-traits"] }
+ascent-syntax = { path = "../crates/ascent-syntax" }
+ascent-ir = { path = "../crates/ascent-ir" }
+
+[[bin]]
+name = "fuzz_parser"
+path = "fuzz_targets/fuzz_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pipeline"
+path = "fuzz_targets/fuzz_pipeline.rs"
+test = false
+doc = false
+bench = false
