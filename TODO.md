@@ -8,7 +8,7 @@
 
 ## Interpreter Core
 
-- [ ] Design interpreter IR (simpler than ascent's HIR/MIR, focused on evaluation)
+- [x] Design interpreter IR (simpler than ascent's HIR/MIR, focused on evaluation)
 - [ ] Implement semi-naive evaluation loop
 - [ ] Relation storage (HashSet-based, indexed)
 - [ ] Variable binding and unification

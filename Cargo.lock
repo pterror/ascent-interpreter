@@ -6,7 +6,19 @@ version = 4
 name = "ascent-interpreter"
 version = "0.1.0"
 dependencies = [
+ "ascent-ir",
  "ascent-syntax",
+]
+
+[[package]]
+name = "ascent-ir"
+version = "0.1.0"
+dependencies = [
+ "ascent-syntax",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
