@@ -21,6 +21,7 @@
 //! assert_eq!(program.rules.len(), 2);
 //! ```
 
+pub mod desugar;
 mod syn_utils;
 mod syntax;
 mod utils;
