@@ -37,6 +37,8 @@ pub enum Value {
     Tuple(Rc<Vec<Value>>),
     /// Option type.
     Option(Option<Box<Value>>),
+    /// Dual lattice wrapper (reverses ordering for lattice join).
+    Dual(Box<Value>),
     /// A range (for generators).
     Range {
         start: Box<Value>,
@@ -124,6 +126,7 @@ impl PartialEq for Value {
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Tuple(a), Value::Tuple(b)) => a == b,
             (Value::Option(a), Value::Option(b)) => a == b,
+            (Value::Dual(a), Value::Dual(b)) => a == b,
             _ => false,
         }
     }
@@ -155,6 +158,7 @@ impl Hash for Value {
             Value::String(v) => v.hash(state),
             Value::Tuple(v) => v.hash(state),
             Value::Option(v) => v.hash(state),
+            Value::Dual(v) => v.hash(state),
             Value::Range {
                 start,
                 end,
@@ -204,6 +208,7 @@ impl fmt::Debug for Value {
             }
             Value::Option(None) => write!(f, "None"),
             Value::Option(Some(v)) => write!(f, "Some({v:?})"),
+            Value::Dual(v) => write!(f, "Dual({v:?})"),
             Value::Range {
                 start,
                 end,
@@ -414,7 +419,39 @@ impl Value {
             (Value::Char(a), Value::Char(b)) => Some(a.cmp(b)),
             (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+            // Dual reverses the ordering
+            (Value::Dual(a), Value::Dual(b)) => b.partial_cmp_val(a),
             _ => None,
+        }
+    }
+
+    /// Lattice join: combine two values using lattice semantics.
+    ///
+    /// For numeric types, join = max (least upper bound).
+    /// For Dual, join = Dual(min(inner)) (reversed).
+    /// Returns `Some(joined_value)` if a merge happened, `None` if types don't match.
+    pub fn lattice_join(&self, other: &Value) -> Option<Value> {
+        match (self, other) {
+            (Value::Dual(a), Value::Dual(b)) => {
+                // Dual join = Dual(meet of inner) = Dual(min)
+                a.partial_cmp_val(b).map(|ord| {
+                    Value::Dual(Box::new(if ord.is_le() {
+                        (**a).clone()
+                    } else {
+                        (**b).clone()
+                    }))
+                })
+            }
+            _ => {
+                // Regular join = max
+                self.partial_cmp_val(other).map(|ord| {
+                    if ord.is_ge() {
+                        self.clone()
+                    } else {
+                        other.clone()
+                    }
+                })
+            }
         }
     }
 

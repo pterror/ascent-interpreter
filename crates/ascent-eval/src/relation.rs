@@ -11,7 +11,7 @@ use crate::value::{Tuple, Value};
 pub struct RelationStorage {
     /// All tuples in the relation, stored as a Vec for index-based access.
     tuples: Vec<Tuple>,
-    /// Deduplication set.
+    /// Deduplication set (used for non-lattice relations).
     seen: HashSet<Tuple>,
     /// Indices of tuples added in the current iteration (delta).
     delta: Vec<usize>,
@@ -23,11 +23,20 @@ pub struct RelationStorage {
     indices: Vec<HashMap<Value, Vec<usize>>>,
     /// Number of columns.
     arity: usize,
+    /// Whether this is a lattice relation (last column is the lattice value).
+    is_lattice: bool,
+    /// For lattice relations: key columns → tuple index (for merge-by-key).
+    key_index: HashMap<Vec<Value>, usize>,
 }
 
 impl RelationStorage {
     /// Create a new relation with the given arity.
     pub fn new(arity: usize) -> Self {
+        Self::with_lattice(arity, false)
+    }
+
+    /// Create a new relation with the given arity, optionally as a lattice.
+    pub fn with_lattice(arity: usize, is_lattice: bool) -> Self {
         Self {
             tuples: Vec::new(),
             seen: HashSet::new(),
@@ -36,6 +45,8 @@ impl RelationStorage {
             recent_set: HashSet::new(),
             indices: (0..arity).map(|_| HashMap::new()).collect(),
             arity,
+            is_lattice,
+            key_index: HashMap::new(),
         }
     }
 
@@ -54,9 +65,18 @@ impl RelationStorage {
         self.tuples.len()
     }
 
-    /// Insert a tuple. Returns true if it was new.
+    /// Insert a tuple. Returns true if data changed.
+    ///
+    /// For regular relations: deduplicates by full tuple equality.
+    /// For lattice relations: merges by key columns (all except last),
+    /// applying lattice join on the last column.
     pub fn insert(&mut self, tuple: Tuple) -> bool {
         debug_assert_eq!(tuple.len(), self.arity, "tuple arity mismatch");
+
+        if self.is_lattice && self.arity > 0 {
+            return self.insert_lattice(tuple);
+        }
+
         if self.seen.insert(tuple.clone()) {
             let idx = self.tuples.len();
             // Update per-column indices
@@ -71,8 +91,58 @@ impl RelationStorage {
         }
     }
 
+    /// Lattice insert: merge by key columns using lattice join on last column.
+    fn insert_lattice(&mut self, tuple: Tuple) -> bool {
+        let key: Vec<Value> = tuple[..self.arity - 1].to_vec();
+        let new_lat = &tuple[self.arity - 1];
+
+        if let Some(&idx) = self.key_index.get(&key) {
+            // Key exists: try to merge lattice values
+            let old_lat = &self.tuples[idx][self.arity - 1];
+            if let Some(joined) = old_lat.lattice_join(new_lat)
+                && joined != *old_lat
+            {
+                // Lattice value changed: update in place
+                let old_val = self.tuples[idx][self.arity - 1].clone();
+                self.tuples[idx][self.arity - 1] = joined.clone();
+
+                // Update the last-column index
+                let last_col = self.arity - 1;
+                if let Some(entries) = self.indices[last_col].get_mut(&old_val) {
+                    entries.retain(|&i| i != idx);
+                }
+                self.indices[last_col].entry(joined).or_default().push(idx);
+
+                // Mark as changed
+                if !self.delta.contains(&idx) {
+                    self.delta.push(idx);
+                }
+                return true;
+            }
+            false
+        } else {
+            // New key: insert fresh tuple
+            let idx = self.tuples.len();
+            for (col, val) in tuple.iter().enumerate() {
+                self.indices[col].entry(val.clone()).or_default().push(idx);
+            }
+            self.key_index.insert(key, idx);
+            self.tuples.push(tuple);
+            self.delta.push(idx);
+            true
+        }
+    }
+
     /// Check if a tuple exists.
     pub fn contains(&self, tuple: &Tuple) -> bool {
+        if self.is_lattice && self.arity > 0 {
+            // For lattice relations, look up by key and check the full tuple
+            let key = &tuple[..self.arity - 1];
+            if let Some(&idx) = self.key_index.get(key) {
+                return self.tuples[idx] == *tuple;
+            }
+            return false;
+        }
         self.seen.contains(tuple)
     }
 
@@ -178,6 +248,45 @@ mod tests {
 
         assert_eq!(rel.recent.len(), 1);
         assert_eq!(rel.len(), 3);
+    }
+
+    #[test]
+    fn test_lattice_insert_merge() {
+        let mut rel = RelationStorage::with_lattice(2, true);
+
+        // First insert: key=1, lattice=10
+        assert!(rel.insert(vec![Value::I32(1), Value::I32(10)]));
+        assert_eq!(rel.len(), 1);
+
+        // Same key, smaller value: no change (join = max for i32)
+        assert!(!rel.insert(vec![Value::I32(1), Value::I32(5)]));
+        assert_eq!(rel.len(), 1);
+
+        // Same key, larger value: merge takes max
+        assert!(rel.insert(vec![Value::I32(1), Value::I32(20)]));
+        assert_eq!(rel.len(), 1);
+        assert!(rel.contains(&vec![Value::I32(1), Value::I32(20)]));
+
+        // Different key: new tuple
+        assert!(rel.insert(vec![Value::I32(2), Value::I32(15)]));
+        assert_eq!(rel.len(), 2);
+    }
+
+    #[test]
+    fn test_lattice_dual_merge() {
+        let mut rel = RelationStorage::with_lattice(2, true);
+
+        // Dual join = min of inner values
+        rel.insert(vec![Value::I32(1), Value::Dual(Box::new(Value::I32(10)))]);
+        assert_eq!(rel.len(), 1);
+
+        // Smaller inner value wins for Dual
+        assert!(rel.insert(vec![Value::I32(1), Value::Dual(Box::new(Value::I32(5)))]));
+        assert!(rel.contains(&vec![Value::I32(1), Value::Dual(Box::new(Value::I32(5)))]));
+
+        // Larger inner value: no change
+        assert!(!rel.insert(vec![Value::I32(1), Value::Dual(Box::new(Value::I32(20)))]));
+        assert!(rel.contains(&vec![Value::I32(1), Value::Dual(Box::new(Value::I32(5)))]));
     }
 
     #[test]

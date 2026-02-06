@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 
+use ascent::Dual;
 use ascent::aggregators::{count, max, min, sum};
 use ascent::ascent;
 use ascent_eval::Engine;
@@ -645,5 +646,124 @@ fn compare_cascading_aggregation() {
         interp1(&engine, "overall_best"),
         set1(prog.overall_best),
         "overall_best"
+    );
+}
+
+// ─── Lattice: Max Value ────────────────────────────────────────────
+
+#[test]
+fn compare_lattice_max() {
+    let engine = run("
+        lattice best(i32, i32);
+        best(1, 10);
+        best(1, 20);
+        best(1, 5);
+        best(2, 30);
+        best(2, 15);
+    ");
+
+    ascent! {
+        lattice best(i32, i32);
+        best(1, 10);
+        best(1, 20);
+        best(1, 5);
+        best(2, 30);
+        best(2, 15);
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(interp2(&engine, "best"), set2(prog.best));
+}
+
+// ─── Lattice: Shortest Path with Dual ──────────────────────────────
+
+#[test]
+fn compare_lattice_shortest_path() {
+    let engine = run("
+        relation edge(i32, i32, i32);
+        lattice shortest(i32, i32, Dual<i32>);
+
+        edge(1, 2, 1);
+        edge(2, 3, 2);
+        edge(1, 3, 10);
+
+        shortest(x, y, Dual(*w)) <-- edge(x, y, w);
+        shortest(x, z, Dual(w + l)) <-- edge(x, y, w), shortest(y, z, ?Dual(l));
+    ");
+
+    ascent! {
+        relation edge(i32, i32, i32);
+        lattice shortest(i32, i32, Dual<i32>);
+
+        edge(1, 2, 1);
+        edge(2, 3, 2);
+        edge(1, 3, 10);
+
+        shortest(x, y, Dual(*w)) <-- edge(x, y, w);
+        shortest(x, z, Dual(w + l)) <-- edge(x, y, w), shortest(y, z, ?Dual(l));
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    // Extract as (src, dst, inner_value) for comparison
+    let interp_sp: BTreeSet<(i32, i32, i32)> = engine
+        .relation("shortest")
+        .unwrap()
+        .iter()
+        .map(|t| match t.as_slice() {
+            [Value::I32(a), Value::I32(b), Value::Dual(d)] => match d.as_ref() {
+                Value::I32(v) => (*a, *b, *v),
+                other => panic!("expected Dual(i32), got Dual({other:?})"),
+            },
+            other => panic!("expected (i32, i32, Dual<i32>), got {other:?}"),
+        })
+        .collect();
+
+    let macro_sp: BTreeSet<(i32, i32, i32)> = prog
+        .shortest
+        .into_iter()
+        .map(|(a, b, d)| (a, b, *d))
+        .collect();
+
+    assert_eq!(interp_sp, macro_sp);
+}
+
+// ─── Lattice: Recursive Max Propagation ────────────────────────────
+
+#[test]
+fn compare_lattice_recursive_max() {
+    let engine = run("
+        relation edge(i32, i32);
+        relation source_val(i32, i32);
+        lattice max_reach(i32, i32);
+
+        edge(1, 2); edge(2, 3);
+        source_val(1, 100);
+        source_val(2, 50);
+
+        max_reach(x, v) <-- source_val(x, v);
+        max_reach(y, v) <-- edge(x, y), max_reach(x, v);
+    ");
+
+    ascent! {
+        relation edge(i32, i32);
+        relation source_val(i32, i32);
+        lattice max_reach(i32, i32);
+
+        edge(1, 2); edge(2, 3);
+        source_val(1, 100);
+        source_val(2, 50);
+
+        max_reach(x, v) <-- source_val(x, v);
+        max_reach(y, v) <-- edge(x, y), max_reach(x, v);
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(
+        interp2(&engine, "max_reach"),
+        set2(prog.max_reach),
+        "max_reach"
     );
 }

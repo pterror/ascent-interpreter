@@ -28,10 +28,10 @@
 
 ## Lattice Support
 
-- [ ] Add Dual value type and lattice join semantics
-- [ ] Lattice-aware insert (merge by key columns instead of dedup)
-- [ ] `?pattern` prefix for lattice value pattern matching
-- [ ] Port lattice tests from ascent (shortest path, etc.)
+- [x] Add Dual value type and lattice join semantics
+- [x] Lattice-aware insert (merge by key columns instead of dedup)
+- [x] `?pattern` prefix for lattice value pattern matching
+- [x] Port lattice tests from ascent (shortest path, etc.)
 
 ## JIT (Future)
 

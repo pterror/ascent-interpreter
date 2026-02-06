@@ -177,14 +177,17 @@ fn eval_tuple(tuple: &syn::ExprTuple, bindings: &Bindings) -> Option<Value> {
 
 /// Evaluate a function call (limited support).
 fn eval_call(call: &syn::ExprCall, bindings: &Bindings) -> Option<Value> {
-    // Handle Some(x) constructor
     if let Expr::Path(p) = &*call.func
         && let Some(ident) = p.path.get_ident()
-        && ident == "Some"
         && call.args.len() == 1
     {
+        let name = ident.to_string();
         let val = eval_expr(&call.args[0], bindings)?;
-        return Some(Value::Option(Some(Box::new(val))));
+        return match name.as_str() {
+            "Some" => Some(Value::Option(Some(Box::new(val)))),
+            "Dual" => Some(Value::Dual(Box::new(val))),
+            _ => None,
+        };
     }
     None
 }

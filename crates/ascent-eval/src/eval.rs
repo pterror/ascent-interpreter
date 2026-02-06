@@ -28,7 +28,10 @@ impl Engine {
 
         for (name, rel) in &program.relations {
             let arity = rel.column_types.len();
-            relations.insert(name.clone(), RelationStorage::new(arity));
+            relations.insert(
+                name.clone(),
+                RelationStorage::with_lattice(arity, rel.is_lattice),
+            );
         }
 
         Engine { relations }
@@ -599,6 +602,15 @@ fn match_pattern(pat: &syn::Pat, value: &Value, bindings: &mut Bindings) -> bool
             match path_str.as_str() {
                 "Some" => {
                     if let Value::Option(Some(inner)) = value
+                        && ts.elems.len() == 1
+                    {
+                        match_pattern(&ts.elems[0], inner, bindings)
+                    } else {
+                        false
+                    }
+                }
+                "Dual" => {
+                    if let Value::Dual(inner) = value
                         && ts.elems.len() == 1
                     {
                         match_pattern(&ts.elems[0], inner, bindings)
@@ -1193,5 +1205,128 @@ mod tests {
         assert!(isolated.contains(&vec![Value::I32(4)]));
         assert!(isolated.contains(&vec![Value::I32(5)]));
         assert_eq!(isolated.len(), 2);
+    }
+
+    // ─── Lattice tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_lattice_max_value() {
+        // Lattice relation keeps the max value per key
+        let engine = run_program(
+            r#"
+            lattice best_score(i32, i32);
+            best_score(1, 10);
+            best_score(1, 20);
+            best_score(1, 5);
+            best_score(2, 30);
+            best_score(2, 15);
+        "#,
+        );
+
+        let best = engine.relation("best_score").unwrap();
+        // Key 1: max(10, 20, 5) = 20
+        assert!(best.contains(&vec![Value::I32(1), Value::I32(20)]));
+        // Key 2: max(30, 15) = 30
+        assert!(best.contains(&vec![Value::I32(2), Value::I32(30)]));
+        assert_eq!(best.len(), 2);
+    }
+
+    #[test]
+    fn test_lattice_dual_shortest_path() {
+        // Shortest path using Dual (reverses ordering so join = min)
+        let engine = run_program(
+            r#"
+            relation edge(i32, i32, i32);
+            lattice shortest(i32, i32, Dual<i32>);
+
+            edge(1, 2, 1);
+            edge(2, 3, 2);
+            edge(1, 3, 10);
+
+            shortest(x, y, Dual(*w)) <-- edge(x, y, w);
+            shortest(x, z, Dual(w + l)) <-- edge(x, y, w), shortest(y, z, ?Dual(l));
+        "#,
+        );
+
+        let sp = engine.relation("shortest").unwrap();
+        // 1→2: direct = 1
+        assert!(sp.contains(&vec![
+            Value::I32(1),
+            Value::I32(2),
+            Value::Dual(Box::new(Value::I32(1)))
+        ]));
+        // 2→3: direct = 2
+        assert!(sp.contains(&vec![
+            Value::I32(2),
+            Value::I32(3),
+            Value::Dual(Box::new(Value::I32(2)))
+        ]));
+        // 1→3: min(10, 1+2) = 3
+        assert!(sp.contains(&vec![
+            Value::I32(1),
+            Value::I32(3),
+            Value::Dual(Box::new(Value::I32(3)))
+        ]));
+        assert_eq!(sp.len(), 3);
+    }
+
+    #[test]
+    fn test_lattice_recursive_max() {
+        // Lattice with recursive rule: max propagates through edges
+        let engine = run_program(
+            r#"
+            relation edge(i32, i32);
+            relation source_val(i32, i32);
+            lattice max_reach(i32, i32);
+
+            edge(1, 2);
+            edge(2, 3);
+            edge(3, 4);
+            source_val(1, 100);
+            source_val(2, 50);
+            source_val(3, 75);
+
+            max_reach(x, v) <-- source_val(x, v);
+            max_reach(y, v) <-- edge(x, y), max_reach(x, v);
+        "#,
+        );
+
+        let mr = engine.relation("max_reach").unwrap();
+        // Node 1: 100 (own value only)
+        assert!(mr.contains(&vec![Value::I32(1), Value::I32(100)]));
+        // Node 2: max(50, 100) = 100 (from node 1)
+        assert!(mr.contains(&vec![Value::I32(2), Value::I32(100)]));
+        // Node 3: max(75, 100) = 100 (propagated through)
+        assert!(mr.contains(&vec![Value::I32(3), Value::I32(100)]));
+        // Node 4: max(100) = 100 (propagated from node 3)
+        assert!(mr.contains(&vec![Value::I32(4), Value::I32(100)]));
+        assert_eq!(mr.len(), 4);
+    }
+
+    #[test]
+    fn test_lattice_with_pattern_match() {
+        // Pattern matching with ?Dual(x) to extract inner value
+        let engine = run_program(
+            r#"
+            lattice best(i32, Dual<i32>);
+            relation result(i32, i32);
+
+            best(1, Dual(10));
+            best(1, Dual(5));
+            best(2, Dual(20));
+            best(2, Dual(3));
+
+            result(k, v) <-- best(k, ?Dual(v));
+        "#,
+        );
+
+        let best = engine.relation("best").unwrap();
+        // Dual join = min: Dual(min(10, 5)) = Dual(5)
+        assert!(best.contains(&vec![Value::I32(1), Value::Dual(Box::new(Value::I32(5)))]));
+        assert!(best.contains(&vec![Value::I32(2), Value::Dual(Box::new(Value::I32(3)))]));
+
+        let result = engine.relation("result").unwrap();
+        assert!(result.contains(&vec![Value::I32(1), Value::I32(5)]));
+        assert!(result.contains(&vec![Value::I32(2), Value::I32(3)]));
     }
 }
