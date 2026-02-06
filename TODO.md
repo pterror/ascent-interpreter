@@ -22,8 +22,16 @@
 
 - [x] REPL for interactive Datalog queries
 - [x] File-based program execution
-- [ ] Incremental evaluation (add/retract facts)
+- [x] Incremental evaluation (:retract to remove facts, :undo to remove last statement)
 - [x] Query interface (:query rel(pattern, ...) with wildcards, int/string/bool filters)
+- [x] Per-column hash indices for join acceleration
+
+## Lattice Support
+
+- [ ] Add Dual value type and lattice join semantics
+- [ ] Lattice-aware insert (merge by key columns instead of dedup)
+- [ ] `?pattern` prefix for lattice value pattern matching
+- [ ] Port lattice tests from ascent (shortest path, etc.)
 
 ## JIT (Future)
 

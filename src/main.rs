@@ -138,6 +138,64 @@ fn repl() {
                         }
                     }
                 }
+                ":undo" => {
+                    if source.is_empty() {
+                        eprintln!("(nothing to undo)");
+                    } else if let Some(pos) = source.rfind('\n') {
+                        let removed = source[pos + 1..].trim().to_string();
+                        source.truncate(pos);
+                        // Verify the remaining source still parses
+                        if !source.trim().is_empty() {
+                            if let Err(e) = eval_source(&source) {
+                                // Restore if it breaks
+                                source.push('\n');
+                                source.push_str(&removed);
+                                eprintln!("undo failed (would break program): {e}");
+                            } else {
+                                eprintln!("(removed: {removed})");
+                                prev_counts.clear();
+                            }
+                        } else {
+                            eprintln!("(removed: {removed})");
+                            prev_counts.clear();
+                        }
+                    } else {
+                        let removed = source.trim().to_string();
+                        source.clear();
+                        prev_counts.clear();
+                        eprintln!("(removed: {removed})");
+                    }
+                }
+                ":retract" => {
+                    if arg.is_empty() {
+                        eprintln!("usage: :retract fact(args);");
+                    } else if source.is_empty() {
+                        eprintln!("(no program)");
+                    } else {
+                        let needle = arg.trim().trim_end_matches(';');
+                        let mut found = false;
+                        let lines: Vec<&str> = source.lines().collect();
+                        let mut new_source = String::new();
+                        for line in &lines {
+                            let trimmed_line = line.trim().trim_end_matches(';');
+                            if !found && trimmed_line == needle {
+                                found = true;
+                                continue;
+                            }
+                            if !new_source.is_empty() {
+                                new_source.push('\n');
+                            }
+                            new_source.push_str(line);
+                        }
+                        if found {
+                            source = new_source;
+                            prev_counts.clear();
+                            eprintln!("(retracted: {needle})");
+                        } else {
+                            eprintln!("(not found: {needle})");
+                        }
+                    }
+                }
                 ":relations" | ":rels" => {
                     if source.is_empty() {
                         eprintln!("(no relations)");
@@ -184,6 +242,8 @@ fn print_help() {
     eprintln!("  :query rel(1, _)  Filter tuples by pattern (_, int, \"str\", bool)");
     eprintln!("  :count <rel>      Show number of tuples in a relation");
     eprintln!("  :dump             Show all non-empty relations");
+    eprintln!("  :undo             Remove the last statement");
+    eprintln!("  :retract fact     Remove a specific fact from the program");
     eprintln!("  :source           Show accumulated program source");
     eprintln!("  :clear            Clear program and start over");
     eprintln!("  :quit             Exit the REPL");
