@@ -15,7 +15,7 @@
 - [x] Built-in aggregators (count, sum, min, max, mean, not)
 - [x] Expression evaluation (arithmetic, comparisons, ranges, generators)
 - [x] Stratification (aggregation rules run after base rules reach fixpoint)
-- [ ] Pattern matching in conditions (if let)
+- [x] Pattern matching in conditions (if let)
 - [ ] Full dependency-based stratification (SCC analysis)
 
 ## Runtime
@@ -33,7 +33,7 @@
 
 ## Testing
 
-- [x] Port ascent test suite (24 compat tests: fizzbuzz, factorial, negation, aggregation, joins, etc.)
+- [x] Port ascent test suite (28 compat tests: fizzbuzz, factorial, negation, aggregation, joins, pattern matching, etc.)
 - [ ] Comparison tests: run same program in ascent macro vs interpreter, compare results
 - [ ] Performance benchmarks (transitive closure, graph algorithms)
 

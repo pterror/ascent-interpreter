@@ -727,3 +727,113 @@ fn test_constant_in_clause() {
     let ones = rel_set(&engine, "ones");
     assert_eq!(ones, [10, 20].into_iter().map(|v| vec![i(v)]).collect());
 }
+
+// ─── If let: Option pattern matching ────────────────────────────────
+// From: ascent_tests/src/tests.rs (test_dl_pattern_args)
+// Tests: if let Some(y) = x pattern in conditions
+
+#[test]
+fn test_if_let_option() {
+    let engine = run_with_facts(
+        r#"
+        relation input(i32, Option<i32>);
+        relation output(i32, i32);
+        output(x, y) <-- input(x, opt), if let Some(y) = opt;
+    "#,
+        vec![(
+            "input",
+            vec![
+                vec![i(1), Value::Option(None)],
+                vec![i(2), Value::Option(Some(Box::new(i(20))))],
+                vec![i(3), Value::Option(Some(Box::new(i(30))))],
+                vec![i(4), Value::Option(None)],
+            ],
+        )],
+    );
+
+    let output = rel_set(&engine, "output");
+    assert_eq!(
+        output,
+        [vec![i(2), i(20)], vec![i(3), i(30)]].into_iter().collect()
+    );
+}
+
+// ─── If let with filter ─────────────────────────────────────────────
+// From: ascent_tests/src/tests.rs (test_dl_pattern_args)
+// Tests: if let combined with inequality filter
+
+#[test]
+fn test_if_let_with_filter() {
+    let engine = run_with_facts(
+        r#"
+        relation input(i32, Option<i32>);
+        relation output(i32, i32);
+        output(x, y) <-- input(x, opt), if let Some(y) = opt, if y != x;
+    "#,
+        vec![(
+            "input",
+            vec![
+                vec![i(2), Value::Option(Some(Box::new(i(2))))],
+                vec![i(3), Value::Option(Some(Box::new(i(30))))],
+            ],
+        )],
+    );
+
+    let output = rel_set(&engine, "output");
+    // (2, 2) filtered out because y == x
+    assert_eq!(output, [vec![i(3), i(30)]].into_iter().collect());
+}
+
+// ─── Let binding ────────────────────────────────────────────────────
+// Tests: let binding introduces a new variable
+
+#[test]
+fn test_let_binding() {
+    let engine = run(r#"
+        relation input(i32);
+        relation output(i32, i32);
+
+        input(x) <-- for x in 1..6;
+        output(x, doubled) <-- input(x), let doubled = x * 2;
+    "#);
+
+    let output = rel_set(&engine, "output");
+    assert!(output.contains(&vec![i(1), i(2)]));
+    assert!(output.contains(&vec![i(3), i(6)]));
+    assert!(output.contains(&vec![i(5), i(10)]));
+    assert_eq!(output.len(), 5);
+}
+
+// ─── If let with join ───────────────────────────────────────────────
+// Tests: pattern-matched value used in subsequent join
+
+#[test]
+fn test_if_let_join() {
+    let engine = run_with_facts(
+        r#"
+        relation source(i32, Option<i32>);
+        relation lookup(i32, i32);
+        relation result(i32, i32);
+        result(x, z) <-- source(x, opt), if let Some(y) = opt, lookup(y, z);
+    "#,
+        vec![
+            (
+                "source",
+                vec![
+                    vec![i(1), Value::Option(Some(Box::new(i(10))))],
+                    vec![i(2), Value::Option(None)],
+                    vec![i(3), Value::Option(Some(Box::new(i(20))))],
+                ],
+            ),
+            ("lookup", vec![vec![i(10), i(100)], vec![i(20), i(200)]]),
+        ],
+    );
+
+    let result = rel_set(&engine, "result");
+    assert_eq!(
+        result,
+        [vec![i(1), i(100)], vec![i(3), i(200)]]
+            .into_iter()
+            .collect()
+    );
+}

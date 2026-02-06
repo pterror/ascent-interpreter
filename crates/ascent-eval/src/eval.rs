@@ -232,9 +232,9 @@ impl Engine {
         for binding in bindings {
             for tuple in &tuples {
                 if let Some(new_binding) = self.match_clause(clause, tuple, binding.clone())
-                    && self.check_clause_conditions(clause, &new_binding)
+                    && let Some(final_binding) = self.check_clause_conditions(clause, new_binding)
                 {
-                    results.push(new_binding);
+                    results.push(final_binding);
                 }
             }
         }
@@ -277,14 +277,12 @@ impl Engine {
         Some(bindings)
     }
 
-    /// Check additional conditions on a clause.
-    fn check_clause_conditions(&self, clause: &Clause, bindings: &Bindings) -> bool {
+    /// Check additional conditions on a clause, potentially extending bindings.
+    fn check_clause_conditions(&self, clause: &Clause, mut bindings: Bindings) -> Option<Bindings> {
         for cond in &clause.conditions {
-            if !self.eval_condition(cond, bindings) {
-                return false;
-            }
+            bindings = self.eval_condition(cond, bindings)?;
         }
-        true
+        Some(bindings)
     }
 
     /// Process a generator.
@@ -393,27 +391,44 @@ impl Engine {
         Some(bindings)
     }
 
-    /// Process a condition filter.
+    /// Process a condition, potentially binding new variables.
     fn process_condition(&self, cond: &Condition, bindings: Vec<Bindings>) -> Vec<Bindings> {
         bindings
             .into_iter()
-            .filter(|b| self.eval_condition(cond, b))
+            .filter_map(|b| self.eval_condition(cond, b))
             .collect()
     }
 
-    /// Evaluate a condition.
-    fn eval_condition(&self, cond: &Condition, bindings: &Bindings) -> bool {
+    /// Evaluate a condition. Returns updated bindings on success, None on failure.
+    fn eval_condition(&self, cond: &Condition, bindings: Bindings) -> Option<Bindings> {
         match cond {
-            Condition::If(expr) => eval_expr(expr, bindings)
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            Condition::IfLet { .. } => {
-                // TODO: implement pattern matching
-                true
+            Condition::If(expr) => {
+                if eval_expr(expr, &bindings)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    Some(bindings)
+                } else {
+                    None
+                }
             }
-            Condition::Let { .. } => {
-                // TODO: implement let binding
-                true
+            Condition::IfLet { pattern, expr } => {
+                let value = eval_expr(expr, &bindings)?;
+                let mut new_bindings = bindings;
+                if match_pattern(pattern, &value, &mut new_bindings) {
+                    Some(new_bindings)
+                } else {
+                    None
+                }
+            }
+            Condition::Let { pattern, expr } => {
+                let value = eval_expr(expr, &bindings)?;
+                let mut new_bindings = bindings;
+                if match_pattern(pattern, &value, &mut new_bindings) {
+                    Some(new_bindings)
+                } else {
+                    None
+                }
             }
         }
     }
@@ -439,6 +454,115 @@ fn rule_has_aggregation(rule: &Rule) -> bool {
     rule.body
         .iter()
         .any(|item| matches!(item, BodyItem::Aggregation(_)))
+}
+
+/// Match a pattern against a value, extending bindings on success.
+fn match_pattern(pat: &syn::Pat, value: &Value, bindings: &mut Bindings) -> bool {
+    match pat {
+        // Wildcard: always matches, binds nothing
+        syn::Pat::Wild(_) => true,
+
+        // Variable binding: `x` or `mut x`
+        syn::Pat::Ident(ident) => {
+            let name = ident.ident.to_string();
+            // Handle `_` identifiers as wildcards
+            if name == "_" {
+                return true;
+            }
+            // If there's a subpattern (`name @ pattern`), match it too
+            if let Some((_, sub_pat)) = &ident.subpat
+                && !match_pattern(sub_pat, value, bindings)
+            {
+                return false;
+            }
+            bindings.insert(name, value.clone());
+            true
+        }
+
+        // Literal pattern: `42`, `true`, `'a'`
+        syn::Pat::Lit(expr_lit) => {
+            let expr = syn::Expr::Lit(expr_lit.clone());
+            if let Some(lit_val) = eval_expr(&expr, bindings) {
+                lit_val == *value
+            } else {
+                false
+            }
+        }
+
+        // Reference pattern: `&x` — in Datalog context, match the inner pattern
+        syn::Pat::Reference(r) => match_pattern(&r.pat, value, bindings),
+
+        // Tuple pattern: `(a, b, c)`
+        syn::Pat::Tuple(tuple) => {
+            if let Value::Tuple(vals) = value {
+                if vals.len() != tuple.elems.len() {
+                    return false;
+                }
+                for (pat_elem, val) in tuple.elems.iter().zip(vals.iter()) {
+                    if !match_pattern(pat_elem, val, bindings) {
+                        return false;
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }
+
+        // Tuple struct pattern: `Some(x)`, `Ok(v)`
+        syn::Pat::TupleStruct(ts) => {
+            let path_str = path_to_string(&ts.path);
+            match path_str.as_str() {
+                "Some" => {
+                    if let Value::Option(Some(inner)) = value
+                        && ts.elems.len() == 1
+                    {
+                        match_pattern(&ts.elems[0], inner, bindings)
+                    } else {
+                        false
+                    }
+                }
+                "None" => matches!(value, Value::Option(None)),
+                _ => false,
+            }
+        }
+
+        // Path pattern: `None`, `true`, `false`
+        syn::Pat::Path(p) => {
+            let path_str = path_to_string(&p.path);
+            match path_str.as_str() {
+                "None" => matches!(value, Value::Option(None)),
+                "true" => matches!(value, Value::Bool(true)),
+                "false" => matches!(value, Value::Bool(false)),
+                _ => false,
+            }
+        }
+
+        // Or pattern: `A | B`
+        syn::Pat::Or(or_pat) => {
+            for case in &or_pat.cases {
+                let mut trial = bindings.clone();
+                if match_pattern(case, value, &mut trial) {
+                    *bindings = trial;
+                    return true;
+                }
+            }
+            false
+        }
+
+        // Parenthesized: `(pattern)`
+        syn::Pat::Paren(p) => match_pattern(&p.pat, value, bindings),
+
+        _ => false,
+    }
+}
+
+/// Convert a syn::Path to a simple string (last segment).
+fn path_to_string(path: &syn::Path) -> String {
+    path.segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default()
 }
 
 /// Extract the aggregator name from an expression.
