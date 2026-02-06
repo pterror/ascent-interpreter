@@ -12,12 +12,16 @@
 - [x] Implement semi-naive evaluation loop
 - [x] Relation storage (HashSet-based, indexed)
 - [x] Variable binding and unification
-- [ ] Built-in aggregators (count, sum, min, max, mean)
+- [x] Built-in aggregators (count, sum, min, max, mean, not)
+- [x] Expression evaluation (arithmetic, comparisons, ranges, generators)
+- [x] Stratification (aggregation rules run after base rules reach fixpoint)
+- [ ] Pattern matching in conditions (if let)
+- [ ] Full dependency-based stratification (SCC analysis)
 
 ## Runtime
 
-- [ ] REPL for interactive Datalog queries
-- [ ] File-based program execution
+- [x] REPL for interactive Datalog queries
+- [x] File-based program execution
 - [ ] Incremental evaluation (add/retract facts)
 - [ ] Query interface (ask questions about computed relations)
 

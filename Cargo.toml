@@ -31,3 +31,4 @@ description = "Interpreter and JIT for Ascent Datalog programs"
 ascent-syntax.workspace = true
 ascent-ir.workspace = true
 ascent-eval.workspace = true
+syn.workspace = true

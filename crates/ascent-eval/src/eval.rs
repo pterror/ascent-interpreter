@@ -51,10 +51,27 @@ impl Engine {
         }
     }
 
-    /// Run the program to fixpoint using semi-naive evaluation.
+    /// Run the program to fixpoint using semi-naive evaluation with stratification.
+    ///
+    /// Rules are partitioned into strata: non-aggregation rules first, then
+    /// aggregation rules. Each stratum runs to fixpoint before the next begins.
+    /// This ensures aggregation sees complete input relations.
     pub fn run(&mut self, program: &Program) {
+        let (base_rules, agg_rules): (Vec<_>, Vec<_>) =
+            program.rules.iter().partition(|r| !rule_has_aggregation(r));
+
+        self.run_stratum(&base_rules);
+        self.run_stratum(&agg_rules);
+    }
+
+    /// Run a set of rules to fixpoint.
+    fn run_stratum(&mut self, rules: &[&Rule]) {
+        if rules.is_empty() {
+            return;
+        }
+
         // Initial iteration: evaluate all rules once
-        for rule in &program.rules {
+        for rule in rules {
             self.evaluate_rule(rule, false);
         }
 
@@ -70,7 +87,7 @@ impl Engine {
         while changed {
             changed = false;
 
-            for rule in &program.rules {
+            for rule in rules {
                 self.evaluate_rule(rule, true);
             }
 
@@ -84,7 +101,7 @@ impl Engine {
 
     /// Evaluate a single rule.
     fn evaluate_rule(&mut self, rule: &Rule, use_recent: bool) {
-        if use_recent && !self.rule_has_recent_clause(rule) {
+        if use_recent && !self.rule_has_recent_data(rule) {
             return;
         }
 
@@ -95,11 +112,15 @@ impl Engine {
         }
     }
 
-    /// Check if any clause in the rule has recent tuples.
-    fn rule_has_recent_clause(&self, rule: &Rule) -> bool {
+    /// Check if any relation referenced in the rule body has recent tuples.
+    fn rule_has_recent_data(&self, rule: &Rule) -> bool {
         for item in &rule.body {
-            if let BodyItem::Clause(clause) = item
-                && let Some(rel) = self.relations.get(&clause.relation)
+            let rel_name = match item {
+                BodyItem::Clause(clause) => &clause.relation,
+                BodyItem::Aggregation(agg) => &agg.relation,
+                _ => continue,
+            };
+            if let Some(rel) = self.relations.get(rel_name)
                 && rel.iter_recent().next().is_some()
             {
                 return true;
@@ -376,6 +397,13 @@ impl Engine {
 
         Some(tuple)
     }
+}
+
+/// Check if a rule contains any aggregation body items.
+fn rule_has_aggregation(rule: &Rule) -> bool {
+    rule.body
+        .iter()
+        .any(|item| matches!(item, BodyItem::Aggregation(_)))
 }
 
 /// Extract the aggregator name from an expression.
@@ -707,5 +735,54 @@ mod tests {
         assert!(only_a.contains(&vec![Value::I32(3)]));
         assert!(!only_a.contains(&vec![Value::I32(2)]));
         assert_eq!(only_a.len(), 2);
+    }
+
+    #[test]
+    fn test_stratification_agg_after_recursion() {
+        // Aggregation over a recursively-computed relation.
+        // fib_max should see the complete fib relation, not partial results.
+        let engine = run_program(
+            r#"
+            relation fib(i32, i32);
+            relation fib_max(i32);
+            fib(0, 1);
+            fib(1, 1);
+            fib(n + 1, a + b) <-- fib(n, a), fib(n - 1, b), if n < 10;
+            fib_max(m) <-- agg m = max(v) in fib(_, v);
+        "#,
+        );
+
+        let fib_max = engine.relation("fib_max").unwrap();
+        assert_eq!(fib_max.len(), 1);
+        assert!(fib_max.contains(&vec![Value::I32(89)]));
+    }
+
+    #[test]
+    fn test_negation_with_recursive_input() {
+        // Negation (which uses aggregation internally) should see complete
+        // recursive results thanks to stratification.
+        let engine = run_program(
+            r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            relation unreachable(i32);
+            relation node(i32);
+            edge(1, 2);
+            edge(2, 3);
+            node(1);
+            node(2);
+            node(3);
+            node(4);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- edge(x, y), path(y, z);
+            unreachable(x) <-- node(x), !path(1, x);
+        "#,
+        );
+
+        let unreachable = engine.relation("unreachable").unwrap();
+        // Node 4 is unreachable from node 1; node 1 is unreachable from itself
+        assert!(unreachable.contains(&vec![Value::I32(4)]));
+        assert!(unreachable.contains(&vec![Value::I32(1)]));
+        assert_eq!(unreachable.len(), 2);
     }
 }
