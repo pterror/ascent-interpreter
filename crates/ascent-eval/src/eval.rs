@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use ascent_ir::{BodyItem, Clause, ClauseArg, Condition, Program, Rule};
 
+use crate::expr::{eval_expr, expand_range};
 use crate::relation::RelationStorage;
 use crate::value::{Tuple, Value};
 
@@ -69,11 +70,9 @@ impl Engine {
             changed = false;
 
             for rule in &program.rules {
-                // For semi-naive, we need at least one clause to use recent tuples
                 self.evaluate_rule(rule, true);
             }
 
-            // Advance all relations
             for rel in self.relations.values_mut() {
                 if rel.advance() {
                     changed = true;
@@ -84,15 +83,12 @@ impl Engine {
 
     /// Evaluate a single rule.
     fn evaluate_rule(&mut self, rule: &Rule, use_recent: bool) {
-        // If using semi-naive and no clauses use recent, skip
         if use_recent && !self.rule_has_recent_clause(rule) {
             return;
         }
 
-        // Collect all derived tuples first to avoid borrow issues
         let derived = self.derive_tuples(rule, use_recent);
 
-        // Insert derived tuples
         for (relation, tuple) in derived {
             self.insert(&relation, tuple);
         }
@@ -115,13 +111,9 @@ impl Engine {
     fn derive_tuples(&self, rule: &Rule, use_recent: bool) -> Vec<(String, Tuple)> {
         let mut results = Vec::new();
 
-        // Start with empty bindings
         let initial_bindings = vec![Bindings::new()];
-
-        // Process each body item
         let final_bindings = self.process_body(&rule.body, initial_bindings, use_recent);
 
-        // For each complete binding, produce head tuples
         for bindings in final_bindings {
             for head in &rule.heads {
                 if let Some(tuple) = self.eval_head_tuple(head, &bindings) {
@@ -149,7 +141,6 @@ impl Engine {
 
             current = match item {
                 BodyItem::Clause(clause) => {
-                    // For semi-naive: at least one clause should use recent
                     let use_recent_for_this = use_recent && i == 0;
                     self.process_clause(clause, current, use_recent_for_this)
                 }
@@ -178,7 +169,6 @@ impl Engine {
 
         let mut results = Vec::new();
 
-        // Choose iterator based on semi-naive flag
         let tuples: Vec<_> = if use_recent {
             rel.iter_recent().collect()
         } else {
@@ -187,11 +177,10 @@ impl Engine {
 
         for binding in bindings {
             for tuple in &tuples {
-                if let Some(new_binding) = self.match_clause(clause, tuple, binding.clone()) {
-                    // Check additional conditions on the clause
-                    if self.check_clause_conditions(clause, &new_binding) {
-                        results.push(new_binding);
-                    }
+                if let Some(new_binding) = self.match_clause(clause, tuple, binding.clone())
+                    && self.check_clause_conditions(clause, &new_binding)
+                {
+                    results.push(new_binding);
                 }
             }
         }
@@ -221,9 +210,12 @@ impl Engine {
                         bindings.insert(var.clone(), value.clone());
                     }
                 }
-                ClauseArg::Expr(_expr) => {
-                    // TODO: evaluate expression and compare
-                    // For now, just skip
+                ClauseArg::Expr(expr) => {
+                    if let Some(evaluated) = eval_expr(expr, &bindings)
+                        && evaluated != *value
+                    {
+                        return None;
+                    }
                 }
             }
         }
@@ -250,12 +242,11 @@ impl Engine {
         let mut results = Vec::new();
 
         for binding in bindings {
-            // TODO: properly evaluate generator expression
-            // For now, handle simple range patterns
-            if let Some(values) = self.eval_generator_values(generator, &binding) {
+            if let Some(range_val) = eval_expr(&generator.expr, &binding)
+                && let Some(values) = expand_range(&range_val)
+            {
                 for value in values {
                     let mut new_binding = binding.clone();
-                    // Bind the first variable to the value
                     if let Some(var) = generator.vars.first() {
                         new_binding.insert(var.clone(), value);
                     }
@@ -267,17 +258,6 @@ impl Engine {
         results
     }
 
-    /// Evaluate generator to produce values.
-    fn eval_generator_values(
-        &self,
-        _generator: &ascent_ir::Generator,
-        _bindings: &Bindings,
-    ) -> Option<Vec<Value>> {
-        // TODO: implement proper expression evaluation
-        // For now, return None (generator not supported yet)
-        None
-    }
-
     /// Process a condition filter.
     fn process_condition(&self, cond: &Condition, bindings: Vec<Bindings>) -> Vec<Bindings> {
         bindings
@@ -287,24 +267,17 @@ impl Engine {
     }
 
     /// Evaluate a condition.
-    fn eval_condition(&self, cond: &Condition, _bindings: &Bindings) -> bool {
+    fn eval_condition(&self, cond: &Condition, bindings: &Bindings) -> bool {
         match cond {
-            Condition::If(_expr) => {
-                // TODO: evaluate expression
+            Condition::If(expr) => eval_expr(expr, bindings)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            Condition::IfLet { .. } => {
+                // TODO: implement pattern matching
                 true
             }
-            Condition::IfLet {
-                pattern: _,
-                expr: _,
-            } => {
-                // TODO: evaluate pattern match
-                true
-            }
-            Condition::Let {
-                pattern: _,
-                expr: _,
-            } => {
-                // TODO: evaluate let binding
+            Condition::Let { .. } => {
+                // TODO: implement let binding
                 true
             }
         }
@@ -315,8 +288,7 @@ impl Engine {
         let mut tuple = Vec::with_capacity(head.args.len());
 
         for arg in &head.args {
-            // Try to evaluate the expression
-            if let Some(value) = self.eval_expr_simple(arg, bindings) {
+            if let Some(value) = eval_expr(arg, bindings) {
                 tuple.push(value);
             } else {
                 return None;
@@ -324,35 +296,6 @@ impl Engine {
         }
 
         Some(tuple)
-    }
-
-    /// Simple expression evaluation (variables only for now).
-    fn eval_expr_simple(&self, expr: &syn::Expr, bindings: &Bindings) -> Option<Value> {
-        match expr {
-            syn::Expr::Path(p) => {
-                if let Some(ident) = p.path.get_ident() {
-                    bindings.get(&ident.to_string()).cloned()
-                } else {
-                    None
-                }
-            }
-            syn::Expr::Lit(lit) => self.eval_lit(&lit.lit),
-            _ => None,
-        }
-    }
-
-    /// Evaluate a literal.
-    fn eval_lit(&self, lit: &syn::Lit) -> Option<Value> {
-        match lit {
-            syn::Lit::Int(i) => {
-                let v: i64 = i.base10_parse().ok()?;
-                Some(Value::I64(v))
-            }
-            syn::Lit::Bool(b) => Some(Value::Bool(b.value)),
-            syn::Lit::Str(s) => Some(Value::string(s.value())),
-            syn::Lit::Char(c) => Some(Value::Char(c.value())),
-            _ => None,
-        }
     }
 }
 
@@ -370,48 +313,56 @@ mod tests {
         engine
     }
 
-    #[test]
-    fn test_simple_fact() {
-        let mut engine = run_program(
-            r#"
-            relation edge(i32, i32);
-            edge(1, 2);
-        "#,
-        );
-
-        // Manually insert the fact since we don't evaluate literals in facts yet
-        engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-
-        assert!(
-            engine
-                .relation("edge")
-                .unwrap()
-                .contains(&vec![Value::I32(1), Value::I32(2)])
-        );
-    }
-
-    #[test]
-    fn test_transitive_closure() {
-        let input = r#"
-            relation edge(i32, i32);
-            relation path(i32, i32);
-            path(x, y) <-- edge(x, y);
-            path(x, z) <-- edge(x, y), path(y, z);
-        "#;
-
+    fn run_with_facts(input: &str, facts: Vec<(&str, Vec<Tuple>)>) -> Engine {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast);
         let mut engine = Engine::new(&program);
 
-        // Insert initial edges
-        engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-        engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
-        engine.insert("edge", vec![Value::I32(3), Value::I32(4)]);
+        for (rel, tuples) in facts {
+            for tuple in tuples {
+                engine.insert(rel, tuple);
+            }
+        }
 
-        // Run to fixpoint
         engine.run(&program);
+        engine
+    }
 
-        // Check paths
+    #[test]
+    fn test_fact_with_literals() {
+        let engine = run_program(
+            r#"
+            relation edge(i32, i32);
+            edge(1, 2);
+            edge(2, 3);
+        "#,
+        );
+
+        let edge = engine.relation("edge").unwrap();
+        assert!(edge.contains(&vec![Value::I32(1), Value::I32(2)]));
+        assert!(edge.contains(&vec![Value::I32(2), Value::I32(3)]));
+        assert_eq!(edge.len(), 2);
+    }
+
+    #[test]
+    fn test_transitive_closure() {
+        let engine = run_with_facts(
+            r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- edge(x, y), path(y, z);
+        "#,
+            vec![(
+                "edge",
+                vec![
+                    vec![Value::I32(1), Value::I32(2)],
+                    vec![Value::I32(2), Value::I32(3)],
+                    vec![Value::I32(3), Value::I32(4)],
+                ],
+            )],
+        );
+
         let path = engine.relation("path").unwrap();
         assert!(path.contains(&vec![Value::I32(1), Value::I32(2)]));
         assert!(path.contains(&vec![Value::I32(1), Value::I32(3)]));
@@ -423,28 +374,147 @@ mod tests {
     }
 
     #[test]
+    fn test_transitive_closure_from_facts() {
+        let engine = run_program(
+            r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            edge(1, 2);
+            edge(2, 3);
+            edge(3, 4);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- edge(x, y), path(y, z);
+        "#,
+        );
+
+        let path = engine.relation("path").unwrap();
+        assert_eq!(path.len(), 6);
+    }
+
+    #[test]
     fn test_join() {
-        let input = r#"
+        let engine = run_with_facts(
+            r#"
             relation r(i32, i32);
             relation s(i32, i32);
             relation joined(i32, i32, i32);
             joined(a, b, c) <-- r(a, b), s(b, c);
-        "#;
-
-        let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
-        let mut engine = Engine::new(&program);
-
-        engine.insert("r", vec![Value::I32(1), Value::I32(2)]);
-        engine.insert("r", vec![Value::I32(3), Value::I32(4)]);
-        engine.insert("s", vec![Value::I32(2), Value::I32(5)]);
-        engine.insert("s", vec![Value::I32(4), Value::I32(6)]);
-
-        engine.run(&program);
+        "#,
+            vec![
+                (
+                    "r",
+                    vec![
+                        vec![Value::I32(1), Value::I32(2)],
+                        vec![Value::I32(3), Value::I32(4)],
+                    ],
+                ),
+                (
+                    "s",
+                    vec![
+                        vec![Value::I32(2), Value::I32(5)],
+                        vec![Value::I32(4), Value::I32(6)],
+                    ],
+                ),
+            ],
+        );
 
         let joined = engine.relation("joined").unwrap();
         assert!(joined.contains(&vec![Value::I32(1), Value::I32(2), Value::I32(5)]));
         assert!(joined.contains(&vec![Value::I32(3), Value::I32(4), Value::I32(6)]));
         assert_eq!(joined.len(), 2);
+    }
+
+    #[test]
+    fn test_condition_filter() {
+        let engine = run_program(
+            r#"
+            relation number(i32);
+            relation even(i32);
+            number(1);
+            number(2);
+            number(3);
+            number(4);
+            number(5);
+            even(x) <-- number(x), if x % 2 == 0;
+        "#,
+        );
+
+        let even = engine.relation("even").unwrap();
+        assert!(even.contains(&vec![Value::I32(2)]));
+        assert!(even.contains(&vec![Value::I32(4)]));
+        assert_eq!(even.len(), 2);
+    }
+
+    #[test]
+    fn test_generator() {
+        let engine = run_program(
+            r#"
+            relation number(i32);
+            number(x) <-- for x in 0..5;
+        "#,
+        );
+
+        let number = engine.relation("number").unwrap();
+        assert_eq!(number.len(), 5);
+        assert!(number.contains(&vec![Value::I32(0)]));
+        assert!(number.contains(&vec![Value::I32(4)]));
+    }
+
+    #[test]
+    fn test_arithmetic_in_head() {
+        let engine = run_program(
+            r#"
+            relation input(i32);
+            relation doubled(i32);
+            input(1);
+            input(2);
+            input(3);
+            doubled(x * 2) <-- input(x);
+        "#,
+        );
+
+        let doubled = engine.relation("doubled").unwrap();
+        assert!(doubled.contains(&vec![Value::I32(2)]));
+        assert!(doubled.contains(&vec![Value::I32(4)]));
+        assert!(doubled.contains(&vec![Value::I32(6)]));
+        assert_eq!(doubled.len(), 3);
+    }
+
+    #[test]
+    fn test_generator_with_condition() {
+        let engine = run_program(
+            r#"
+            relation number(i32);
+            relation small_even(i32);
+            number(x) <-- for x in 0..20;
+            small_even(x) <-- number(x), if x % 2 == 0, if x < 10;
+        "#,
+        );
+
+        let small_even = engine.relation("small_even").unwrap();
+        assert_eq!(small_even.len(), 5); // 0, 2, 4, 6, 8
+        assert!(small_even.contains(&vec![Value::I32(0)]));
+        assert!(small_even.contains(&vec![Value::I32(8)]));
+        assert!(!small_even.contains(&vec![Value::I32(10)]));
+    }
+
+    #[test]
+    fn test_fibonacci_like() {
+        let engine = run_program(
+            r#"
+            relation fib(i32, i32);
+            fib(0, 1);
+            fib(1, 1);
+            fib(n + 1, a + b) <-- fib(n, a), fib(n - 1, b), if n < 10;
+        "#,
+        );
+
+        let fib = engine.relation("fib").unwrap();
+        assert!(fib.contains(&vec![Value::I32(0), Value::I32(1)]));
+        assert!(fib.contains(&vec![Value::I32(1), Value::I32(1)]));
+        assert!(fib.contains(&vec![Value::I32(2), Value::I32(2)]));
+        assert!(fib.contains(&vec![Value::I32(3), Value::I32(3)]));
+        assert!(fib.contains(&vec![Value::I32(4), Value::I32(5)]));
+        assert!(fib.contains(&vec![Value::I32(5), Value::I32(8)]));
     }
 }

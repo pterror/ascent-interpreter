@@ -288,6 +288,157 @@ impl Value {
     }
 }
 
+// Arithmetic operations
+macro_rules! impl_numeric_binop {
+    ($method:ident, $op:tt) => {
+        pub fn $method(&self, other: &Value) -> Option<Value> {
+            match (self, other) {
+                (Value::I8(a), Value::I8(b)) => Some(Value::I8(a $op b)),
+                (Value::I16(a), Value::I16(b)) => Some(Value::I16(a $op b)),
+                (Value::I32(a), Value::I32(b)) => Some(Value::I32(a $op b)),
+                (Value::I64(a), Value::I64(b)) => Some(Value::I64(a $op b)),
+                (Value::I128(a), Value::I128(b)) => Some(Value::I128(a $op b)),
+                (Value::Isize(a), Value::Isize(b)) => Some(Value::Isize(a $op b)),
+                (Value::U8(a), Value::U8(b)) => Some(Value::U8(a $op b)),
+                (Value::U16(a), Value::U16(b)) => Some(Value::U16(a $op b)),
+                (Value::U32(a), Value::U32(b)) => Some(Value::U32(a $op b)),
+                (Value::U64(a), Value::U64(b)) => Some(Value::U64(a $op b)),
+                (Value::U128(a), Value::U128(b)) => Some(Value::U128(a $op b)),
+                (Value::Usize(a), Value::Usize(b)) => Some(Value::Usize(a $op b)),
+                (Value::F32(OrderedFloat(a)), Value::F32(OrderedFloat(b))) => Some(Value::F32(OrderedFloat(a $op b))),
+                (Value::F64(OrderedFloat(a)), Value::F64(OrderedFloat(b))) => Some(Value::F64(OrderedFloat(a $op b))),
+                _ => None,
+            }
+        }
+    };
+}
+
+macro_rules! impl_integer_binop {
+    ($method:ident, $op:tt) => {
+        pub fn $method(&self, other: &Value) -> Option<Value> {
+            match (self, other) {
+                (Value::I8(a), Value::I8(b)) => Some(Value::I8(a $op b)),
+                (Value::I16(a), Value::I16(b)) => Some(Value::I16(a $op b)),
+                (Value::I32(a), Value::I32(b)) => Some(Value::I32(a $op b)),
+                (Value::I64(a), Value::I64(b)) => Some(Value::I64(a $op b)),
+                (Value::I128(a), Value::I128(b)) => Some(Value::I128(a $op b)),
+                (Value::Isize(a), Value::Isize(b)) => Some(Value::Isize(a $op b)),
+                (Value::U8(a), Value::U8(b)) => Some(Value::U8(a $op b)),
+                (Value::U16(a), Value::U16(b)) => Some(Value::U16(a $op b)),
+                (Value::U32(a), Value::U32(b)) => Some(Value::U32(a $op b)),
+                (Value::U64(a), Value::U64(b)) => Some(Value::U64(a $op b)),
+                (Value::U128(a), Value::U128(b)) => Some(Value::U128(a $op b)),
+                (Value::Usize(a), Value::Usize(b)) => Some(Value::Usize(a $op b)),
+                _ => None,
+            }
+        }
+    };
+}
+
+impl Value {
+    impl_numeric_binop!(add, +);
+    impl_numeric_binop!(sub, -);
+    impl_numeric_binop!(mul, *);
+    impl_numeric_binop!(div, /);
+    impl_numeric_binop!(rem, %);
+
+    impl_integer_binop!(bitand, &);
+    impl_integer_binop!(bitor, |);
+    impl_integer_binop!(bitxor, ^);
+    impl_integer_binop!(shl, <<);
+    impl_integer_binop!(shr, >>);
+
+    pub fn neg(&self) -> Option<Value> {
+        match self {
+            Value::I8(v) => Some(Value::I8(-v)),
+            Value::I16(v) => Some(Value::I16(-v)),
+            Value::I32(v) => Some(Value::I32(-v)),
+            Value::I64(v) => Some(Value::I64(-v)),
+            Value::I128(v) => Some(Value::I128(-v)),
+            Value::Isize(v) => Some(Value::Isize(-v)),
+            Value::F32(OrderedFloat(v)) => Some(Value::F32(OrderedFloat(-v))),
+            Value::F64(OrderedFloat(v)) => Some(Value::F64(OrderedFloat(-v))),
+            _ => None,
+        }
+    }
+
+    pub fn not(&self) -> Option<Value> {
+        match self {
+            Value::Bool(v) => Some(Value::Bool(!v)),
+            Value::I8(v) => Some(Value::I8(!v)),
+            Value::I16(v) => Some(Value::I16(!v)),
+            Value::I32(v) => Some(Value::I32(!v)),
+            Value::I64(v) => Some(Value::I64(!v)),
+            Value::I128(v) => Some(Value::I128(!v)),
+            Value::Isize(v) => Some(Value::Isize(!v)),
+            Value::U8(v) => Some(Value::U8(!v)),
+            Value::U16(v) => Some(Value::U16(!v)),
+            Value::U32(v) => Some(Value::U32(!v)),
+            Value::U64(v) => Some(Value::U64(!v)),
+            Value::U128(v) => Some(Value::U128(!v)),
+            Value::Usize(v) => Some(Value::Usize(!v)),
+            _ => None,
+        }
+    }
+
+    pub fn abs(&self) -> Option<Value> {
+        match self {
+            Value::I8(v) => Some(Value::I8(v.abs())),
+            Value::I16(v) => Some(Value::I16(v.abs())),
+            Value::I32(v) => Some(Value::I32(v.abs())),
+            Value::I64(v) => Some(Value::I64(v.abs())),
+            Value::I128(v) => Some(Value::I128(v.abs())),
+            Value::Isize(v) => Some(Value::Isize(v.abs())),
+            Value::F32(OrderedFloat(v)) => Some(Value::F32(OrderedFloat(v.abs()))),
+            Value::F64(OrderedFloat(v)) => Some(Value::F64(OrderedFloat(v.abs()))),
+            _ => None,
+        }
+    }
+
+    pub fn partial_cmp_val(&self, other: &Value) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::I8(a), Value::I8(b)) => Some(a.cmp(b)),
+            (Value::I16(a), Value::I16(b)) => Some(a.cmp(b)),
+            (Value::I32(a), Value::I32(b)) => Some(a.cmp(b)),
+            (Value::I64(a), Value::I64(b)) => Some(a.cmp(b)),
+            (Value::I128(a), Value::I128(b)) => Some(a.cmp(b)),
+            (Value::Isize(a), Value::Isize(b)) => Some(a.cmp(b)),
+            (Value::U8(a), Value::U8(b)) => Some(a.cmp(b)),
+            (Value::U16(a), Value::U16(b)) => Some(a.cmp(b)),
+            (Value::U32(a), Value::U32(b)) => Some(a.cmp(b)),
+            (Value::U64(a), Value::U64(b)) => Some(a.cmp(b)),
+            (Value::U128(a), Value::U128(b)) => Some(a.cmp(b)),
+            (Value::Usize(a), Value::Usize(b)) => Some(a.cmp(b)),
+            (Value::F32(a), Value::F32(b)) => Some(a.cmp(b)),
+            (Value::F64(a), Value::F64(b)) => Some(a.cmp(b)),
+            (Value::Char(a), Value::Char(b)) => Some(a.cmp(b)),
+            (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+            (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
+
+    /// Cast to a target type by name.
+    pub fn cast_to(&self, target: &str) -> Option<Value> {
+        let v = self.as_i64()?;
+        match target {
+            "i8" => Some(Value::I8(v as i8)),
+            "i16" => Some(Value::I16(v as i16)),
+            "i32" => Some(Value::I32(v as i32)),
+            "i64" => Some(Value::I64(v)),
+            "i128" => Some(Value::I128(v as i128)),
+            "isize" => Some(Value::Isize(v as isize)),
+            "u8" => Some(Value::U8(v as u8)),
+            "u16" => Some(Value::U16(v as u16)),
+            "u32" => Some(Value::U32(v as u32)),
+            "u64" => Some(Value::U64(v as u64)),
+            "u128" => Some(Value::U128(v as u128)),
+            "usize" => Some(Value::Usize(v as usize)),
+            _ => None,
+        }
+    }
+}
+
 // Convenience From implementations
 impl From<()> for Value {
     fn from(_: ()) -> Self {

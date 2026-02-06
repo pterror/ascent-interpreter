@@ -34,6 +34,7 @@
 //! ```
 
 mod eval;
+pub mod expr;
 mod relation;
 pub mod value;
 
