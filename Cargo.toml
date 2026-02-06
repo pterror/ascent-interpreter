@@ -11,6 +11,7 @@ repository = "https://github.com/pterror/ascent-interpreter"
 [workspace.dependencies]
 ascent-syntax = { path = "crates/ascent-syntax" }
 ascent-ir = { path = "crates/ascent-ir" }
+ascent-eval = { path = "crates/ascent-eval" }
 
 syn = { version = "2.0", features = ["full", "derive", "extra-traits", "visit-mut"] }
 proc-macro2 = "1.0"
@@ -29,3 +30,4 @@ description = "Interpreter and JIT for Ascent Datalog programs"
 [dependencies]
 ascent-syntax.workspace = true
 ascent-ir.workspace = true
+ascent-eval.workspace = true

@@ -3,9 +3,20 @@
 version = 4
 
 [[package]]
+name = "ascent-eval"
+version = "0.1.0"
+dependencies = [
+ "ascent-ir",
+ "ascent-syntax",
+ "itertools",
+ "syn",
+]
+
+[[package]]
 name = "ascent-interpreter"
 version = "0.1.0"
 dependencies = [
+ "ascent-eval",
  "ascent-ir",
  "ascent-syntax",
 ]

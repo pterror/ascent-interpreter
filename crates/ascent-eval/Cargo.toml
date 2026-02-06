@@ -1,0 +1,13 @@
+[package]
+name = "ascent-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Semi-naive evaluation engine for Ascent interpreter"
+
+[dependencies]
+ascent-ir.workspace = true
+ascent-syntax.workspace = true
+syn.workspace = true
+itertools.workspace = true
