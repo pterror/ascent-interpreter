@@ -55,6 +55,6 @@
 
 ## Documentation
 
-- [ ] Usage examples
-- [ ] Syntax reference
+- [x] Usage examples
+- [x] Syntax reference
 - [ ] Architecture overview
