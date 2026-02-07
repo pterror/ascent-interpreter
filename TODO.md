@@ -57,4 +57,4 @@
 
 - [x] Usage examples
 - [x] Syntax reference
-- [ ] Architecture overview
+- [x] Architecture overview

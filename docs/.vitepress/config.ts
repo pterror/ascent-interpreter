@@ -22,6 +22,7 @@ export default withMermaid(
           items: [
             { text: "Syntax", link: "/reference/syntax" },
             { text: "Types & Aggregators", link: "/reference/types" },
+            { text: "Architecture", link: "/reference/architecture" },
           ],
         },
       ],
