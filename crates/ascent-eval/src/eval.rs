@@ -529,10 +529,69 @@ impl Engine {
         let Some(rel) = self.relations.get(&clause.relation) else {
             return;
         };
+
+        // Fast path: all columns known bound at compile time and not using recent
+        // → build expected tuple directly and do single membership check,
+        // skipping find_bound_columns allocation entirely.
+        if clause.all_args_bound && !use_recent {
+            let mut expected = Vec::with_capacity(clause.args.len());
+            let mut ok = true;
+            for arg in &clause.args {
+                match arg {
+                    CClauseArg::Var(var_id) => {
+                        if let Some(val) = binding.get(var_id) {
+                            expected.push(val.clone());
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    CClauseArg::Expr(expr) => {
+                        if let Some(val) =
+                            eval_cexpr(expr, binding, Some(&self.type_registry), &self.var_interner)
+                        {
+                            expected.push(val);
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ok && rel.contains(&expected) {
+                if clause.conditions.is_empty() {
+                    self.process_body_recursive(
+                        body,
+                        offset + 1,
+                        heads,
+                        binding,
+                        undo,
+                        recent_clause_idx,
+                        results,
+                    );
+                } else {
+                    let cp = undo.len();
+                    if self.check_clause_conditions(clause, binding, undo) {
+                        self.process_body_recursive(
+                            body,
+                            offset + 1,
+                            heads,
+                            binding,
+                            undo,
+                            recent_clause_idx,
+                            results,
+                        );
+                    }
+                    rollback(binding, undo, cp);
+                }
+            }
+            return;
+        }
+
         let bound_cols = self.find_bound_columns(clause, binding);
 
-        // Fast path: all columns bound and not using recent → single membership check.
-        // Replaces index lookup + iteration + match_clause with one hash lookup.
+        // Runtime fast path fallback: all columns happen to be bound
+        // (catches cases the compile-time analysis missed, e.g. vars from if-let patterns).
         if !use_recent && bound_cols.len() == clause.args.len() {
             let expected: Vec<Value> = bound_cols.iter().map(|(_, val)| val.clone()).collect();
             if rel.contains(&expected) {
@@ -651,7 +710,7 @@ impl Engine {
     /// Returns a list of (column_index, value) pairs for columns where
     /// the clause arg is a bound variable or evaluable expression.
     fn find_bound_columns(&self, clause: &CClause, binding: &Bindings) -> Vec<(usize, Value)> {
-        let mut bound = Vec::new();
+        let mut bound = Vec::with_capacity(clause.args.len());
         for (col, arg) in clause.args.iter().enumerate() {
             match arg {
                 CClauseArg::Var(var_id) => {
@@ -834,7 +893,7 @@ impl Engine {
         agg: &CAggregation,
         binding: &Bindings,
     ) -> Vec<(usize, Value)> {
-        let mut bound = Vec::new();
+        let mut bound = Vec::with_capacity(agg.args.len());
         for (col, arg) in agg.args.iter().enumerate() {
             match arg {
                 CAggArg::Var(var_id) => {

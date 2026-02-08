@@ -6,6 +6,7 @@
 //! - Expressions flattened from syn::Expr to CExpr (simpler dispatch)
 
 use ascent_ir::{Aggregation, BodyItem, Clause, ClauseArg, Condition, Generator, Rule};
+use rustc_hash::FxHashSet;
 
 use crate::eval::{Bindings, TypeRegistry, VarId, VarInterner};
 use crate::expr::{eval_expr, eval_expr_with_registry, eval_lit};
@@ -90,6 +91,9 @@ pub(crate) struct CClause {
     pub relation: String,
     pub args: Vec<CClauseArg>,
     pub conditions: Vec<CCondition>,
+    /// True if all args will be bound by preceding body items at evaluation time.
+    /// Enables fast-path contains check without `find_bound_columns` allocation.
+    pub all_args_bound: bool,
 }
 
 /// Pre-compiled condition.
@@ -151,6 +155,12 @@ pub(crate) struct CRule {
 
 /// Compile an IR rule into the evaluation-friendly representation.
 pub(crate) fn compile_rule(rule: &Rule, interner: &VarInterner) -> CRule {
+    let body: Vec<CBodyItem> = rule
+        .body
+        .iter()
+        .map(|item| compile_body_item(item, interner))
+        .collect();
+
     CRule {
         heads: rule
             .heads
@@ -160,11 +170,7 @@ pub(crate) fn compile_rule(rule: &Rule, interner: &VarInterner) -> CRule {
                 args: h.args.iter().map(|a| compile_expr(a, interner)).collect(),
             })
             .collect(),
-        body: rule
-            .body
-            .iter()
-            .map(|item| compile_body_item(item, interner))
-            .collect(),
+        body: optimize_body(body),
     }
 }
 
@@ -190,6 +196,7 @@ fn compile_clause(clause: &Clause, interner: &VarInterner) -> CClause {
             .iter()
             .map(|c| compile_condition(c, interner))
             .collect(),
+        all_args_bound: false, // computed by optimize_body
     }
 }
 
@@ -246,6 +253,167 @@ fn compile_agg_arg(expr: &syn::Expr, interner: &VarInterner) -> CAggArg {
         }
     }
     CAggArg::Expr(compile_expr(expr, interner))
+}
+
+// ─── Body optimization ──────────────────────────────────────────────
+
+/// Check if all variable references in a CExpr are in the defined set.
+fn cexpr_vars_defined(expr: &CExpr, defined: &FxHashSet<VarId>) -> bool {
+    match expr {
+        CExpr::Literal(_) => true,
+        CExpr::Var(id) => defined.contains(id),
+        CExpr::Binary(_, l, r) => cexpr_vars_defined(l, defined) && cexpr_vars_defined(r, defined),
+        CExpr::Unary(_, e) | CExpr::Cast(e, _) => cexpr_vars_defined(e, defined),
+        CExpr::Range { start, end, .. } => {
+            cexpr_vars_defined(start, defined) && cexpr_vars_defined(end, defined)
+        }
+        CExpr::Tuple(es) | CExpr::Array(es) => es.iter().all(|e| cexpr_vars_defined(e, defined)),
+        CExpr::Call(_, args) => args.iter().all(|a| cexpr_vars_defined(a, defined)),
+        CExpr::MethodCall(recv, _, args) => {
+            cexpr_vars_defined(recv, defined) && args.iter().all(|a| cexpr_vars_defined(a, defined))
+        }
+        CExpr::Dynamic(_) => false,
+    }
+}
+
+/// Collect all variable references from a CExpr.
+fn cexpr_referenced_vars(expr: &CExpr, vars: &mut FxHashSet<VarId>) {
+    match expr {
+        CExpr::Literal(_) => {}
+        CExpr::Var(id) => {
+            vars.insert(*id);
+        }
+        CExpr::Binary(_, l, r) => {
+            cexpr_referenced_vars(l, vars);
+            cexpr_referenced_vars(r, vars);
+        }
+        CExpr::Unary(_, e) | CExpr::Cast(e, _) => cexpr_referenced_vars(e, vars),
+        CExpr::Range { start, end, .. } => {
+            cexpr_referenced_vars(start, vars);
+            cexpr_referenced_vars(end, vars);
+        }
+        CExpr::Tuple(es) | CExpr::Array(es) => {
+            for e in es {
+                cexpr_referenced_vars(e, vars);
+            }
+        }
+        CExpr::Call(_, args) => {
+            for a in args {
+                cexpr_referenced_vars(a, vars);
+            }
+        }
+        CExpr::MethodCall(recv, _, args) => {
+            cexpr_referenced_vars(recv, vars);
+            for a in args {
+                cexpr_referenced_vars(a, vars);
+            }
+        }
+        CExpr::Dynamic(_) => {} // conservative: unknown vars
+    }
+}
+
+/// Check if a CExpr contains any Dynamic (uncompiled) subexpressions.
+fn cexpr_has_dynamic(expr: &CExpr) -> bool {
+    match expr {
+        CExpr::Dynamic(_) => true,
+        CExpr::Literal(_) | CExpr::Var(_) => false,
+        CExpr::Binary(_, l, r) => cexpr_has_dynamic(l) || cexpr_has_dynamic(r),
+        CExpr::Unary(_, e) | CExpr::Cast(e, _) => cexpr_has_dynamic(e),
+        CExpr::Range { start, end, .. } => cexpr_has_dynamic(start) || cexpr_has_dynamic(end),
+        CExpr::Tuple(es) | CExpr::Array(es) => es.iter().any(cexpr_has_dynamic),
+        CExpr::Call(_, args) => args.iter().any(cexpr_has_dynamic),
+        CExpr::MethodCall(recv, _, args) => {
+            cexpr_has_dynamic(recv) || args.iter().any(cexpr_has_dynamic)
+        }
+    }
+}
+
+/// Track variables defined by a body item.
+fn add_defined_vars(item: &CBodyItem, defined: &mut FxHashSet<VarId>) {
+    match item {
+        CBodyItem::Clause(c) => {
+            for arg in &c.args {
+                if let CClauseArg::Var(id) = arg {
+                    defined.insert(*id);
+                }
+            }
+        }
+        CBodyItem::Generator(g) => {
+            for &var_id in &g.vars {
+                defined.insert(var_id);
+            }
+        }
+        CBodyItem::Aggregation(a) => {
+            for &var_id in &a.result_vars {
+                defined.insert(var_id);
+            }
+        }
+        CBodyItem::Condition(_) => {}
+    }
+}
+
+/// Optimize compiled rule body: reorder conditions and compute bound flags.
+///
+/// Pure `if expr` conditions are moved to the earliest position where all their
+/// referenced variables are defined, filtering tuples before expensive joins.
+/// Additionally, computes `all_args_bound` flags for clauses to enable the
+/// fast-path contains check without runtime `find_bound_columns` allocation.
+fn optimize_body(body: Vec<CBodyItem>) -> Vec<CBodyItem> {
+    // Phase 1: Condition reordering.
+    // Only reorder pure `if expr` conditions without Dynamic subexpressions,
+    // since Dynamic expressions may reference variables we can't detect.
+    let mut result = Vec::with_capacity(body.len());
+    let mut pending: Vec<(FxHashSet<VarId>, CBodyItem)> = Vec::new();
+    let mut defined = FxHashSet::default();
+
+    for item in body {
+        // Check if this is a reorderable condition
+        if let CBodyItem::Condition(CCondition::If(ref expr)) = item
+            && !cexpr_has_dynamic(expr)
+        {
+            let mut required = FxHashSet::default();
+            cexpr_referenced_vars(expr, &mut required);
+            if required.is_subset(&defined) {
+                result.push(item);
+            } else {
+                pending.push((required, item));
+            }
+            continue;
+        }
+
+        // Non-reorderable item: track defined vars, push, flush pending
+        add_defined_vars(&item, &mut defined);
+        result.push(item);
+
+        // Place any pending conditions whose vars are now satisfied
+        let mut i = 0;
+        while i < pending.len() {
+            if pending[i].0.is_subset(&defined) {
+                result.push(pending.remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // Append any remaining conditions at the end
+    for (_, item) in pending {
+        result.push(item);
+    }
+
+    // Phase 2: Compute all_args_bound for each clause.
+    let mut defined = FxHashSet::default();
+    for item in &mut result {
+        if let CBodyItem::Clause(c) = item {
+            c.all_args_bound = c.args.iter().all(|arg| match arg {
+                CClauseArg::Var(id) => defined.contains(id),
+                CClauseArg::Expr(expr) => cexpr_vars_defined(expr, &defined),
+            });
+        }
+        add_defined_vars(item, &mut defined);
+    }
+
+    result
 }
 
 /// Compile a syn expression into the flat CExpr representation.

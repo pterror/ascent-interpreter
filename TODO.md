@@ -60,6 +60,8 @@ Current: 7–56x (after optimizations below).
 - [x] Multi-column index selection with pre-filter for join acceleration
 - [x] Pre-compile rules: intern variable names to VarIds, pre-evaluate literals, flatten syn::Expr to CExpr
 - [x] Avoid Box<dyn Iterator> in process_clause full-scan path (virtual dispatch per tuple)
+- [x] Compile-time condition reordering (move `if` conditions earlier in body to filter before joins)
+- [x] Pre-computed `all_args_bound` flag (skip `find_bound_columns` allocation on fully-bound fast path)
 - [ ] Reuse head tuple buffer (avoid per-derivation Vec allocation)
 - [x] Delta-specific indices (separate index for recent tuples, skip is_recent checks)
 - [x] Index-accelerated aggregation (use bound columns for index lookup instead of full scan)
