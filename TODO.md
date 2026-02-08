@@ -59,7 +59,8 @@ Baseline: 15–550x slower than compiled ascent (Criterion benchmarks).
 - [x] Pre-compile rules: intern variable names to VarIds, pre-evaluate literals, flatten syn::Expr to CExpr
 - [x] Avoid Box<dyn Iterator> in process_clause full-scan path (virtual dispatch per tuple)
 - [ ] Reuse head tuple buffer (avoid per-derivation Vec allocation)
-- [ ] Delta-specific indices (separate index for recent tuples, skip is_recent checks)
+- [x] Delta-specific indices (separate index for recent tuples, skip is_recent checks)
+- [x] Index-accelerated aggregation (use bound columns for index lookup instead of full scan)
 - [ ] Hash join for large relations (O(n+m) instead of nested-loop O(n×m))
 - [ ] Type specialization: fast path for all-i32 programs (skip 17-way Value match)
 
