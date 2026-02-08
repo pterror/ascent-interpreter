@@ -1,5 +1,6 @@
 //! Semi-naive evaluation engine.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -12,8 +13,36 @@ use crate::expr::{eval_expr, eval_expr_with_registry, expand_range};
 use crate::relation::RelationStorage;
 use crate::value::{DynValue, Tuple, Value};
 
-/// Variable bindings during rule evaluation.
-pub type Bindings = HashMap<String, Value>;
+/// Interned variable identifier (u32 index instead of String).
+pub type VarId = u32;
+
+/// Variable bindings during rule evaluation (u32-keyed for cheap clone/lookup).
+pub type Bindings = HashMap<VarId, Value>;
+
+/// Maps variable name strings to compact u32 identifiers.
+///
+/// Uses interior mutability so `intern` can be called from `&self` methods
+/// without conflicting with other Engine borrows.
+#[derive(Debug, Default)]
+pub struct VarInterner {
+    ids: RefCell<HashMap<String, VarId>>,
+    next_id: std::cell::Cell<VarId>,
+}
+
+impl VarInterner {
+    /// Intern a variable name, returning its stable u32 id.
+    pub fn intern(&self, name: &str) -> VarId {
+        let ids = self.ids.borrow();
+        if let Some(&id) = ids.get(name) {
+            return id;
+        }
+        drop(ids);
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        self.ids.borrow_mut().insert(name.to_string(), id);
+        id
+    }
+}
 
 /// Constructor function for a custom type: takes arguments, returns a Value.
 pub type ValueConstructor = Box<dyn Fn(&[Value]) -> Option<Value> + Send + Sync>;
@@ -68,6 +97,8 @@ pub struct Engine {
     relations: HashMap<String, RelationStorage>,
     /// Registry of custom type constructors.
     pub type_registry: TypeRegistry,
+    /// Intern table for variable names.
+    pub(crate) var_interner: VarInterner,
 }
 
 impl Engine {
@@ -86,6 +117,7 @@ impl Engine {
         Engine {
             relations,
             type_registry: TypeRegistry::new(),
+            var_interner: VarInterner::default(),
         }
     }
 
@@ -374,12 +406,18 @@ impl Engine {
         for (col, arg) in clause.args.iter().enumerate() {
             match arg {
                 ClauseArg::Var(var) => {
-                    if let Some(val) = binding.get(var) {
+                    let var_id = self.var_interner.intern(var);
+                    if let Some(val) = binding.get(&var_id) {
                         return Some((col, val.clone()));
                     }
                 }
                 ClauseArg::Expr(expr) => {
-                    if let Some(val) = eval_expr_with_registry(expr, binding, &self.type_registry) {
+                    if let Some(val) = eval_expr_with_registry(
+                        expr,
+                        binding,
+                        &self.type_registry,
+                        &self.var_interner,
+                    ) {
                         return Some((col, val));
                     }
                 }
@@ -402,18 +440,22 @@ impl Engine {
         for (arg, value) in clause.args.iter().zip(tuple.iter()) {
             match arg {
                 ClauseArg::Var(var) => {
-                    if let Some(existing) = bindings.get(var) {
+                    let var_id = self.var_interner.intern(var);
+                    if let Some(existing) = bindings.get(&var_id) {
                         if existing != value {
                             return None;
                         }
                     } else {
-                        bindings.insert(var.clone(), value.clone());
+                        bindings.insert(var_id, value.clone());
                     }
                 }
                 ClauseArg::Expr(expr) => {
-                    if let Some(evaluated) =
-                        eval_expr_with_registry(expr, &bindings, &self.type_registry)
-                        && evaluated != *value
+                    if let Some(evaluated) = eval_expr_with_registry(
+                        expr,
+                        &bindings,
+                        &self.type_registry,
+                        &self.var_interner,
+                    ) && evaluated != *value
                     {
                         return None;
                     }
@@ -441,14 +483,18 @@ impl Engine {
         let mut results = Vec::new();
 
         for binding in bindings {
-            if let Some(range_val) =
-                eval_expr_with_registry(&generator.expr, &binding, &self.type_registry)
-                && let Some(values) = expand_range(&range_val)
+            if let Some(range_val) = eval_expr_with_registry(
+                &generator.expr,
+                &binding,
+                &self.type_registry,
+                &self.var_interner,
+            ) && let Some(values) = expand_range(&range_val)
             {
                 for value in values {
                     let mut new_binding = binding.clone();
                     if let Some(var) = generator.vars.first() {
-                        new_binding.insert(var.clone(), value);
+                        let var_id = self.var_interner.intern(var);
+                        new_binding.insert(var_id, value);
                     }
                     results.push(new_binding);
                 }
@@ -479,7 +525,10 @@ impl Engine {
                     let bound_vals: Vec<Value> = agg
                         .bound_vars
                         .iter()
-                        .filter_map(|var| match_binding.get(var).cloned())
+                        .filter_map(|var| {
+                            let var_id = self.var_interner.intern(var);
+                            match_binding.get(&var_id).cloned()
+                        })
                         .collect();
                     collected.push(bound_vals);
                 }
@@ -492,7 +541,8 @@ impl Engine {
             for result_tuple in agg_results {
                 let mut new_binding = binding.clone();
                 for (var, val) in agg.result_vars.iter().zip(result_tuple) {
-                    new_binding.insert(var.clone(), val);
+                    let var_id = self.var_interner.intern(var);
+                    new_binding.insert(var_id, val);
                 }
                 results.push(new_binding);
             }
@@ -517,21 +567,24 @@ impl Engine {
             if let syn::Expr::Path(p) = arg_expr
                 && let Some(ident) = p.path.get_ident()
             {
-                let name = ident.to_string();
-                if let Some(existing) = bindings.get(&name) {
+                let var_id = self.var_interner.intern(&ident.to_string());
+                if let Some(existing) = bindings.get(&var_id) {
                     if existing != value {
                         return None;
                     }
                 } else {
-                    bindings.insert(name, value.clone());
+                    bindings.insert(var_id, value.clone());
                 }
                 continue;
             }
 
             // Otherwise evaluate and compare
-            if let Some(evaluated) =
-                eval_expr_with_registry(arg_expr, &bindings, &self.type_registry)
-                && evaluated != *value
+            if let Some(evaluated) = eval_expr_with_registry(
+                arg_expr,
+                &bindings,
+                &self.type_registry,
+                &self.var_interner,
+            ) && evaluated != *value
             {
                 return None;
             }
@@ -552,7 +605,7 @@ impl Engine {
     fn eval_condition(&self, cond: &Condition, bindings: Bindings) -> Option<Bindings> {
         match cond {
             Condition::If(expr) => {
-                if eval_expr_with_registry(expr, &bindings, &self.type_registry)
+                if eval_expr_with_registry(expr, &bindings, &self.type_registry, &self.var_interner)
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
                 {
@@ -562,13 +615,19 @@ impl Engine {
                 }
             }
             Condition::IfLet { pattern, expr } => {
-                let value = eval_expr_with_registry(expr, &bindings, &self.type_registry)?;
+                let value = eval_expr_with_registry(
+                    expr,
+                    &bindings,
+                    &self.type_registry,
+                    &self.var_interner,
+                )?;
                 let mut new_bindings = bindings;
                 if match_pattern(
                     pattern,
                     &value,
                     &mut new_bindings,
                     Some(&self.type_registry),
+                    &self.var_interner,
                 ) {
                     Some(new_bindings)
                 } else {
@@ -576,13 +635,19 @@ impl Engine {
                 }
             }
             Condition::Let { pattern, expr } => {
-                let value = eval_expr_with_registry(expr, &bindings, &self.type_registry)?;
+                let value = eval_expr_with_registry(
+                    expr,
+                    &bindings,
+                    &self.type_registry,
+                    &self.var_interner,
+                )?;
                 let mut new_bindings = bindings;
                 if match_pattern(
                     pattern,
                     &value,
                     &mut new_bindings,
                     Some(&self.type_registry),
+                    &self.var_interner,
                 ) {
                     Some(new_bindings)
                 } else {
@@ -597,7 +662,9 @@ impl Engine {
         let mut tuple = Vec::with_capacity(head.args.len());
 
         for arg in &head.args {
-            if let Some(value) = eval_expr_with_registry(arg, bindings, &self.type_registry) {
+            if let Some(value) =
+                eval_expr_with_registry(arg, bindings, &self.type_registry, &self.var_interner)
+            {
                 tuple.push(value);
             } else {
                 return None;
@@ -662,6 +729,7 @@ fn match_pattern(
     value: &Value,
     bindings: &mut Bindings,
     registry: Option<&TypeRegistry>,
+    interner: &VarInterner,
 ) -> bool {
     match pat {
         // Wildcard: always matches, binds nothing
@@ -676,18 +744,19 @@ fn match_pattern(
             }
             // If there's a subpattern (`name @ pattern`), match it too
             if let Some((_, sub_pat)) = &ident.subpat
-                && !match_pattern(sub_pat, value, bindings, registry)
+                && !match_pattern(sub_pat, value, bindings, registry, interner)
             {
                 return false;
             }
-            bindings.insert(name, value.clone());
+            let var_id = interner.intern(&name);
+            bindings.insert(var_id, value.clone());
             true
         }
 
         // Literal pattern: `42`, `true`, `'a'`
         syn::Pat::Lit(expr_lit) => {
             let expr = syn::Expr::Lit(expr_lit.clone());
-            if let Some(lit_val) = eval_expr(&expr, bindings) {
+            if let Some(lit_val) = eval_expr(&expr, bindings, interner) {
                 lit_val == *value
             } else {
                 false
@@ -695,7 +764,7 @@ fn match_pattern(
         }
 
         // Reference pattern: `&x` — in Datalog context, match the inner pattern
-        syn::Pat::Reference(r) => match_pattern(&r.pat, value, bindings, registry),
+        syn::Pat::Reference(r) => match_pattern(&r.pat, value, bindings, registry, interner),
 
         // Tuple pattern: `(a, b, c)`
         syn::Pat::Tuple(tuple) => {
@@ -704,7 +773,7 @@ fn match_pattern(
                     return false;
                 }
                 for (pat_elem, val) in tuple.elems.iter().zip(vals.iter()) {
-                    if !match_pattern(pat_elem, val, bindings, registry) {
+                    if !match_pattern(pat_elem, val, bindings, registry, interner) {
                         return false;
                     }
                 }
@@ -722,7 +791,7 @@ fn match_pattern(
                     if let Value::Option(Some(inner)) = value
                         && ts.elems.len() == 1
                     {
-                        match_pattern(&ts.elems[0], inner, bindings, registry)
+                        match_pattern(&ts.elems[0], inner, bindings, registry, interner)
                     } else {
                         false
                     }
@@ -731,7 +800,7 @@ fn match_pattern(
                     if let Value::Dual(inner) = value
                         && ts.elems.len() == 1
                     {
-                        match_pattern(&ts.elems[0], inner, bindings, registry)
+                        match_pattern(&ts.elems[0], inner, bindings, registry, interner)
                     } else {
                         false
                     }
@@ -744,7 +813,7 @@ fn match_pattern(
                         && fields.len() == ts.elems.len()
                     {
                         for (pat_elem, val) in ts.elems.iter().zip(fields.iter()) {
-                            if !match_pattern(pat_elem, val, bindings, registry) {
+                            if !match_pattern(pat_elem, val, bindings, registry, interner) {
                                 return false;
                             }
                         }
@@ -771,7 +840,7 @@ fn match_pattern(
         syn::Pat::Or(or_pat) => {
             for case in &or_pat.cases {
                 let mut trial = bindings.clone();
-                if match_pattern(case, value, &mut trial, registry) {
+                if match_pattern(case, value, &mut trial, registry, interner) {
                     *bindings = trial;
                     return true;
                 }
@@ -780,7 +849,7 @@ fn match_pattern(
         }
 
         // Parenthesized: `(pattern)`
-        syn::Pat::Paren(p) => match_pattern(&p.pat, value, bindings, registry),
+        syn::Pat::Paren(p) => match_pattern(&p.pat, value, bindings, registry, interner),
 
         _ => false,
     }
