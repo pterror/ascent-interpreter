@@ -515,27 +515,31 @@ impl Engine {
 
         let mut results = Vec::new();
 
+        // Pre-intern bound var ids once per aggregation
+        let bound_var_ids: Vec<VarId> = agg
+            .bound_vars
+            .iter()
+            .map(|var| self.var_interner.intern(var))
+            .collect();
+
         for binding in &bindings {
-            // Find all matching tuples and extract bound variables
-            let mut collected: Vec<Vec<Value>> = Vec::new();
-
-            for tuple in rel.iter_full() {
-                if let Some(match_binding) = self.match_agg_args(agg, tuple, binding.clone()) {
-                    // Extract bound variable values
-                    let bound_vals: Vec<Value> = agg
-                        .bound_vars
+            // Collect bound-variable tuples from matching relation rows.
+            // We collect into a Vec<Vec<Value>> here because the aggregator
+            // borrows the values while iterating, but match_agg_args needs
+            // &self. The allocation is proportional to matching tuples only.
+            let collected: Vec<Vec<Value>> = rel
+                .iter_full()
+                .filter_map(|tuple| self.match_agg_args(agg, tuple, binding.clone()))
+                .map(|match_binding| {
+                    bound_var_ids
                         .iter()
-                        .filter_map(|var| {
-                            let var_id = self.var_interner.intern(var);
-                            match_binding.get(&var_id).cloned()
-                        })
-                        .collect();
-                    collected.push(bound_vals);
-                }
-            }
+                        .filter_map(|var_id| match_binding.get(var_id).cloned())
+                        .collect()
+                })
+                .collect();
 
-            // Apply aggregator
-            let agg_results = apply_aggregator(&agg_name, collected);
+            // Apply aggregator (streaming over the collected slice)
+            let agg_results = apply_aggregator(&agg_name, collected.iter().map(|v| v.as_slice()));
 
             // Bind results to output pattern variables
             for result_tuple in agg_results {
