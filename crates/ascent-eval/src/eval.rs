@@ -573,8 +573,8 @@ impl Engine {
 
     /// Process an aggregation clause.
     ///
-    /// Uses in-place binding modification with undo log to avoid cloning
-    /// the bindings map for each relation tuple during aggregation matching.
+    /// Uses index lookup when aggregation args have bound columns to avoid
+    /// full relation scans. Falls back to full scan when no args are bound.
     fn process_aggregation(&self, agg: &CAggregation, bindings: Vec<Bindings>) -> Vec<Bindings> {
         let Some(rel) = self.relations.get(&agg.relation) else {
             return vec![];
@@ -584,22 +584,59 @@ impl Engine {
         let mut undo = UndoLog::new();
 
         for binding in &bindings {
-            // Collect bound-variable tuples from matching relation rows.
-            // Uses in-place matching with rollback to avoid per-tuple clones.
             let mut work = binding.clone();
             let mut collected: Vec<Vec<Value>> = Vec::new();
 
-            for tuple in rel.iter_full() {
-                let cp = undo.len();
-                if self.match_agg_args(agg, tuple, &mut work, &mut undo) {
-                    collected.push(
-                        agg.bound_vars
+            // Check which aggregation columns are already bound
+            let bound_cols = self.find_bound_agg_columns(agg, binding);
+
+            if !bound_cols.is_empty() {
+                // Use index lookup: pick most selective column
+                let (primary_pos, _) = bound_cols
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, (col, val))| rel.lookup(*col, val).len())
+                    .unwrap();
+                let (primary_col, primary_val) = &bound_cols[primary_pos];
+                let indices = rel.lookup(*primary_col, primary_val);
+
+                for &idx in indices {
+                    let tuple = rel.get(idx);
+                    // Pre-filter secondary bound columns
+                    if bound_cols.len() > 1 {
+                        let pre_match = bound_cols
                             .iter()
-                            .filter_map(|var_id| work.get(var_id).cloned())
-                            .collect(),
-                    );
+                            .enumerate()
+                            .all(|(i, (col, val))| i == primary_pos || tuple[*col] == *val);
+                        if !pre_match {
+                            continue;
+                        }
+                    }
+                    let cp = undo.len();
+                    if self.match_agg_args(agg, tuple, &mut work, &mut undo) {
+                        collected.push(
+                            agg.bound_vars
+                                .iter()
+                                .filter_map(|var_id| work.get(var_id).cloned())
+                                .collect(),
+                        );
+                    }
+                    rollback(&mut work, &mut undo, cp);
                 }
-                rollback(&mut work, &mut undo, cp);
+            } else {
+                // No bound columns: full scan
+                for tuple in rel.iter_full() {
+                    let cp = undo.len();
+                    if self.match_agg_args(agg, tuple, &mut work, &mut undo) {
+                        collected.push(
+                            agg.bound_vars
+                                .iter()
+                                .filter_map(|var_id| work.get(var_id).cloned())
+                                .collect(),
+                        );
+                    }
+                    rollback(&mut work, &mut undo, cp);
+                }
             }
 
             // Apply aggregator (streaming over the collected slice)
@@ -617,6 +654,32 @@ impl Engine {
         }
 
         results
+    }
+
+    /// Find aggregation columns that are already bound in the given bindings.
+    fn find_bound_agg_columns(
+        &self,
+        agg: &CAggregation,
+        binding: &Bindings,
+    ) -> Vec<(usize, Value)> {
+        let mut bound = Vec::new();
+        for (col, arg) in agg.args.iter().enumerate() {
+            match arg {
+                CAggArg::Var(var_id) => {
+                    if let Some(val) = binding.get(var_id) {
+                        bound.push((col, val.clone()));
+                    }
+                }
+                CAggArg::Expr(expr) => {
+                    if let Some(val) =
+                        eval_cexpr(expr, binding, Some(&self.type_registry), &self.var_interner)
+                    {
+                        bound.push((col, val));
+                    }
+                }
+            }
+        }
+        bound
     }
 
     /// Match aggregation relation arguments against a tuple in place.
