@@ -2,8 +2,9 @@
 //!
 //! Each relation maintains per-column hash indices for efficient joins.
 
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::value::{Tuple, Value};
 
@@ -16,21 +17,21 @@ pub struct RelationStorage {
     /// All tuples in the relation, stored as Rc-wrapped slices for cheap cloning.
     tuples: Vec<StoredTuple>,
     /// Deduplication set (Rc clones are O(1) refcount bumps).
-    seen: HashSet<StoredTuple>,
+    seen: FxHashSet<StoredTuple>,
     /// Indices of tuples added in the current iteration (delta).
     delta: Vec<usize>,
     /// Indices of tuples from the previous iteration (for semi-naive).
     recent: Vec<usize>,
     /// Set version of recent for O(1) membership checks.
-    recent_set: HashSet<usize>,
+    recent_set: FxHashSet<usize>,
     /// Per-column index: (column, value) → list of tuple indices.
-    indices: Vec<HashMap<Value, Vec<usize>>>,
+    indices: Vec<FxHashMap<Value, Vec<usize>>>,
     /// Number of columns.
     arity: usize,
     /// Whether this is a lattice relation (last column is the lattice value).
     is_lattice: bool,
     /// For lattice relations: key columns → tuple index (for merge-by-key).
-    key_index: HashMap<Vec<Value>, usize>,
+    key_index: FxHashMap<Vec<Value>, usize>,
 }
 
 impl RelationStorage {
@@ -43,14 +44,14 @@ impl RelationStorage {
     pub fn with_lattice(arity: usize, is_lattice: bool) -> Self {
         Self {
             tuples: Vec::new(),
-            seen: HashSet::new(),
+            seen: FxHashSet::default(),
             delta: Vec::new(),
             recent: Vec::new(),
-            recent_set: HashSet::new(),
-            indices: (0..arity).map(|_| HashMap::new()).collect(),
+            recent_set: FxHashSet::default(),
+            indices: (0..arity).map(|_| FxHashMap::default()).collect(),
             arity,
             is_lattice,
-            key_index: HashMap::new(),
+            key_index: FxHashMap::default(),
         }
     }
 

@@ -47,9 +47,9 @@ Baseline: 15–550x slower than compiled ascent (Criterion benchmarks).
 
 ### Low-effort
 
-- [ ] Intern variable names (u32 index instead of String keys in Bindings)
-- [ ] Rc-wrap tuples to avoid cloning on dedup (Rc::clone instead of Vec::clone)
-- [ ] Stream aggregation instead of collecting into Vec then reducing
+- [x] Intern variable names (u32 index instead of String keys in Bindings)
+- [x] Rc-wrap tuples to avoid cloning on dedup (Rc::clone instead of Vec::clone)
+- [x] Stream aggregation instead of collecting into Vec then reducing
 
 ### Medium-effort
 

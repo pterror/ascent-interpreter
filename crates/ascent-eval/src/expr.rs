@@ -395,7 +395,7 @@ mod tests {
     fn eval(input: &str) -> Value {
         let interner = VarInterner::default();
         let expr: syn::Expr = syn::parse_str(input).unwrap();
-        eval_expr(&expr, &Bindings::new(), &interner).unwrap()
+        eval_expr(&expr, &Bindings::default(), &interner).unwrap()
     }
 
     #[test]
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn test_variables() {
         let interner = VarInterner::default();
-        let mut bindings = Bindings::new();
+        let mut bindings = Bindings::default();
         bindings.insert(interner.intern("x"), Value::I32(10));
         bindings.insert(interner.intern("y"), Value::I32(20));
 

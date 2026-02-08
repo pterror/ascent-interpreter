@@ -12,6 +12,7 @@ ascent-syntax.workspace = true
 syn.workspace = true
 itertools.workspace = true
 petgraph.workspace = true
+rustc-hash.workspace = true
 serde = { workspace = true, optional = true }
 
 [features]

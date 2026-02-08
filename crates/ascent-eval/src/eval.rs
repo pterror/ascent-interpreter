@@ -1,12 +1,12 @@
 //! Semi-naive evaluation engine.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 
 use ascent_ir::{Aggregation, BodyItem, Clause, ClauseArg, Condition, Program, Rule};
 use petgraph::algo::{condensation, toposort};
 use petgraph::graph::DiGraph;
+use rustc_hash::FxHashMap;
 
 use crate::aggregators::apply_aggregator;
 use crate::expr::{eval_expr, eval_expr_with_registry, expand_range};
@@ -16,8 +16,8 @@ use crate::value::{DynValue, Tuple, Value};
 /// Interned variable identifier (u32 index instead of String).
 pub type VarId = u32;
 
-/// Variable bindings during rule evaluation (u32-keyed for cheap clone/lookup).
-pub type Bindings = HashMap<VarId, Value>;
+/// Variable bindings during rule evaluation (u32-keyed with FxHash for fast clone/lookup).
+pub type Bindings = FxHashMap<VarId, Value>;
 
 /// Maps variable name strings to compact u32 identifiers.
 ///
@@ -25,7 +25,7 @@ pub type Bindings = HashMap<VarId, Value>;
 /// without conflicting with other Engine borrows.
 #[derive(Debug, Default)]
 pub struct VarInterner {
-    ids: RefCell<HashMap<String, VarId>>,
+    ids: RefCell<FxHashMap<String, VarId>>,
     next_id: std::cell::Cell<VarId>,
 }
 
@@ -52,16 +52,16 @@ pub type ValueDestructor = Box<dyn Fn(&Value) -> Option<Vec<Value>> + Send + Syn
 
 /// Registry of user-defined types and their constructors/destructors.
 pub struct TypeRegistry {
-    constructors: HashMap<String, ValueConstructor>,
-    destructors: HashMap<String, ValueDestructor>,
+    constructors: FxHashMap<String, ValueConstructor>,
+    destructors: FxHashMap<String, ValueDestructor>,
 }
 
 impl TypeRegistry {
     /// Create an empty type registry.
     pub fn new() -> Self {
         TypeRegistry {
-            constructors: HashMap::new(),
-            destructors: HashMap::new(),
+            constructors: FxHashMap::default(),
+            destructors: FxHashMap::default(),
         }
     }
 
@@ -94,7 +94,7 @@ impl fmt::Debug for TypeRegistry {
 #[derive(Debug)]
 pub struct Engine {
     /// Storage for each relation.
-    relations: HashMap<String, RelationStorage>,
+    relations: FxHashMap<String, RelationStorage>,
     /// Registry of custom type constructors.
     pub type_registry: TypeRegistry,
     /// Intern table for variable names.
@@ -104,7 +104,7 @@ pub struct Engine {
 impl Engine {
     /// Create a new engine from a program.
     pub fn new(program: &Program) -> Self {
-        let mut relations = HashMap::new();
+        let mut relations = FxHashMap::default();
 
         for (name, rel) in &program.relations {
             let arity = rel.column_types.len();
@@ -276,7 +276,7 @@ impl Engine {
 
         if !use_recent {
             // Initial iteration: all clauses use full
-            let final_bindings = self.process_body(&rule.body, vec![Bindings::new()], None);
+            let final_bindings = self.process_body(&rule.body, vec![Bindings::default()], None);
             self.collect_head_tuples(rule, &final_bindings, &mut results);
             return results;
         }
@@ -291,7 +291,7 @@ impl Engine {
                 && rel.iter_recent().next().is_some()
             {
                 let final_bindings =
-                    self.process_body(&rule.body, vec![Bindings::new()], Some(idx));
+                    self.process_body(&rule.body, vec![Bindings::default()], Some(idx));
                 self.collect_head_tuples(rule, &final_bindings, &mut results);
             }
         }
@@ -689,7 +689,7 @@ fn compute_rule_sccs(program: &Program) -> Vec<Vec<usize>> {
     }
 
     // Map: relation_name → rule indices that produce it (appear in head)
-    let mut producers: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut producers: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
     for (i, rule) in program.rules.iter().enumerate() {
         for head in &rule.heads {
             producers.entry(&head.relation).or_default().push(i);
