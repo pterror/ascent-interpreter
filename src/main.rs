@@ -358,7 +358,7 @@ fn matches_pattern(value: &Value, pat: &QueryPat) -> bool {
 }
 
 fn print_filtered(name: &str, rel: &RelationStorage, pats: &[QueryPat]) {
-    let mut tuples: Vec<&Vec<Value>> = rel
+    let mut tuples: Vec<&[Value]> = rel
         .iter()
         .filter(|tuple| {
             tuple.len() >= pats.len()
@@ -417,7 +417,7 @@ fn print_tuples(name: &str, rel: &RelationStorage) {
         if rel.len() == 1 { "" } else { "s" }
     );
 
-    let mut tuples: Vec<&Vec<Value>> = rel.iter().collect();
+    let mut tuples: Vec<&[Value]> = rel.iter().collect();
     tuples.sort_by(|a, b| cmp_tuples(a, b));
 
     for tuple in tuples {

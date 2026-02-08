@@ -31,13 +31,42 @@ fn run_with_facts(input: &str, facts: Vec<(&str, Vec<Vec<Value>>)>) -> Engine {
     engine
 }
 
-fn rel_set(engine: &Engine, name: &str) -> HashSet<Vec<Value>> {
-    engine
-        .relation(name)
-        .unwrap()
-        .iter()
-        .cloned()
-        .collect::<HashSet<_>>()
+/// Wrapper around HashSet<Vec<Value>> that accepts `&[Value]` in `contains`,
+/// enabling `&[Value; N]` → `&[Value]` coercion at call sites.
+#[derive(Debug)]
+struct RelSet(HashSet<Vec<Value>>);
+
+impl RelSet {
+    fn contains(&self, tuple: &[Value]) -> bool {
+        self.0.contains(tuple)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl PartialEq for RelSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl FromIterator<Vec<Value>> for RelSet {
+    fn from_iter<I: IntoIterator<Item = Vec<Value>>>(iter: I) -> Self {
+        RelSet(iter.into_iter().collect())
+    }
+}
+
+fn rel_set(engine: &Engine, name: &str) -> RelSet {
+    RelSet(
+        engine
+            .relation(name)
+            .unwrap()
+            .iter()
+            .map(|t| t.to_vec())
+            .collect::<HashSet<_>>(),
+    )
 }
 
 fn i(v: i32) -> Value {
@@ -126,11 +155,11 @@ fn test_nested_generators() {
     let pair = engine.relation("pair").unwrap();
     // Combinations where x < y from 0..10: C(10,2) = 45
     assert_eq!(pair.len(), 45);
-    assert!(pair.contains(&vec![i(0), i(1)]));
-    assert!(pair.contains(&vec![i(0), i(9)]));
-    assert!(pair.contains(&vec![i(8), i(9)]));
-    assert!(!pair.contains(&vec![i(5), i(5)])); // x < y, not x == y
-    assert!(!pair.contains(&vec![i(9), i(0)])); // not reversed
+    assert!(pair.contains(&[i(0), i(1)]));
+    assert!(pair.contains(&[i(0), i(9)]));
+    assert!(pair.contains(&[i(8), i(9)]));
+    assert!(!pair.contains(&[i(5), i(5)])); // x < y, not x == y
+    assert!(!pair.contains(&[i(9), i(0)])); // not reversed
 }
 
 // ─── Cross product ──────────────────────────────────────────────────
@@ -155,8 +184,8 @@ fn test_cross_product() {
 
     let baz = engine.relation("baz").unwrap();
     assert_eq!(baz.len(), 10); // 5 × 2
-    assert!(baz.contains(&vec![i(0), i(1), i(11), i(12)]));
-    assert!(baz.contains(&vec![i(4), i(5), i(12), i(13)]));
+    assert!(baz.contains(&[i(0), i(1), i(11), i(12)]));
+    assert!(baz.contains(&[i(4), i(5), i(12), i(13)]));
 }
 
 // ─── Arithmetic joins ───────────────────────────────────────────────
@@ -190,10 +219,10 @@ fn test_arithmetic_join() {
     );
 
     let bar = rel_set(&engine, "bar");
-    assert!(bar.contains(&vec![i(1), i(6)])); // 1, 2+4
-    assert!(bar.contains(&vec![i(1), i(3)])); // 1, 2+1
-    assert!(bar.contains(&vec![i(10), i(60)])); // 10, 20+40
-    assert!(bar.contains(&vec![i(10), i(20)])); // 10, 20+0
+    assert!(bar.contains(&[i(1), i(6)])); // 1, 2+4
+    assert!(bar.contains(&[i(1), i(3)])); // 1, 2+1
+    assert!(bar.contains(&[i(10), i(60)])); // 10, 20+40
+    assert!(bar.contains(&[i(10), i(20)])); // 10, 20+0
     assert_eq!(bar.len(), 4);
 }
 
@@ -214,10 +243,10 @@ fn test_factorial() {
     "#);
 
     let fac = engine.relation("fac").unwrap();
-    assert!(fac.contains(&vec![i(0), i(1)]));
-    assert!(fac.contains(&vec![i(1), i(1)]));
-    assert!(fac.contains(&vec![i(5), i(120)]));
-    assert!(fac.contains(&vec![i(10), i(3628800)]));
+    assert!(fac.contains(&[i(0), i(1)]));
+    assert!(fac.contains(&[i(1), i(1)]));
+    assert!(fac.contains(&[i(5), i(120)]));
+    assert!(fac.contains(&[i(10), i(3628800)]));
 }
 
 // ─── Multi-head rules ───────────────────────────────────────────────
@@ -295,11 +324,11 @@ fn test_disjunction() {
     // Even: 2, 4, 6, 8, 10
     // Square: 1, 4, 9, 16, 25, 36, 49, 64, 81, 100
     // Union: 1, 2, 4, 6, 8, 9, 10, 16, 25, 36, 49, 64, 81, 100
-    assert!(eos.contains(&vec![i(2)]));
-    assert!(eos.contains(&vec![i(4)])); // both even and square
-    assert!(eos.contains(&vec![i(9)])); // square only
-    assert!(eos.contains(&vec![i(10)])); // even only
-    assert!(!eos.contains(&vec![i(3)])); // neither
+    assert!(eos.contains(&[i(2)]));
+    assert!(eos.contains(&[i(4)])); // both even and square
+    assert!(eos.contains(&[i(9)])); // square only
+    assert!(eos.contains(&[i(10)])); // even only
+    assert!(!eos.contains(&[i(3)])); // neither
 }
 
 // ─── Disjunction with recursion ─────────────────────────────────────
@@ -325,9 +354,9 @@ fn test_disjunction_transitive() {
     let conn = rel_set(&engine, "connected");
     // 1→2 (road), 2→3 (road), 3→4 (rail), 4→5 (rail)
     // Plus transitive: 1→3, 1→4, 1→5, 2→4, 2→5, 3→5
-    assert!(conn.contains(&vec![i(1), i(2)]));
-    assert!(conn.contains(&vec![i(1), i(5)])); // 1→2→3→4→5
-    assert!(conn.contains(&vec![i(3), i(5)])); // 3→4→5
+    assert!(conn.contains(&[i(1), i(2)]));
+    assert!(conn.contains(&[i(1), i(5)])); // 1→2→3→4→5
+    assert!(conn.contains(&[i(3), i(5)])); // 3→4→5
     assert_eq!(conn.len(), 10); // 4 direct + 6 transitive
 }
 
@@ -440,10 +469,10 @@ fn test_aggregation_all() {
         card(y) <-- agg y = count() in number(_);
     "#);
 
-    assert!(engine.relation("lowest").unwrap().contains(&vec![i(1)]));
-    assert!(engine.relation("greatest").unwrap().contains(&vec![i(5)]));
-    assert!(engine.relation("total").unwrap().contains(&vec![i(15)]));
-    assert!(engine.relation("card").unwrap().contains(&vec![i(5)]));
+    assert!(engine.relation("lowest").unwrap().contains(&[i(1)]));
+    assert!(engine.relation("greatest").unwrap().contains(&[i(5)]));
+    assert!(engine.relation("total").unwrap().contains(&[i(15)]));
+    assert!(engine.relation("card").unwrap().contains(&[i(5)]));
 }
 
 // ─── Aggregation with grouping ──────────────────────────────────────
@@ -492,12 +521,12 @@ fn test_connected_components() {
     let reach = engine.relation("reach").unwrap();
     // Component {1,2,3}: 3×3 = 9 pairs (including self-loops via reach(x,y),reach(y,x))
     // Component {4,5}: 2×2 = 4 pairs (including self-loops)
-    assert!(reach.contains(&vec![i(1), i(3)]));
-    assert!(reach.contains(&vec![i(3), i(1)]));
-    assert!(reach.contains(&vec![i(1), i(1)])); // self-loop
-    assert!(reach.contains(&vec![i(4), i(5)]));
-    assert!(reach.contains(&vec![i(5), i(4)]));
-    assert!(!reach.contains(&vec![i(1), i(4)])); // different component
+    assert!(reach.contains(&[i(1), i(3)]));
+    assert!(reach.contains(&[i(3), i(1)]));
+    assert!(reach.contains(&[i(1), i(1)])); // self-loop
+    assert!(reach.contains(&[i(4), i(5)]));
+    assert!(reach.contains(&[i(5), i(4)]));
+    assert!(!reach.contains(&[i(1), i(4)])); // different component
     assert_eq!(reach.len(), 13); // 9 + 4
 }
 
@@ -704,7 +733,7 @@ fn test_aggregation_over_recursive() {
     assert_eq!(path.len(), 10); // 4 + 3 + 2 + 1
 
     let pc = engine.relation("path_count").unwrap();
-    assert!(pc.contains(&vec![i(10)]));
+    assert!(pc.contains(&[i(10)]));
 }
 
 // ─── Constant in body clause ────────────────────────────────────────
@@ -798,9 +827,9 @@ fn test_let_binding() {
     "#);
 
     let output = rel_set(&engine, "output");
-    assert!(output.contains(&vec![i(1), i(2)]));
-    assert!(output.contains(&vec![i(3), i(6)]));
-    assert!(output.contains(&vec![i(5), i(10)]));
+    assert!(output.contains(&[i(1), i(2)]));
+    assert!(output.contains(&[i(3), i(6)]));
+    assert!(output.contains(&[i(5), i(10)]));
     assert_eq!(output.len(), 5);
 }
 

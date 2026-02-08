@@ -25,7 +25,7 @@ fn interp1(engine: &Engine, name: &str) -> BTreeSet<(i32,)> {
         .relation(name)
         .unwrap()
         .iter()
-        .map(|t| match t.as_slice() {
+        .map(|t| match t {
             [Value::I32(a)] => (*a,),
             other => panic!("expected 1-col i32, got {other:?}"),
         })
@@ -38,7 +38,7 @@ fn interp2(engine: &Engine, name: &str) -> BTreeSet<(i32, i32)> {
         .relation(name)
         .unwrap()
         .iter()
-        .map(|t| match t.as_slice() {
+        .map(|t| match t {
             [Value::I32(a), Value::I32(b)] => (*a, *b),
             other => panic!("expected 2-col i32, got {other:?}"),
         })
@@ -51,7 +51,7 @@ fn interp3(engine: &Engine, name: &str) -> BTreeSet<(i32, i32, i32)> {
         .relation(name)
         .unwrap()
         .iter()
-        .map(|t| match t.as_slice() {
+        .map(|t| match t {
             [Value::I32(a), Value::I32(b), Value::I32(c)] => (*a, *b, *c),
             other => panic!("expected 3-col i32, got {other:?}"),
         })
@@ -220,7 +220,7 @@ fn compare_three_way_join() {
         .relation("result")
         .unwrap()
         .iter()
-        .map(|t| match t.as_slice() {
+        .map(|t| match t {
             [Value::I32(a), Value::I32(b), Value::I32(c), Value::I32(d)] => (*a, *b, *c, *d),
             other => panic!("unexpected: {other:?}"),
         })
@@ -711,7 +711,7 @@ fn compare_lattice_shortest_path() {
         .relation("shortest")
         .unwrap()
         .iter()
-        .map(|t| match t.as_slice() {
+        .map(|t| match t {
             [Value::I32(a), Value::I32(b), Value::Dual(d)] => match d.as_ref() {
                 Value::I32(v) => (*a, *b, *v),
                 other => panic!("expected Dual(i32), got Dual({other:?})"),

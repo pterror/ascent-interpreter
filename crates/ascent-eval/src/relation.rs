@@ -3,16 +3,20 @@
 //! Each relation maintains per-column hash indices for efficient joins.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::value::{Tuple, Value};
+
+/// Rc-wrapped tuple for cheap cloning in dedup sets and storage.
+type StoredTuple = Rc<[Value]>;
 
 /// Storage for a single relation with per-column indices.
 #[derive(Debug, Clone, Default)]
 pub struct RelationStorage {
-    /// All tuples in the relation, stored as a Vec for index-based access.
-    tuples: Vec<Tuple>,
-    /// Deduplication set (used for non-lattice relations).
-    seen: HashSet<Tuple>,
+    /// All tuples in the relation, stored as Rc-wrapped slices for cheap cloning.
+    tuples: Vec<StoredTuple>,
+    /// Deduplication set (Rc clones are O(1) refcount bumps).
+    seen: HashSet<StoredTuple>,
     /// Indices of tuples added in the current iteration (delta).
     delta: Vec<usize>,
     /// Indices of tuples from the previous iteration (for semi-naive).
@@ -77,13 +81,14 @@ impl RelationStorage {
             return self.insert_lattice(tuple);
         }
 
-        if self.seen.insert(tuple.clone()) {
+        let stored: StoredTuple = Rc::from(tuple);
+        if self.seen.insert(stored.clone()) {
             let idx = self.tuples.len();
             // Update per-column indices
-            for (col, val) in tuple.iter().enumerate() {
+            for (col, val) in stored.iter().enumerate() {
                 self.indices[col].entry(val.clone()).or_default().push(idx);
             }
-            self.tuples.push(tuple);
+            self.tuples.push(stored);
             self.delta.push(idx);
             true
         } else {
@@ -93,8 +98,9 @@ impl RelationStorage {
 
     /// Lattice insert: merge by key columns using lattice join on last column.
     fn insert_lattice(&mut self, tuple: Tuple) -> bool {
-        let key: Vec<Value> = tuple[..self.arity - 1].to_vec();
-        let new_lat = &tuple[self.arity - 1];
+        let stored: StoredTuple = Rc::from(tuple);
+        let key: Vec<Value> = stored[..self.arity - 1].to_vec();
+        let new_lat = &stored[self.arity - 1];
 
         if let Some(&idx) = self.key_index.get(&key) {
             // Key exists: try to merge lattice values
@@ -102,9 +108,11 @@ impl RelationStorage {
             if let Some(joined) = old_lat.lattice_join(new_lat)
                 && joined != *old_lat
             {
-                // Lattice value changed: update in place
+                // Lattice value changed: rebuild tuple with new lattice value
                 let old_val = self.tuples[idx][self.arity - 1].clone();
-                self.tuples[idx][self.arity - 1] = joined.clone();
+                let mut new_data: Vec<Value> = self.tuples[idx].to_vec();
+                new_data[self.arity - 1] = joined.clone();
+                self.tuples[idx] = Rc::from(new_data);
 
                 // Update the last-column index
                 let last_col = self.arity - 1;
@@ -123,23 +131,23 @@ impl RelationStorage {
         } else {
             // New key: insert fresh tuple
             let idx = self.tuples.len();
-            for (col, val) in tuple.iter().enumerate() {
+            for (col, val) in stored.iter().enumerate() {
                 self.indices[col].entry(val.clone()).or_default().push(idx);
             }
             self.key_index.insert(key, idx);
-            self.tuples.push(tuple);
+            self.tuples.push(stored);
             self.delta.push(idx);
             true
         }
     }
 
     /// Check if a tuple exists.
-    pub fn contains(&self, tuple: &Tuple) -> bool {
+    pub fn contains(&self, tuple: &[Value]) -> bool {
         if self.is_lattice && self.arity > 0 {
             // For lattice relations, look up by key and check the full tuple
             let key = &tuple[..self.arity - 1];
             if let Some(&idx) = self.key_index.get(key) {
-                return self.tuples[idx] == *tuple;
+                return *self.tuples[idx] == *tuple;
             }
             return false;
         }
@@ -147,18 +155,18 @@ impl RelationStorage {
     }
 
     /// Iterate over all tuples.
-    pub fn iter(&self) -> impl Iterator<Item = &Tuple> {
-        self.tuples.iter()
+    pub fn iter(&self) -> impl Iterator<Item = &[Value]> {
+        self.tuples.iter().map(|t| t.as_ref())
     }
 
     /// Iterate over recent tuples (from last iteration).
-    pub fn iter_recent(&self) -> impl Iterator<Item = &Tuple> {
-        self.recent.iter().map(|&i| &self.tuples[i])
+    pub fn iter_recent(&self) -> impl Iterator<Item = &[Value]> {
+        self.recent.iter().map(|&i| self.tuples[i].as_ref())
     }
 
     /// Iterate over all tuples (for rules that don't use semi-naive).
-    pub fn iter_full(&self) -> impl Iterator<Item = &Tuple> {
-        self.tuples.iter()
+    pub fn iter_full(&self) -> impl Iterator<Item = &[Value]> {
+        self.tuples.iter().map(|t| t.as_ref())
     }
 
     /// Look up tuples matching a value in the given column.
@@ -170,7 +178,7 @@ impl RelationStorage {
     }
 
     /// Get a tuple by index.
-    pub fn get(&self, idx: usize) -> &Tuple {
+    pub fn get(&self, idx: usize) -> &[Value] {
         &self.tuples[idx]
     }
 
@@ -265,7 +273,7 @@ mod tests {
         // Same key, larger value: merge takes max
         assert!(rel.insert(vec![Value::I32(1), Value::I32(20)]));
         assert_eq!(rel.len(), 1);
-        assert!(rel.contains(&vec![Value::I32(1), Value::I32(20)]));
+        assert!(rel.contains(&[Value::I32(1), Value::I32(20)]));
 
         // Different key: new tuple
         assert!(rel.insert(vec![Value::I32(2), Value::I32(15)]));
@@ -282,11 +290,11 @@ mod tests {
 
         // Smaller inner value wins for Dual
         assert!(rel.insert(vec![Value::I32(1), Value::Dual(Box::new(Value::I32(5)))]));
-        assert!(rel.contains(&vec![Value::I32(1), Value::Dual(Box::new(Value::I32(5)))]));
+        assert!(rel.contains(&[Value::I32(1), Value::Dual(Box::new(Value::I32(5)))]));
 
         // Larger inner value: no change
         assert!(!rel.insert(vec![Value::I32(1), Value::Dual(Box::new(Value::I32(20)))]));
-        assert!(rel.contains(&vec![Value::I32(1), Value::Dual(Box::new(Value::I32(5)))]));
+        assert!(rel.contains(&[Value::I32(1), Value::Dual(Box::new(Value::I32(5)))]));
     }
 
     #[test]

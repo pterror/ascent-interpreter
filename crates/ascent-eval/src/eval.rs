@@ -348,7 +348,7 @@ impl Engine {
                 }
             } else {
                 // No bound columns: full scan
-                let iter: Box<dyn Iterator<Item = &Tuple>> = if use_recent {
+                let iter: Box<dyn Iterator<Item = &[Value]>> = if use_recent {
                     Box::new(rel.iter_recent())
                 } else {
                     Box::new(rel.iter_full())
@@ -392,7 +392,7 @@ impl Engine {
     fn match_clause(
         &self,
         clause: &Clause,
-        tuple: &Tuple,
+        tuple: &[Value],
         mut bindings: Bindings,
     ) -> Option<Bindings> {
         if clause.args.len() != tuple.len() {
@@ -505,7 +505,7 @@ impl Engine {
     fn match_agg_args(
         &self,
         agg: &Aggregation,
-        tuple: &Tuple,
+        tuple: &[Value],
         mut bindings: Bindings,
     ) -> Option<Bindings> {
         if agg.args.len() != tuple.len() {
@@ -880,8 +880,8 @@ mod tests {
         );
 
         let edge = engine.relation("edge").unwrap();
-        assert!(edge.contains(&vec![Value::I32(1), Value::I32(2)]));
-        assert!(edge.contains(&vec![Value::I32(2), Value::I32(3)]));
+        assert!(edge.contains(&[Value::I32(1), Value::I32(2)]));
+        assert!(edge.contains(&[Value::I32(2), Value::I32(3)]));
         assert_eq!(edge.len(), 2);
     }
 
@@ -905,12 +905,12 @@ mod tests {
         );
 
         let path = engine.relation("path").unwrap();
-        assert!(path.contains(&vec![Value::I32(1), Value::I32(2)]));
-        assert!(path.contains(&vec![Value::I32(1), Value::I32(3)]));
-        assert!(path.contains(&vec![Value::I32(1), Value::I32(4)]));
-        assert!(path.contains(&vec![Value::I32(2), Value::I32(3)]));
-        assert!(path.contains(&vec![Value::I32(2), Value::I32(4)]));
-        assert!(path.contains(&vec![Value::I32(3), Value::I32(4)]));
+        assert!(path.contains(&[Value::I32(1), Value::I32(2)]));
+        assert!(path.contains(&[Value::I32(1), Value::I32(3)]));
+        assert!(path.contains(&[Value::I32(1), Value::I32(4)]));
+        assert!(path.contains(&[Value::I32(2), Value::I32(3)]));
+        assert!(path.contains(&[Value::I32(2), Value::I32(4)]));
+        assert!(path.contains(&[Value::I32(3), Value::I32(4)]));
         assert_eq!(path.len(), 6);
     }
 
@@ -960,8 +960,8 @@ mod tests {
         );
 
         let joined = engine.relation("joined").unwrap();
-        assert!(joined.contains(&vec![Value::I32(1), Value::I32(2), Value::I32(5)]));
-        assert!(joined.contains(&vec![Value::I32(3), Value::I32(4), Value::I32(6)]));
+        assert!(joined.contains(&[Value::I32(1), Value::I32(2), Value::I32(5)]));
+        assert!(joined.contains(&[Value::I32(3), Value::I32(4), Value::I32(6)]));
         assert_eq!(joined.len(), 2);
     }
 
@@ -981,8 +981,8 @@ mod tests {
         );
 
         let even = engine.relation("even").unwrap();
-        assert!(even.contains(&vec![Value::I32(2)]));
-        assert!(even.contains(&vec![Value::I32(4)]));
+        assert!(even.contains(&[Value::I32(2)]));
+        assert!(even.contains(&[Value::I32(4)]));
         assert_eq!(even.len(), 2);
     }
 
@@ -997,8 +997,8 @@ mod tests {
 
         let number = engine.relation("number").unwrap();
         assert_eq!(number.len(), 5);
-        assert!(number.contains(&vec![Value::I32(0)]));
-        assert!(number.contains(&vec![Value::I32(4)]));
+        assert!(number.contains(&[Value::I32(0)]));
+        assert!(number.contains(&[Value::I32(4)]));
     }
 
     #[test]
@@ -1015,9 +1015,9 @@ mod tests {
         );
 
         let doubled = engine.relation("doubled").unwrap();
-        assert!(doubled.contains(&vec![Value::I32(2)]));
-        assert!(doubled.contains(&vec![Value::I32(4)]));
-        assert!(doubled.contains(&vec![Value::I32(6)]));
+        assert!(doubled.contains(&[Value::I32(2)]));
+        assert!(doubled.contains(&[Value::I32(4)]));
+        assert!(doubled.contains(&[Value::I32(6)]));
         assert_eq!(doubled.len(), 3);
     }
 
@@ -1034,9 +1034,9 @@ mod tests {
 
         let small_even = engine.relation("small_even").unwrap();
         assert_eq!(small_even.len(), 5); // 0, 2, 4, 6, 8
-        assert!(small_even.contains(&vec![Value::I32(0)]));
-        assert!(small_even.contains(&vec![Value::I32(8)]));
-        assert!(!small_even.contains(&vec![Value::I32(10)]));
+        assert!(small_even.contains(&[Value::I32(0)]));
+        assert!(small_even.contains(&[Value::I32(8)]));
+        assert!(!small_even.contains(&[Value::I32(10)]));
     }
 
     #[test]
@@ -1051,12 +1051,12 @@ mod tests {
         );
 
         let fib = engine.relation("fib").unwrap();
-        assert!(fib.contains(&vec![Value::I32(0), Value::I32(1)]));
-        assert!(fib.contains(&vec![Value::I32(1), Value::I32(1)]));
-        assert!(fib.contains(&vec![Value::I32(2), Value::I32(2)]));
-        assert!(fib.contains(&vec![Value::I32(3), Value::I32(3)]));
-        assert!(fib.contains(&vec![Value::I32(4), Value::I32(5)]));
-        assert!(fib.contains(&vec![Value::I32(5), Value::I32(8)]));
+        assert!(fib.contains(&[Value::I32(0), Value::I32(1)]));
+        assert!(fib.contains(&[Value::I32(1), Value::I32(1)]));
+        assert!(fib.contains(&[Value::I32(2), Value::I32(2)]));
+        assert!(fib.contains(&[Value::I32(3), Value::I32(3)]));
+        assert!(fib.contains(&[Value::I32(4), Value::I32(5)]));
+        assert!(fib.contains(&[Value::I32(5), Value::I32(8)]));
     }
 
     #[test]
@@ -1076,7 +1076,7 @@ mod tests {
 
         let lowest = engine.relation("lowest").unwrap();
         assert_eq!(lowest.len(), 1);
-        assert!(lowest.contains(&vec![Value::I32(1)]));
+        assert!(lowest.contains(&[Value::I32(1)]));
     }
 
     #[test]
@@ -1094,7 +1094,7 @@ mod tests {
 
         let highest = engine.relation("highest").unwrap();
         assert_eq!(highest.len(), 1);
-        assert!(highest.contains(&vec![Value::I32(8)]));
+        assert!(highest.contains(&[Value::I32(8)]));
     }
 
     #[test]
@@ -1112,7 +1112,7 @@ mod tests {
 
         let total = engine.relation("total").unwrap();
         assert_eq!(total.len(), 1);
-        assert!(total.contains(&vec![Value::I32(6)]));
+        assert!(total.contains(&[Value::I32(6)]));
     }
 
     #[test]
@@ -1130,7 +1130,7 @@ mod tests {
 
         let card = engine.relation("card").unwrap();
         assert_eq!(card.len(), 1);
-        assert!(card.contains(&vec![Value::I32(3)]));
+        assert!(card.contains(&[Value::I32(3)]));
     }
 
     #[test]
@@ -1149,9 +1149,9 @@ mod tests {
         );
 
         let only_a = engine.relation("only_a").unwrap();
-        assert!(only_a.contains(&vec![Value::I32(1)]));
-        assert!(only_a.contains(&vec![Value::I32(3)]));
-        assert!(!only_a.contains(&vec![Value::I32(2)]));
+        assert!(only_a.contains(&[Value::I32(1)]));
+        assert!(only_a.contains(&[Value::I32(3)]));
+        assert!(!only_a.contains(&[Value::I32(2)]));
         assert_eq!(only_a.len(), 2);
     }
 
@@ -1172,7 +1172,7 @@ mod tests {
 
         let fib_max = engine.relation("fib_max").unwrap();
         assert_eq!(fib_max.len(), 1);
-        assert!(fib_max.contains(&vec![Value::I32(89)]));
+        assert!(fib_max.contains(&[Value::I32(89)]));
     }
 
     #[test]
@@ -1199,8 +1199,8 @@ mod tests {
 
         let unreachable = engine.relation("unreachable").unwrap();
         // Node 4 is unreachable from node 1; node 1 is unreachable from itself
-        assert!(unreachable.contains(&vec![Value::I32(4)]));
-        assert!(unreachable.contains(&vec![Value::I32(1)]));
+        assert!(unreachable.contains(&[Value::I32(4)]));
+        assert!(unreachable.contains(&[Value::I32(1)]));
         assert_eq!(unreachable.len(), 2);
     }
 
@@ -1234,13 +1234,13 @@ mod tests {
             engine
                 .relation("path_count")
                 .unwrap()
-                .contains(&vec![Value::I32(6)])
+                .contains(&[Value::I32(6)])
         );
         // max_dest: 1→4, 2→4, 3→4
         let max_dest = engine.relation("max_dest").unwrap();
-        assert!(max_dest.contains(&vec![Value::I32(1), Value::I32(4)]));
-        assert!(max_dest.contains(&vec![Value::I32(2), Value::I32(4)]));
-        assert!(max_dest.contains(&vec![Value::I32(3), Value::I32(4)]));
+        assert!(max_dest.contains(&[Value::I32(1), Value::I32(4)]));
+        assert!(max_dest.contains(&[Value::I32(2), Value::I32(4)]));
+        assert!(max_dest.contains(&[Value::I32(3), Value::I32(4)]));
         assert_eq!(max_dest.len(), 3);
     }
 
@@ -1295,14 +1295,14 @@ mod tests {
             engine
                 .relation("total")
                 .unwrap()
-                .contains(&vec![Value::I32(60)])
+                .contains(&[Value::I32(60)])
         );
         // 60 > 50, so is_high should have (60)
         assert!(
             engine
                 .relation("is_high")
                 .unwrap()
-                .contains(&vec![Value::I32(60)])
+                .contains(&[Value::I32(60)])
         );
     }
 
@@ -1326,8 +1326,8 @@ mod tests {
         );
 
         let best = engine.relation("best").unwrap();
-        assert!(best.contains(&vec![Value::I32(1), Value::I32(20)]));
-        assert!(best.contains(&vec![Value::I32(2), Value::I32(30)]));
+        assert!(best.contains(&[Value::I32(1), Value::I32(20)]));
+        assert!(best.contains(&[Value::I32(2), Value::I32(30)]));
         assert_eq!(best.len(), 2);
 
         // overall_best: max(20, 30) = 30
@@ -1335,7 +1335,7 @@ mod tests {
             engine
                 .relation("overall_best")
                 .unwrap()
-                .contains(&vec![Value::I32(30)])
+                .contains(&[Value::I32(30)])
         );
     }
 
@@ -1365,8 +1365,8 @@ mod tests {
 
         let isolated = engine.relation("isolated").unwrap();
         // Nodes 4 and 5 have no edges at all
-        assert!(isolated.contains(&vec![Value::I32(4)]));
-        assert!(isolated.contains(&vec![Value::I32(5)]));
+        assert!(isolated.contains(&[Value::I32(4)]));
+        assert!(isolated.contains(&[Value::I32(5)]));
         assert_eq!(isolated.len(), 2);
     }
 
@@ -1388,9 +1388,9 @@ mod tests {
 
         let best = engine.relation("best_score").unwrap();
         // Key 1: max(10, 20, 5) = 20
-        assert!(best.contains(&vec![Value::I32(1), Value::I32(20)]));
+        assert!(best.contains(&[Value::I32(1), Value::I32(20)]));
         // Key 2: max(30, 15) = 30
-        assert!(best.contains(&vec![Value::I32(2), Value::I32(30)]));
+        assert!(best.contains(&[Value::I32(2), Value::I32(30)]));
         assert_eq!(best.len(), 2);
     }
 
@@ -1413,19 +1413,19 @@ mod tests {
 
         let sp = engine.relation("shortest").unwrap();
         // 1→2: direct = 1
-        assert!(sp.contains(&vec![
+        assert!(sp.contains(&[
             Value::I32(1),
             Value::I32(2),
             Value::Dual(Box::new(Value::I32(1)))
         ]));
         // 2→3: direct = 2
-        assert!(sp.contains(&vec![
+        assert!(sp.contains(&[
             Value::I32(2),
             Value::I32(3),
             Value::Dual(Box::new(Value::I32(2)))
         ]));
         // 1→3: min(10, 1+2) = 3
-        assert!(sp.contains(&vec![
+        assert!(sp.contains(&[
             Value::I32(1),
             Value::I32(3),
             Value::Dual(Box::new(Value::I32(3)))
@@ -1456,13 +1456,13 @@ mod tests {
 
         let mr = engine.relation("max_reach").unwrap();
         // Node 1: 100 (own value only)
-        assert!(mr.contains(&vec![Value::I32(1), Value::I32(100)]));
+        assert!(mr.contains(&[Value::I32(1), Value::I32(100)]));
         // Node 2: max(50, 100) = 100 (from node 1)
-        assert!(mr.contains(&vec![Value::I32(2), Value::I32(100)]));
+        assert!(mr.contains(&[Value::I32(2), Value::I32(100)]));
         // Node 3: max(75, 100) = 100 (propagated through)
-        assert!(mr.contains(&vec![Value::I32(3), Value::I32(100)]));
+        assert!(mr.contains(&[Value::I32(3), Value::I32(100)]));
         // Node 4: max(100) = 100 (propagated from node 3)
-        assert!(mr.contains(&vec![Value::I32(4), Value::I32(100)]));
+        assert!(mr.contains(&[Value::I32(4), Value::I32(100)]));
         assert_eq!(mr.len(), 4);
     }
 
@@ -1485,12 +1485,12 @@ mod tests {
 
         let best = engine.relation("best").unwrap();
         // Dual join = min: Dual(min(10, 5)) = Dual(5)
-        assert!(best.contains(&vec![Value::I32(1), Value::Dual(Box::new(Value::I32(5)))]));
-        assert!(best.contains(&vec![Value::I32(2), Value::Dual(Box::new(Value::I32(3)))]));
+        assert!(best.contains(&[Value::I32(1), Value::Dual(Box::new(Value::I32(5)))]));
+        assert!(best.contains(&[Value::I32(2), Value::Dual(Box::new(Value::I32(3)))]));
 
         let result = engine.relation("result").unwrap();
-        assert!(result.contains(&vec![Value::I32(1), Value::I32(5)]));
-        assert!(result.contains(&vec![Value::I32(2), Value::I32(3)]));
+        assert!(result.contains(&[Value::I32(1), Value::I32(5)]));
+        assert!(result.contains(&[Value::I32(2), Value::I32(3)]));
     }
 
     // ─── Custom type (BYOD) tests ──────────────────────────────────
@@ -1532,8 +1532,8 @@ mod tests {
         engine.run(&program);
 
         let hp = engine.relation("has_point").unwrap();
-        assert!(hp.contains(&vec![Value::I32(1)]));
-        assert!(hp.contains(&vec![Value::I32(2)]));
+        assert!(hp.contains(&[Value::I32(1)]));
+        assert!(hp.contains(&[Value::I32(2)]));
         assert_eq!(hp.len(), 2);
     }
 
@@ -1558,7 +1558,7 @@ mod tests {
         engine.run(&program);
 
         let joined = engine.relation("joined").unwrap();
-        assert!(joined.contains(&vec![Value::I32(1), Value::I32(99)]));
+        assert!(joined.contains(&[Value::I32(1), Value::I32(99)]));
         assert_eq!(joined.len(), 1);
     }
 
@@ -1592,8 +1592,8 @@ mod tests {
 
         let data = engine.relation("data").unwrap();
         assert_eq!(data.len(), 2);
-        assert!(data.contains(&vec![Value::I32(1), Value::custom(Point { x: 10, y: 20 })]));
-        assert!(data.contains(&vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })]));
+        assert!(data.contains(&[Value::I32(1), Value::custom(Point { x: 10, y: 20 })]));
+        assert!(data.contains(&[Value::I32(2), Value::custom(Point { x: 30, y: 40 })]));
     }
 
     #[test]
@@ -1648,8 +1648,8 @@ mod tests {
 
         let coords = engine.relation("coords").unwrap();
         assert_eq!(coords.len(), 2);
-        assert!(coords.contains(&vec![Value::I32(1), Value::I32(10), Value::I32(20)]));
-        assert!(coords.contains(&vec![Value::I32(2), Value::I32(30), Value::I32(40)]));
+        assert!(coords.contains(&[Value::I32(1), Value::I32(10), Value::I32(20)]));
+        assert!(coords.contains(&[Value::I32(2), Value::I32(30), Value::I32(40)]));
     }
 
     #[test]
@@ -1675,7 +1675,7 @@ mod tests {
 
         let coords = engine.relation("coords").unwrap();
         assert_eq!(coords.len(), 1);
-        assert!(coords.contains(&vec![Value::I32(1), Value::I32(5), Value::I32(15)]));
+        assert!(coords.contains(&[Value::I32(1), Value::I32(5), Value::I32(15)]));
     }
 
     #[test]
@@ -1701,7 +1701,7 @@ mod tests {
 
         let x_only = engine.relation("x_only").unwrap();
         assert_eq!(x_only.len(), 1);
-        assert!(x_only.contains(&vec![Value::I32(1), Value::I32(7)]));
+        assert!(x_only.contains(&[Value::I32(1), Value::I32(7)]));
     }
 
     #[test]
@@ -1749,8 +1749,8 @@ mod tests {
 
         let unwrapped = engine.relation("unwrapped").unwrap();
         assert_eq!(unwrapped.len(), 2);
-        assert!(unwrapped.contains(&vec![Value::I32(1), Value::I32(10), Value::I32(20)]));
-        assert!(unwrapped.contains(&vec![Value::I32(2), Value::I32(30), Value::I32(40)]));
+        assert!(unwrapped.contains(&[Value::I32(1), Value::I32(10), Value::I32(20)]));
+        assert!(unwrapped.contains(&[Value::I32(2), Value::I32(30), Value::I32(40)]));
     }
 
     // ─── Serde registration tests ───────────────────────────────────
@@ -1794,8 +1794,8 @@ mod tests {
 
             let unwrapped = engine.relation("unwrapped").unwrap();
             assert_eq!(unwrapped.len(), 2);
-            assert!(unwrapped.contains(&vec![Value::I32(1), Value::I32(10), Value::I32(20)]));
-            assert!(unwrapped.contains(&vec![Value::I32(2), Value::I32(30), Value::I32(40)]));
+            assert!(unwrapped.contains(&[Value::I32(1), Value::I32(10), Value::I32(20)]));
+            assert!(unwrapped.contains(&[Value::I32(2), Value::I32(30), Value::I32(40)]));
         }
     }
 }
