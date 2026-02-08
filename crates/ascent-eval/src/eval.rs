@@ -10,8 +10,8 @@ use rustc_hash::FxHashMap;
 
 use crate::aggregators::apply_aggregator;
 use crate::compiled::{
-    CAggArg, CAggregation, CBodyItem, CClause, CClauseArg, CCondition, CGenerator, CHeadClause,
-    CRule, compile_rule, eval_cexpr,
+    CAggArg, CAggregation, CBodyItem, CClause, CClauseArg, CCondition, CHeadClause, CRule,
+    compile_rule, eval_cexpr,
 };
 use crate::expr::{eval_expr, expand_range};
 use crate::relation::RelationStorage;
@@ -20,8 +20,61 @@ use crate::value::{DynValue, Tuple, Value};
 /// Interned variable identifier (u32 index instead of String).
 pub type VarId = u32;
 
-/// Variable bindings during rule evaluation (u32-keyed with FxHash for fast clone/lookup).
-pub type Bindings = FxHashMap<VarId, Value>;
+/// Variable bindings during rule evaluation.
+///
+/// Uses Vec-indexed slots for O(1) direct access by VarId,
+/// replacing the previous FxHashMap-based approach.
+#[derive(Debug, Default)]
+pub struct Bindings {
+    slots: Vec<Option<Value>>,
+}
+
+impl Clone for Bindings {
+    fn clone(&self) -> Self {
+        Bindings {
+            slots: self.slots.clone(),
+        }
+    }
+    fn clone_from(&mut self, source: &Self) {
+        self.slots.clone_from(&source.slots);
+    }
+}
+
+impl Bindings {
+    /// Create bindings with pre-allocated slots for `n` variables.
+    pub fn new(capacity: usize) -> Self {
+        Bindings {
+            slots: vec![None; capacity],
+        }
+    }
+
+    /// Look up a variable binding by VarId.
+    #[inline]
+    pub fn get(&self, var_id: &VarId) -> Option<&Value> {
+        self.slots.get(*var_id as usize)?.as_ref()
+    }
+
+    /// Insert a variable binding. Returns the previous value if any.
+    #[inline]
+    pub fn insert(&mut self, var_id: VarId, value: Value) -> Option<Value> {
+        let idx = var_id as usize;
+        if idx >= self.slots.len() {
+            self.slots.resize(idx + 1, None);
+        }
+        self.slots[idx].replace(value)
+    }
+
+    /// Remove a variable binding. Returns the value if it was present.
+    #[inline]
+    pub fn remove(&mut self, var_id: &VarId) -> Option<Value> {
+        let idx = *var_id as usize;
+        if idx < self.slots.len() {
+            self.slots[idx].take()
+        } else {
+            None
+        }
+    }
+}
 
 /// Undo log for rolling back in-place binding modifications.
 ///
@@ -65,6 +118,16 @@ impl VarInterner {
         self.next_id.set(id + 1);
         self.ids.borrow_mut().insert(name.to_string(), id);
         id
+    }
+
+    /// Get the number of interned variables.
+    pub fn len(&self) -> usize {
+        self.next_id.get() as usize
+    }
+
+    /// Check if no variables have been interned.
+    pub fn is_empty(&self) -> bool {
+        self.next_id.get() == 0
     }
 }
 
@@ -123,6 +186,8 @@ pub struct Engine {
     pub type_registry: TypeRegistry,
     /// Intern table for variable names.
     pub(crate) var_interner: VarInterner,
+    /// Number of interned variables (for pre-allocating Bindings).
+    var_count: usize,
 }
 
 impl Engine {
@@ -142,6 +207,7 @@ impl Engine {
             relations,
             type_registry: TypeRegistry::new(),
             var_interner: VarInterner::default(),
+            var_count: 0,
         }
     }
 
@@ -223,6 +289,7 @@ impl Engine {
             .iter()
             .map(|r| compile_rule(r, &self.var_interner))
             .collect();
+        self.var_count = self.var_interner.len();
         for scc_indices in &sccs {
             let rules: Vec<&CRule> = scc_indices.iter().map(|&i| &compiled[i]).collect();
             self.run_stratum(&rules);
@@ -294,19 +361,28 @@ impl Engine {
         false
     }
 
-    /// Derive all tuples from a rule.
+    /// Derive all tuples from a rule using streaming evaluation.
     ///
     /// In semi-naive mode, for each clause position that has recent tuples,
     /// evaluate the rule with that clause using recent and all others using full.
-    /// This ensures we discover all new derivations regardless of which clause
-    /// received new data.
+    /// Uses recursive body processing with undo log to avoid materializing
+    /// intermediate `Vec<Bindings>` between body items.
     fn derive_tuples<'a>(&self, rule: &'a CRule, use_recent: bool) -> Vec<(&'a str, Tuple)> {
         let mut results = Vec::new();
+        let mut binding = Bindings::new(self.var_count);
+        let mut undo = UndoLog::new();
 
         if !use_recent {
             // Initial iteration: all clauses use full
-            let final_bindings = self.process_body(&rule.body, vec![Bindings::default()], None);
-            self.collect_head_tuples(rule, &final_bindings, &mut results);
+            self.process_body_recursive(
+                &rule.body,
+                0,
+                &rule.heads,
+                &mut binding,
+                &mut undo,
+                None,
+                &mut results,
+            );
             return results;
         }
 
@@ -319,144 +395,221 @@ impl Engine {
             if let Some(rel) = self.relations.get(rel_name)
                 && rel.iter_recent().next().is_some()
             {
-                let final_bindings =
-                    self.process_body(&rule.body, vec![Bindings::default()], Some(idx));
-                self.collect_head_tuples(rule, &final_bindings, &mut results);
+                self.process_body_recursive(
+                    &rule.body,
+                    0,
+                    &rule.heads,
+                    &mut binding,
+                    &mut undo,
+                    Some(idx),
+                    &mut results,
+                );
             }
         }
 
         results
     }
 
-    /// Collect head tuples from a set of bindings.
-    fn collect_head_tuples<'a>(
+    /// Recursively process body items in streaming fashion.
+    ///
+    /// Instead of materializing intermediate `Vec<Bindings>`, processes each
+    /// body item against the current binding in place. On match, recurses to
+    /// the next body item. On complete match of all items, emits head tuples.
+    /// Uses the undo log to roll back binding modifications after each attempt.
+    #[allow(clippy::too_many_arguments)]
+    fn process_body_recursive<'a>(
         &self,
-        rule: &'a CRule,
-        bindings: &[Bindings],
+        body: &'a [CBodyItem],
+        offset: usize,
+        heads: &'a [CHeadClause],
+        binding: &mut Bindings,
+        undo: &mut UndoLog,
+        recent_clause_idx: Option<usize>,
         results: &mut Vec<(&'a str, Tuple)>,
     ) {
-        for binding in bindings {
-            for head in &rule.heads {
+        if offset >= body.len() {
+            // All body items matched — emit head tuples
+            for head in heads {
                 if let Some(tuple) = self.eval_head_tuple(head, binding) {
                     results.push((&head.relation, tuple));
                 }
             }
+            return;
         }
-    }
 
-    /// Process body items, producing all valid bindings.
-    ///
-    /// `recent_clause_idx`: if Some(i), clause at position i uses recent tuples,
-    /// all other clauses use full. If None, all use full (initial iteration).
-    fn process_body(
-        &self,
-        body: &[CBodyItem],
-        bindings: Vec<Bindings>,
-        recent_clause_idx: Option<usize>,
-    ) -> Vec<Bindings> {
-        let mut current = bindings;
-
-        for (i, item) in body.iter().enumerate() {
-            if current.is_empty() {
-                break;
+        match &body[offset] {
+            CBodyItem::Clause(clause) => {
+                let use_recent = recent_clause_idx == Some(offset);
+                self.stream_clause(
+                    clause,
+                    use_recent,
+                    body,
+                    offset,
+                    heads,
+                    binding,
+                    undo,
+                    recent_clause_idx,
+                    results,
+                );
             }
-
-            current = match item {
-                CBodyItem::Clause(clause) => {
-                    let use_recent = recent_clause_idx == Some(i);
-                    self.process_clause(clause, current, use_recent)
+            CBodyItem::Generator(generator) => {
+                if let Some(range_val) = eval_cexpr(
+                    &generator.expr,
+                    binding,
+                    Some(&self.type_registry),
+                    &self.var_interner,
+                ) && let Some(values) = expand_range(&range_val)
+                {
+                    for value in values {
+                        let cp = undo.len();
+                        if let Some(&var_id) = generator.vars.first() {
+                            let old = binding.insert(var_id, value);
+                            undo.push((var_id, old));
+                        }
+                        self.process_body_recursive(
+                            body,
+                            offset + 1,
+                            heads,
+                            binding,
+                            undo,
+                            recent_clause_idx,
+                            results,
+                        );
+                        rollback(binding, undo, cp);
+                    }
                 }
-                CBodyItem::Generator(generator) => self.process_generator(generator, current),
-                CBodyItem::Condition(cond) => self.process_condition(cond, current),
-                CBodyItem::Aggregation(agg) => self.process_aggregation(agg, current),
-            };
+            }
+            CBodyItem::Condition(cond) => {
+                let cp = undo.len();
+                if self.eval_condition(cond, binding, undo) {
+                    self.process_body_recursive(
+                        body,
+                        offset + 1,
+                        heads,
+                        binding,
+                        undo,
+                        recent_clause_idx,
+                        results,
+                    );
+                }
+                rollback(binding, undo, cp);
+            }
+            CBodyItem::Aggregation(agg) => {
+                self.stream_aggregation(
+                    agg,
+                    body,
+                    offset,
+                    heads,
+                    binding,
+                    undo,
+                    recent_clause_idx,
+                    results,
+                );
+            }
         }
-
-        current
     }
 
-    /// Process a clause against the relation using index lookups when possible.
+    /// Stream clause matches, recursing to the next body item for each match.
     ///
-    /// Uses in-place binding modification with undo log to avoid cloning
-    /// the bindings map for each tuple attempted. Only clones on match success.
-    /// When multiple columns are bound, picks the most selective index and
-    /// pre-filters remaining bound columns via direct comparison.
-    fn process_clause(
+    /// Uses index lookups when bound columns are available, with pre-filtering
+    /// for multi-column matches. Uses delta-specific indices for recent lookups.
+    #[allow(clippy::too_many_arguments)]
+    fn stream_clause<'a>(
         &self,
         clause: &CClause,
-        bindings: Vec<Bindings>,
         use_recent: bool,
-    ) -> Vec<Bindings> {
+        body: &'a [CBodyItem],
+        offset: usize,
+        heads: &'a [CHeadClause],
+        binding: &mut Bindings,
+        undo: &mut UndoLog,
+        recent_clause_idx: Option<usize>,
+        results: &mut Vec<(&'a str, Tuple)>,
+    ) {
         let Some(rel) = self.relations.get(&clause.relation) else {
-            return vec![];
+            return;
         };
+        let bound_cols = self.find_bound_columns(clause, binding);
 
-        let mut results = Vec::new();
-        let mut undo = UndoLog::new();
-
-        for binding in &bindings {
-            let mut work = binding.clone();
-            let bound_cols = self.find_bound_columns(clause, binding);
-
-            if !bound_cols.is_empty() {
-                // Pick the most selective column for index lookup (smallest result set)
-                let (primary_pos, _) = bound_cols
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|&(_, (col, val))| rel.lookup(*col, val).len())
-                    .unwrap();
-                let (primary_col, primary_val) = &bound_cols[primary_pos];
-                // Use delta-specific index when only recent tuples are needed
-                let indices = if use_recent {
-                    rel.lookup_recent(*primary_col, primary_val)
-                } else {
-                    rel.lookup(*primary_col, primary_val)
-                };
-
-                for &idx in indices {
-                    let tuple = rel.get(idx);
-                    // Pre-filter: check remaining bound columns via direct comparison
-                    if bound_cols.len() > 1 {
-                        let pre_match = bound_cols
-                            .iter()
-                            .enumerate()
-                            .all(|(i, (col, val))| i == primary_pos || tuple[*col] == *val);
-                        if !pre_match {
-                            continue;
-                        }
-                    }
-                    let cp = undo.len();
-                    if self.match_clause(clause, tuple, &mut work, &mut undo)
-                        && self.check_clause_conditions(clause, &mut work, &mut undo)
-                    {
-                        results.push(work.clone());
-                    }
-                    rollback(&mut work, &mut undo, cp);
-                }
-            } else if use_recent {
-                for tuple in rel.iter_recent() {
-                    let cp = undo.len();
-                    if self.match_clause(clause, tuple, &mut work, &mut undo)
-                        && self.check_clause_conditions(clause, &mut work, &mut undo)
-                    {
-                        results.push(work.clone());
-                    }
-                    rollback(&mut work, &mut undo, cp);
-                }
+        if !bound_cols.is_empty() {
+            // Pick the most selective column for index lookup
+            let (primary_pos, _) = bound_cols
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, (col, val))| rel.lookup(*col, val).len())
+                .unwrap();
+            let (primary_col, primary_val) = &bound_cols[primary_pos];
+            let indices = if use_recent {
+                rel.lookup_recent(*primary_col, primary_val)
             } else {
-                for tuple in rel.iter_full() {
-                    let cp = undo.len();
-                    if self.match_clause(clause, tuple, &mut work, &mut undo)
-                        && self.check_clause_conditions(clause, &mut work, &mut undo)
-                    {
-                        results.push(work.clone());
+                rel.lookup(*primary_col, primary_val)
+            };
+
+            for &idx in indices {
+                let tuple = rel.get(idx);
+                // Pre-filter: check remaining bound columns via direct comparison
+                if bound_cols.len() > 1 {
+                    let pre_match = bound_cols
+                        .iter()
+                        .enumerate()
+                        .all(|(i, (col, val))| i == primary_pos || tuple[*col] == *val);
+                    if !pre_match {
+                        continue;
                     }
-                    rollback(&mut work, &mut undo, cp);
                 }
+                let cp = undo.len();
+                if self.match_clause(clause, tuple, binding, undo)
+                    && self.check_clause_conditions(clause, binding, undo)
+                {
+                    self.process_body_recursive(
+                        body,
+                        offset + 1,
+                        heads,
+                        binding,
+                        undo,
+                        recent_clause_idx,
+                        results,
+                    );
+                }
+                rollback(binding, undo, cp);
+            }
+        } else if use_recent {
+            for tuple in rel.iter_recent() {
+                let cp = undo.len();
+                if self.match_clause(clause, tuple, binding, undo)
+                    && self.check_clause_conditions(clause, binding, undo)
+                {
+                    self.process_body_recursive(
+                        body,
+                        offset + 1,
+                        heads,
+                        binding,
+                        undo,
+                        recent_clause_idx,
+                        results,
+                    );
+                }
+                rollback(binding, undo, cp);
+            }
+        } else {
+            for tuple in rel.iter_full() {
+                let cp = undo.len();
+                if self.match_clause(clause, tuple, binding, undo)
+                    && self.check_clause_conditions(clause, binding, undo)
+                {
+                    self.process_body_recursive(
+                        body,
+                        offset + 1,
+                        heads,
+                        binding,
+                        undo,
+                        recent_clause_idx,
+                        results,
+                    );
+                }
+                rollback(binding, undo, cp);
             }
         }
-
-        results
     }
 
     /// Find all clause columns that are already bound in the given bindings.
@@ -546,114 +699,99 @@ impl Engine {
         true
     }
 
-    /// Process a generator.
-    fn process_generator(&self, generator: &CGenerator, bindings: Vec<Bindings>) -> Vec<Bindings> {
-        let mut results = Vec::new();
-
-        for binding in bindings {
-            if let Some(range_val) = eval_cexpr(
-                &generator.expr,
-                &binding,
-                Some(&self.type_registry),
-                &self.var_interner,
-            ) && let Some(values) = expand_range(&range_val)
-            {
-                for value in values {
-                    let mut new_binding = binding.clone();
-                    if let Some(&var_id) = generator.vars.first() {
-                        new_binding.insert(var_id, value);
-                    }
-                    results.push(new_binding);
-                }
-            }
-        }
-
-        results
-    }
-
-    /// Process an aggregation clause.
+    /// Stream aggregation: collect matches, apply aggregator, recurse for each result.
     ///
     /// Uses index lookup when aggregation args have bound columns to avoid
     /// full relation scans. Falls back to full scan when no args are bound.
-    fn process_aggregation(&self, agg: &CAggregation, bindings: Vec<Bindings>) -> Vec<Bindings> {
+    #[allow(clippy::too_many_arguments)]
+    fn stream_aggregation<'a>(
+        &self,
+        agg: &CAggregation,
+        body: &'a [CBodyItem],
+        offset: usize,
+        heads: &'a [CHeadClause],
+        binding: &mut Bindings,
+        undo: &mut UndoLog,
+        recent_clause_idx: Option<usize>,
+        results: &mut Vec<(&'a str, Tuple)>,
+    ) {
         let Some(rel) = self.relations.get(&agg.relation) else {
-            return vec![];
+            return;
         };
 
-        let mut results = Vec::new();
-        let mut undo = UndoLog::new();
+        let mut collected: Vec<Vec<Value>> = Vec::new();
+        let bound_cols = self.find_bound_agg_columns(agg, binding);
 
-        for binding in &bindings {
-            let mut work = binding.clone();
-            let mut collected: Vec<Vec<Value>> = Vec::new();
+        if !bound_cols.is_empty() {
+            // Use index lookup: pick most selective column
+            let (primary_pos, _) = bound_cols
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, (col, val))| rel.lookup(*col, val).len())
+                .unwrap();
+            let (primary_col, primary_val) = &bound_cols[primary_pos];
+            let indices = rel.lookup(*primary_col, primary_val);
 
-            // Check which aggregation columns are already bound
-            let bound_cols = self.find_bound_agg_columns(agg, binding);
-
-            if !bound_cols.is_empty() {
-                // Use index lookup: pick most selective column
-                let (primary_pos, _) = bound_cols
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|&(_, (col, val))| rel.lookup(*col, val).len())
-                    .unwrap();
-                let (primary_col, primary_val) = &bound_cols[primary_pos];
-                let indices = rel.lookup(*primary_col, primary_val);
-
-                for &idx in indices {
-                    let tuple = rel.get(idx);
-                    // Pre-filter secondary bound columns
-                    if bound_cols.len() > 1 {
-                        let pre_match = bound_cols
+            for &idx in indices {
+                let tuple = rel.get(idx);
+                // Pre-filter secondary bound columns
+                if bound_cols.len() > 1 {
+                    let pre_match = bound_cols
+                        .iter()
+                        .enumerate()
+                        .all(|(i, (col, val))| i == primary_pos || tuple[*col] == *val);
+                    if !pre_match {
+                        continue;
+                    }
+                }
+                let cp = undo.len();
+                if self.match_agg_args(agg, tuple, binding, undo) {
+                    collected.push(
+                        agg.bound_vars
                             .iter()
-                            .enumerate()
-                            .all(|(i, (col, val))| i == primary_pos || tuple[*col] == *val);
-                        if !pre_match {
-                            continue;
-                        }
-                    }
-                    let cp = undo.len();
-                    if self.match_agg_args(agg, tuple, &mut work, &mut undo) {
-                        collected.push(
-                            agg.bound_vars
-                                .iter()
-                                .filter_map(|var_id| work.get(var_id).cloned())
-                                .collect(),
-                        );
-                    }
-                    rollback(&mut work, &mut undo, cp);
+                            .filter_map(|var_id| binding.get(var_id).cloned())
+                            .collect(),
+                    );
                 }
-            } else {
-                // No bound columns: full scan
-                for tuple in rel.iter_full() {
-                    let cp = undo.len();
-                    if self.match_agg_args(agg, tuple, &mut work, &mut undo) {
-                        collected.push(
-                            agg.bound_vars
-                                .iter()
-                                .filter_map(|var_id| work.get(var_id).cloned())
-                                .collect(),
-                        );
-                    }
-                    rollback(&mut work, &mut undo, cp);
-                }
+                rollback(binding, undo, cp);
             }
-
-            // Apply aggregator (streaming over the collected slice)
-            let agg_results =
-                apply_aggregator(&agg.aggregator_name, collected.iter().map(|v| v.as_slice()));
-
-            // Bind results to output pattern variables
-            for result_tuple in agg_results {
-                let mut new_binding = binding.clone();
-                for (&var_id, val) in agg.result_vars.iter().zip(result_tuple) {
-                    new_binding.insert(var_id, val);
+        } else {
+            // No bound columns: full scan
+            for tuple in rel.iter_full() {
+                let cp = undo.len();
+                if self.match_agg_args(agg, tuple, binding, undo) {
+                    collected.push(
+                        agg.bound_vars
+                            .iter()
+                            .filter_map(|var_id| binding.get(var_id).cloned())
+                            .collect(),
+                    );
                 }
-                results.push(new_binding);
+                rollback(binding, undo, cp);
             }
         }
 
-        results
+        // Apply aggregator and recurse for each result
+        let agg_results =
+            apply_aggregator(&agg.aggregator_name, collected.iter().map(|v| v.as_slice()));
+
+        for result_tuple in agg_results {
+            let cp = undo.len();
+            for (&var_id, val) in agg.result_vars.iter().zip(result_tuple) {
+                let old = binding.insert(var_id, val);
+                undo.push((var_id, old));
+            }
+            self.process_body_recursive(
+                body,
+                offset + 1,
+                heads,
+                binding,
+                undo,
+                recent_clause_idx,
+                results,
+            );
+            rollback(binding, undo, cp);
+        }
     }
 
     /// Find aggregation columns that are already bound in the given bindings.
@@ -727,17 +865,6 @@ impl Engine {
         }
 
         true
-    }
-
-    /// Process a condition, potentially binding new variables.
-    fn process_condition(&self, cond: &CCondition, mut bindings: Vec<Bindings>) -> Vec<Bindings> {
-        let mut undo = UndoLog::new();
-        bindings.retain_mut(|b| {
-            undo.clear();
-            self.eval_condition(cond, b, &mut undo)
-            // No rollback needed: failed bindings are dropped by retain_mut
-        });
-        bindings
     }
 
     /// Evaluate a condition in place. Returns `true` on success (bindings may be extended).

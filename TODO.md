@@ -44,6 +44,7 @@
 ## Interpreter Performance
 
 Baseline: 15–550x slower than compiled ascent (Criterion benchmarks).
+Current: 7–56x (after optimizations below).
 
 ### Low-effort
 
@@ -54,6 +55,7 @@ Baseline: 15–550x slower than compiled ascent (Criterion benchmarks).
 ### Medium-effort
 
 - [x] FxHashMap for all hot-path hash maps (bindings, indices, dedup sets)
+- [x] Vec-indexed Bindings (O(1) direct slot access by VarId instead of hash lookup)
 - [x] Eliminate per-match binding clones via undo log (rollback instead of clone)
 - [x] Multi-column index selection with pre-filter for join acceleration
 - [x] Pre-compile rules: intern variable names to VarIds, pre-evaluate literals, flatten syn::Expr to CExpr
@@ -67,7 +69,7 @@ Baseline: 15–550x slower than compiled ascent (Criterion benchmarks).
 ### High-effort
 
 - [ ] Expression compilation (flatten tree-walk to bytecode or closures)
-- [ ] Rule body pipeline without intermediate Vec<Bindings> (coroutine/callback streaming)
+- [x] Rule body pipeline without intermediate Vec<Bindings> (recursive streaming with undo log)
 - [ ] Parallel SCC evaluation (independent strata run on separate threads)
 - [ ] Cranelift backend for hot loops
 - [ ] Compile frequently-used rules to native code
