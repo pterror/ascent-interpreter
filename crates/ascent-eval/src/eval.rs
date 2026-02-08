@@ -531,6 +531,40 @@ impl Engine {
         };
         let bound_cols = self.find_bound_columns(clause, binding);
 
+        // Fast path: all columns bound and not using recent → single membership check.
+        // Replaces index lookup + iteration + match_clause with one hash lookup.
+        if !use_recent && bound_cols.len() == clause.args.len() {
+            let expected: Vec<Value> = bound_cols.iter().map(|(_, val)| val.clone()).collect();
+            if rel.contains(&expected) {
+                if clause.conditions.is_empty() {
+                    self.process_body_recursive(
+                        body,
+                        offset + 1,
+                        heads,
+                        binding,
+                        undo,
+                        recent_clause_idx,
+                        results,
+                    );
+                } else {
+                    let cp = undo.len();
+                    if self.check_clause_conditions(clause, binding, undo) {
+                        self.process_body_recursive(
+                            body,
+                            offset + 1,
+                            heads,
+                            binding,
+                            undo,
+                            recent_clause_idx,
+                            results,
+                        );
+                    }
+                    rollback(binding, undo, cp);
+                }
+            }
+            return;
+        }
+
         if !bound_cols.is_empty() {
             // Pick the most selective column for index lookup
             let (primary_pos, _) = bound_cols
