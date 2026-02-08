@@ -19,6 +19,26 @@ pub type VarId = u32;
 /// Variable bindings during rule evaluation (u32-keyed with FxHash for fast clone/lookup).
 pub type Bindings = FxHashMap<VarId, Value>;
 
+/// Undo log for rolling back in-place binding modifications.
+///
+/// Each entry records the VarId that was modified and its previous value
+/// (`None` if the key was freshly inserted, `Some(old)` if it was overwritten).
+type UndoLog = Vec<(VarId, Option<Value>)>;
+
+/// Rollback bindings to a checkpoint, undoing all insertions since that point.
+fn rollback(bindings: &mut Bindings, undo: &mut UndoLog, checkpoint: usize) {
+    for (id, old_val) in undo.drain(checkpoint..).rev() {
+        match old_val {
+            Some(v) => {
+                bindings.insert(id, v);
+            }
+            None => {
+                bindings.remove(&id);
+            }
+        }
+    }
+}
+
 /// Maps variable name strings to compact u32 identifiers.
 ///
 /// Uses interior mutability so `intern` can be called from `&self` methods
@@ -347,6 +367,9 @@ impl Engine {
     }
 
     /// Process a clause against the relation using index lookups when possible.
+    ///
+    /// Uses in-place binding modification with undo log to avoid cloning
+    /// the bindings map for each tuple attempted. Only clones on match success.
     fn process_clause(
         &self,
         clause: &Clause,
@@ -358,9 +381,10 @@ impl Engine {
         };
 
         let mut results = Vec::new();
+        let mut undo = UndoLog::new();
 
         for binding in &bindings {
-            // Find the best column to index on: a bound variable or evaluable expression
+            let mut work = binding.clone();
             let index_col = self.find_index_column(clause, binding);
 
             if let Some((col, value)) = index_col {
@@ -370,13 +394,14 @@ impl Engine {
                     if use_recent && !rel.is_recent(idx) {
                         continue;
                     }
+                    let cp = undo.len();
                     let tuple = rel.get(idx);
-                    if let Some(new_binding) = self.match_clause(clause, tuple, binding.clone())
-                        && let Some(final_binding) =
-                            self.check_clause_conditions(clause, new_binding)
+                    if self.match_clause(clause, tuple, &mut work, &mut undo)
+                        && self.check_clause_conditions(clause, &mut work, &mut undo)
                     {
-                        results.push(final_binding);
+                        results.push(work.clone());
                     }
+                    rollback(&mut work, &mut undo, cp);
                 }
             } else {
                 // No bound columns: full scan
@@ -386,12 +411,13 @@ impl Engine {
                     Box::new(rel.iter_full())
                 };
                 for tuple in iter {
-                    if let Some(new_binding) = self.match_clause(clause, tuple, binding.clone())
-                        && let Some(final_binding) =
-                            self.check_clause_conditions(clause, new_binding)
+                    let cp = undo.len();
+                    if self.match_clause(clause, tuple, &mut work, &mut undo)
+                        && self.check_clause_conditions(clause, &mut work, &mut undo)
                     {
-                        results.push(final_binding);
+                        results.push(work.clone());
                     }
+                    rollback(&mut work, &mut undo, cp);
                 }
             }
         }
@@ -426,52 +452,67 @@ impl Engine {
         None
     }
 
-    /// Try to match a clause against a tuple, extending bindings.
+    /// Try to match a clause against a tuple, extending bindings in place.
+    ///
+    /// Returns `true` if the match succeeded (bindings extended with new vars).
+    /// On failure, rolls back any partial insertions via the undo log.
     fn match_clause(
         &self,
         clause: &Clause,
         tuple: &[Value],
-        mut bindings: Bindings,
-    ) -> Option<Bindings> {
+        bindings: &mut Bindings,
+        undo: &mut UndoLog,
+    ) -> bool {
         if clause.args.len() != tuple.len() {
-            return None;
+            return false;
         }
 
+        let cp = undo.len();
         for (arg, value) in clause.args.iter().zip(tuple.iter()) {
             match arg {
                 ClauseArg::Var(var) => {
                     let var_id = self.var_interner.intern(var);
                     if let Some(existing) = bindings.get(&var_id) {
                         if existing != value {
-                            return None;
+                            rollback(bindings, undo, cp);
+                            return false;
                         }
                     } else {
                         bindings.insert(var_id, value.clone());
+                        undo.push((var_id, None));
                     }
                 }
                 ClauseArg::Expr(expr) => {
                     if let Some(evaluated) = eval_expr_with_registry(
                         expr,
-                        &bindings,
+                        bindings,
                         &self.type_registry,
                         &self.var_interner,
                     ) && evaluated != *value
                     {
-                        return None;
+                        rollback(bindings, undo, cp);
+                        return false;
                     }
                 }
             }
         }
 
-        Some(bindings)
+        true
     }
 
-    /// Check additional conditions on a clause, potentially extending bindings.
-    fn check_clause_conditions(&self, clause: &Clause, mut bindings: Bindings) -> Option<Bindings> {
+    /// Check additional conditions on a clause, potentially extending bindings in place.
+    fn check_clause_conditions(
+        &self,
+        clause: &Clause,
+        bindings: &mut Bindings,
+        undo: &mut UndoLog,
+    ) -> bool {
         for cond in &clause.conditions {
-            bindings = self.eval_condition(cond, bindings)?;
+            if !self.eval_condition(cond, bindings, undo) {
+                return false;
+            }
         }
-        Some(bindings)
+        true
     }
 
     /// Process a generator.
@@ -505,6 +546,9 @@ impl Engine {
     }
 
     /// Process an aggregation clause.
+    ///
+    /// Uses in-place binding modification with undo log to avoid cloning
+    /// the bindings map for each relation tuple during aggregation matching.
     fn process_aggregation(&self, agg: &Aggregation, bindings: Vec<Bindings>) -> Vec<Bindings> {
         let Some(rel) = self.relations.get(&agg.relation) else {
             return vec![];
@@ -522,21 +566,26 @@ impl Engine {
             .map(|var| self.var_interner.intern(var))
             .collect();
 
+        let mut undo = UndoLog::new();
+
         for binding in &bindings {
             // Collect bound-variable tuples from matching relation rows.
-            // We collect into a Vec<Vec<Value>> here because the aggregator
-            // borrows the values while iterating, but match_agg_args needs
-            // &self. The allocation is proportional to matching tuples only.
-            let collected: Vec<Vec<Value>> = rel
-                .iter_full()
-                .filter_map(|tuple| self.match_agg_args(agg, tuple, binding.clone()))
-                .map(|match_binding| {
-                    bound_var_ids
-                        .iter()
-                        .filter_map(|var_id| match_binding.get(var_id).cloned())
-                        .collect()
-                })
-                .collect();
+            // Uses in-place matching with rollback to avoid per-tuple clones.
+            let mut work = binding.clone();
+            let mut collected: Vec<Vec<Value>> = Vec::new();
+
+            for tuple in rel.iter_full() {
+                let cp = undo.len();
+                if self.match_agg_args(agg, tuple, &mut work, &mut undo) {
+                    collected.push(
+                        bound_var_ids
+                            .iter()
+                            .filter_map(|var_id| work.get(var_id).cloned())
+                            .collect(),
+                    );
+                }
+                rollback(&mut work, &mut undo, cp);
+            }
 
             // Apply aggregator (streaming over the collected slice)
             let agg_results = apply_aggregator(&agg_name, collected.iter().map(|v| v.as_slice()));
@@ -555,17 +604,22 @@ impl Engine {
         results
     }
 
-    /// Match aggregation relation arguments against a tuple.
+    /// Match aggregation relation arguments against a tuple in place.
+    ///
+    /// Returns `true` if the match succeeded (bindings extended with new vars).
+    /// On failure, rolls back any partial insertions via the undo log.
     fn match_agg_args(
         &self,
         agg: &Aggregation,
         tuple: &[Value],
-        mut bindings: Bindings,
-    ) -> Option<Bindings> {
+        bindings: &mut Bindings,
+        undo: &mut UndoLog,
+    ) -> bool {
         if agg.args.len() != tuple.len() {
-            return None;
+            return false;
         }
 
+        let cp = undo.len();
         for (arg_expr, value) in agg.args.iter().zip(tuple.iter()) {
             // Check if the argument is a simple variable (bound var)
             if let syn::Expr::Path(p) = arg_expr
@@ -574,88 +628,67 @@ impl Engine {
                 let var_id = self.var_interner.intern(&ident.to_string());
                 if let Some(existing) = bindings.get(&var_id) {
                     if existing != value {
-                        return None;
+                        rollback(bindings, undo, cp);
+                        return false;
                     }
                 } else {
                     bindings.insert(var_id, value.clone());
+                    undo.push((var_id, None));
                 }
                 continue;
             }
 
             // Otherwise evaluate and compare
-            if let Some(evaluated) = eval_expr_with_registry(
-                arg_expr,
-                &bindings,
-                &self.type_registry,
-                &self.var_interner,
-            ) && evaluated != *value
+            if let Some(evaluated) =
+                eval_expr_with_registry(arg_expr, bindings, &self.type_registry, &self.var_interner)
+                && evaluated != *value
             {
-                return None;
+                rollback(bindings, undo, cp);
+                return false;
             }
         }
 
-        Some(bindings)
+        true
     }
 
     /// Process a condition, potentially binding new variables.
-    fn process_condition(&self, cond: &Condition, bindings: Vec<Bindings>) -> Vec<Bindings> {
+    fn process_condition(&self, cond: &Condition, mut bindings: Vec<Bindings>) -> Vec<Bindings> {
+        let mut undo = UndoLog::new();
+        bindings.retain_mut(|b| {
+            undo.clear();
+            self.eval_condition(cond, b, &mut undo)
+            // No rollback needed: failed bindings are dropped by retain_mut
+        });
         bindings
-            .into_iter()
-            .filter_map(|b| self.eval_condition(cond, b))
-            .collect()
     }
 
-    /// Evaluate a condition. Returns updated bindings on success, None on failure.
-    fn eval_condition(&self, cond: &Condition, bindings: Bindings) -> Option<Bindings> {
+    /// Evaluate a condition in place. Returns `true` on success (bindings may be extended).
+    fn eval_condition(
+        &self,
+        cond: &Condition,
+        bindings: &mut Bindings,
+        undo: &mut UndoLog,
+    ) -> bool {
         match cond {
             Condition::If(expr) => {
-                if eval_expr_with_registry(expr, &bindings, &self.type_registry, &self.var_interner)
+                eval_expr_with_registry(expr, bindings, &self.type_registry, &self.var_interner)
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
+            }
+            Condition::IfLet { pattern, expr } | Condition::Let { pattern, expr } => {
+                if let Some(value) =
+                    eval_expr_with_registry(expr, bindings, &self.type_registry, &self.var_interner)
                 {
-                    Some(bindings)
+                    match_pattern(
+                        pattern,
+                        &value,
+                        bindings,
+                        Some(&self.type_registry),
+                        &self.var_interner,
+                        undo,
+                    )
                 } else {
-                    None
-                }
-            }
-            Condition::IfLet { pattern, expr } => {
-                let value = eval_expr_with_registry(
-                    expr,
-                    &bindings,
-                    &self.type_registry,
-                    &self.var_interner,
-                )?;
-                let mut new_bindings = bindings;
-                if match_pattern(
-                    pattern,
-                    &value,
-                    &mut new_bindings,
-                    Some(&self.type_registry),
-                    &self.var_interner,
-                ) {
-                    Some(new_bindings)
-                } else {
-                    None
-                }
-            }
-            Condition::Let { pattern, expr } => {
-                let value = eval_expr_with_registry(
-                    expr,
-                    &bindings,
-                    &self.type_registry,
-                    &self.var_interner,
-                )?;
-                let mut new_bindings = bindings;
-                if match_pattern(
-                    pattern,
-                    &value,
-                    &mut new_bindings,
-                    Some(&self.type_registry),
-                    &self.var_interner,
-                ) {
-                    Some(new_bindings)
-                } else {
-                    None
+                    false
                 }
             }
         }
@@ -728,12 +761,15 @@ fn compute_rule_sccs(program: &Program) -> Vec<Vec<usize>> {
 }
 
 /// Match a pattern against a value, extending bindings on success.
+///
+/// Uses the undo log to track insertions for rollback on partial match failure.
 fn match_pattern(
     pat: &syn::Pat,
     value: &Value,
     bindings: &mut Bindings,
     registry: Option<&TypeRegistry>,
     interner: &VarInterner,
+    undo: &mut UndoLog,
 ) -> bool {
     match pat {
         // Wildcard: always matches, binds nothing
@@ -748,12 +784,13 @@ fn match_pattern(
             }
             // If there's a subpattern (`name @ pattern`), match it too
             if let Some((_, sub_pat)) = &ident.subpat
-                && !match_pattern(sub_pat, value, bindings, registry, interner)
+                && !match_pattern(sub_pat, value, bindings, registry, interner, undo)
             {
                 return false;
             }
             let var_id = interner.intern(&name);
-            bindings.insert(var_id, value.clone());
+            let old = bindings.insert(var_id, value.clone());
+            undo.push((var_id, old));
             true
         }
 
@@ -768,7 +805,7 @@ fn match_pattern(
         }
 
         // Reference pattern: `&x` — in Datalog context, match the inner pattern
-        syn::Pat::Reference(r) => match_pattern(&r.pat, value, bindings, registry, interner),
+        syn::Pat::Reference(r) => match_pattern(&r.pat, value, bindings, registry, interner, undo),
 
         // Tuple pattern: `(a, b, c)`
         syn::Pat::Tuple(tuple) => {
@@ -776,8 +813,10 @@ fn match_pattern(
                 if vals.len() != tuple.elems.len() {
                     return false;
                 }
+                let cp = undo.len();
                 for (pat_elem, val) in tuple.elems.iter().zip(vals.iter()) {
-                    if !match_pattern(pat_elem, val, bindings, registry, interner) {
+                    if !match_pattern(pat_elem, val, bindings, registry, interner, undo) {
+                        rollback(bindings, undo, cp);
                         return false;
                     }
                 }
@@ -795,7 +834,7 @@ fn match_pattern(
                     if let Value::Option(Some(inner)) = value
                         && ts.elems.len() == 1
                     {
-                        match_pattern(&ts.elems[0], inner, bindings, registry, interner)
+                        match_pattern(&ts.elems[0], inner, bindings, registry, interner, undo)
                     } else {
                         false
                     }
@@ -804,7 +843,7 @@ fn match_pattern(
                     if let Value::Dual(inner) = value
                         && ts.elems.len() == 1
                     {
-                        match_pattern(&ts.elems[0], inner, bindings, registry, interner)
+                        match_pattern(&ts.elems[0], inner, bindings, registry, interner, undo)
                     } else {
                         false
                     }
@@ -816,8 +855,10 @@ fn match_pattern(
                         && let Some(fields) = destructor(value)
                         && fields.len() == ts.elems.len()
                     {
+                        let cp = undo.len();
                         for (pat_elem, val) in ts.elems.iter().zip(fields.iter()) {
-                            if !match_pattern(pat_elem, val, bindings, registry, interner) {
+                            if !match_pattern(pat_elem, val, bindings, registry, interner, undo) {
+                                rollback(bindings, undo, cp);
                                 return false;
                             }
                         }
@@ -842,18 +883,18 @@ fn match_pattern(
 
         // Or pattern: `A | B`
         syn::Pat::Or(or_pat) => {
+            let cp = undo.len();
             for case in &or_pat.cases {
-                let mut trial = bindings.clone();
-                if match_pattern(case, value, &mut trial, registry, interner) {
-                    *bindings = trial;
+                if match_pattern(case, value, bindings, registry, interner, undo) {
                     return true;
                 }
+                rollback(bindings, undo, cp);
             }
             false
         }
 
         // Parenthesized: `(pattern)`
-        syn::Pat::Paren(p) => match_pattern(&p.pat, value, bindings, registry, interner),
+        syn::Pat::Paren(p) => match_pattern(&p.pat, value, bindings, registry, interner, undo),
 
         _ => false,
     }
