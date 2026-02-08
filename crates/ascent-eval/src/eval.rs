@@ -370,6 +370,8 @@ impl Engine {
     ///
     /// Uses in-place binding modification with undo log to avoid cloning
     /// the bindings map for each tuple attempted. Only clones on match success.
+    /// When multiple columns are bound, picks the most selective index and
+    /// pre-filters remaining bound columns via direct comparison.
     fn process_clause(
         &self,
         clause: &Clause,
@@ -385,17 +387,34 @@ impl Engine {
 
         for binding in &bindings {
             let mut work = binding.clone();
-            let index_col = self.find_index_column(clause, binding);
+            let bound_cols = self.find_bound_columns(clause, binding);
 
-            if let Some((col, value)) = index_col {
-                // Use index lookup: only check matching tuples
-                let indices = rel.lookup(col, &value);
+            if !bound_cols.is_empty() {
+                // Pick the most selective column for index lookup (smallest result set)
+                let (primary_pos, _) = bound_cols
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, (col, val))| rel.lookup(*col, val).len())
+                    .unwrap();
+                let (primary_col, primary_val) = &bound_cols[primary_pos];
+                let indices = rel.lookup(*primary_col, primary_val);
+
                 for &idx in indices {
                     if use_recent && !rel.is_recent(idx) {
                         continue;
                     }
-                    let cp = undo.len();
                     let tuple = rel.get(idx);
+                    // Pre-filter: check remaining bound columns via direct comparison
+                    if bound_cols.len() > 1 {
+                        let pre_match = bound_cols
+                            .iter()
+                            .enumerate()
+                            .all(|(i, (col, val))| i == primary_pos || tuple[*col] == *val);
+                        if !pre_match {
+                            continue;
+                        }
+                    }
+                    let cp = undo.len();
                     if self.match_clause(clause, tuple, &mut work, &mut undo)
                         && self.check_clause_conditions(clause, &mut work, &mut undo)
                     {
@@ -425,16 +444,18 @@ impl Engine {
         results
     }
 
-    /// Find the best column to use for index lookup.
+    /// Find all clause columns that are already bound in the given bindings.
     ///
-    /// Returns Some((column_index, value)) if a clause arg is already bound.
-    fn find_index_column(&self, clause: &Clause, binding: &Bindings) -> Option<(usize, Value)> {
+    /// Returns a list of (column_index, value) pairs for columns where
+    /// the clause arg is a bound variable or evaluable expression.
+    fn find_bound_columns(&self, clause: &Clause, binding: &Bindings) -> Vec<(usize, Value)> {
+        let mut bound = Vec::new();
         for (col, arg) in clause.args.iter().enumerate() {
             match arg {
                 ClauseArg::Var(var) => {
                     let var_id = self.var_interner.intern(var);
                     if let Some(val) = binding.get(&var_id) {
-                        return Some((col, val.clone()));
+                        bound.push((col, val.clone()));
                     }
                 }
                 ClauseArg::Expr(expr) => {
@@ -444,12 +465,12 @@ impl Engine {
                         &self.type_registry,
                         &self.var_interner,
                     ) {
-                        return Some((col, val));
+                        bound.push((col, val));
                     }
                 }
             }
         }
-        None
+        bound
     }
 
     /// Try to match a clause against a tuple, extending bindings in place.
