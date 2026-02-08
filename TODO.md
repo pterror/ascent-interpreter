@@ -41,8 +41,26 @@
 - [x] Pattern matching support for custom types (destructuring in clauses)
 - [x] Serde-based automatic `DynValue` registration
 
-## JIT (Future)
+## Interpreter Performance
 
+Baseline: 15–550x slower than compiled ascent (Criterion benchmarks).
+
+### Low-effort
+
+- [ ] Intern variable names (u32 index instead of String keys in Bindings)
+- [ ] Rc-wrap tuples to avoid cloning on dedup (Rc::clone instead of Vec::clone)
+- [ ] Stream aggregation instead of collecting into Vec then reducing
+
+### Medium-effort
+
+- [ ] Arena-allocate / pool binding maps (eliminate per-match HashMap clones)
+- [ ] Composite (multi-column) indices for join acceleration
+- [ ] Hash join for large relations (O(n+m) instead of nested-loop O(n×m))
+- [ ] Type specialization: fast path for all-i32 programs (skip 17-way Value match)
+
+### High-effort
+
+- [ ] Expression compilation (flatten tree-walk to bytecode or closures)
 - [ ] Cranelift backend for hot loops
 - [ ] Compile frequently-used rules to native code
 - [ ] Benchmark against interpreted mode
