@@ -273,7 +273,7 @@ impl Engine {
         let derived = self.derive_tuples(rule, use_recent);
 
         for (relation, tuple) in derived {
-            self.insert(&relation, tuple);
+            self.insert(relation, tuple);
         }
     }
 
@@ -300,7 +300,7 @@ impl Engine {
     /// evaluate the rule with that clause using recent and all others using full.
     /// This ensures we discover all new derivations regardless of which clause
     /// received new data.
-    fn derive_tuples(&self, rule: &CRule, use_recent: bool) -> Vec<(String, Tuple)> {
+    fn derive_tuples<'a>(&self, rule: &'a CRule, use_recent: bool) -> Vec<(&'a str, Tuple)> {
         let mut results = Vec::new();
 
         if !use_recent {
@@ -329,16 +329,16 @@ impl Engine {
     }
 
     /// Collect head tuples from a set of bindings.
-    fn collect_head_tuples(
+    fn collect_head_tuples<'a>(
         &self,
-        rule: &CRule,
+        rule: &'a CRule,
         bindings: &[Bindings],
-        results: &mut Vec<(String, Tuple)>,
+        results: &mut Vec<(&'a str, Tuple)>,
     ) {
         for binding in bindings {
             for head in &rule.heads {
                 if let Some(tuple) = self.eval_head_tuple(head, binding) {
-                    results.push((head.relation.clone(), tuple));
+                    results.push((&head.relation, tuple));
                 }
             }
         }
@@ -406,12 +406,14 @@ impl Engine {
                     .min_by_key(|&(_, (col, val))| rel.lookup(*col, val).len())
                     .unwrap();
                 let (primary_col, primary_val) = &bound_cols[primary_pos];
-                let indices = rel.lookup(*primary_col, primary_val);
+                // Use delta-specific index when only recent tuples are needed
+                let indices = if use_recent {
+                    rel.lookup_recent(*primary_col, primary_val)
+                } else {
+                    rel.lookup(*primary_col, primary_val)
+                };
 
                 for &idx in indices {
-                    if use_recent && !rel.is_recent(idx) {
-                        continue;
-                    }
                     let tuple = rel.get(idx);
                     // Pre-filter: check remaining bound columns via direct comparison
                     if bound_cols.len() > 1 {

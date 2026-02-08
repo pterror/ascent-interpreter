@@ -26,6 +26,8 @@ pub struct RelationStorage {
     recent_set: FxHashSet<usize>,
     /// Per-column index: (column, value) → list of tuple indices.
     indices: Vec<FxHashMap<Value, Vec<usize>>>,
+    /// Per-column index for recent tuples only (rebuilt on advance).
+    recent_col_indices: Vec<FxHashMap<Value, Vec<usize>>>,
     /// Number of columns.
     arity: usize,
     /// Whether this is a lattice relation (last column is the lattice value).
@@ -49,6 +51,7 @@ impl RelationStorage {
             recent: Vec::new(),
             recent_set: FxHashSet::default(),
             indices: (0..arity).map(|_| FxHashMap::default()).collect(),
+            recent_col_indices: (0..arity).map(|_| FxHashMap::default()).collect(),
             arity,
             is_lattice,
             key_index: FxHashMap::default(),
@@ -178,6 +181,14 @@ impl RelationStorage {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Look up only recent tuples matching a value in the given column.
+    pub fn lookup_recent(&self, col: usize, value: &Value) -> &[usize] {
+        self.recent_col_indices
+            .get(col)
+            .and_then(|idx| idx.get(value))
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// Get a tuple by index.
     pub fn get(&self, idx: usize) -> &[Value] {
         &self.tuples[idx]
@@ -193,6 +204,18 @@ impl RelationStorage {
         let had_delta = !self.delta.is_empty();
         self.recent = std::mem::take(&mut self.delta);
         self.recent_set = self.recent.iter().copied().collect();
+        // Rebuild per-column indices for recent tuples only
+        for col_idx in &mut self.recent_col_indices {
+            col_idx.clear();
+        }
+        for &idx in &self.recent {
+            for (col, val) in self.tuples[idx].iter().enumerate() {
+                self.recent_col_indices[col]
+                    .entry(val.clone())
+                    .or_default()
+                    .push(idx);
+            }
+        }
         had_delta
     }
 
