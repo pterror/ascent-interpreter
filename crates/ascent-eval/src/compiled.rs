@@ -21,7 +21,15 @@ pub(crate) enum CExpr {
     Literal(Value),
     /// Variable reference (pre-interned, no HashMap lookup to resolve name).
     Var(VarId),
-    /// Binary operation.
+    /// Binary operation on two variables (no recursion needed).
+    VarBinVar(CBinOp, VarId, VarId),
+    /// Binary operation on variable and literal (no recursion needed).
+    VarBinLit(CBinOp, VarId, Value),
+    /// Binary operation on literal and variable (no recursion needed).
+    LitBinVar(CBinOp, Value, VarId),
+    /// Deref of a variable (`*x` — identity in Datalog context).
+    DerefVar(VarId),
+    /// Binary operation (general case, recursive).
     Binary(CBinOp, Box<CExpr>, Box<CExpr>),
     /// Unary operation.
     Unary(CUnOp, Box<CExpr>),
@@ -261,7 +269,10 @@ fn compile_agg_arg(expr: &syn::Expr, interner: &VarInterner) -> CAggArg {
 fn cexpr_vars_defined(expr: &CExpr, defined: &FxHashSet<VarId>) -> bool {
     match expr {
         CExpr::Literal(_) => true,
-        CExpr::Var(id) => defined.contains(id),
+        CExpr::Var(id) | CExpr::DerefVar(id) => defined.contains(id),
+        CExpr::VarBinVar(_, a, b) => defined.contains(a) && defined.contains(b),
+        CExpr::VarBinLit(_, a, _) => defined.contains(a),
+        CExpr::LitBinVar(_, _, b) => defined.contains(b),
         CExpr::Binary(_, l, r) => cexpr_vars_defined(l, defined) && cexpr_vars_defined(r, defined),
         CExpr::Unary(_, e) | CExpr::Cast(e, _) => cexpr_vars_defined(e, defined),
         CExpr::Range { start, end, .. } => {
@@ -280,8 +291,18 @@ fn cexpr_vars_defined(expr: &CExpr, defined: &FxHashSet<VarId>) -> bool {
 fn cexpr_referenced_vars(expr: &CExpr, vars: &mut FxHashSet<VarId>) {
     match expr {
         CExpr::Literal(_) => {}
-        CExpr::Var(id) => {
+        CExpr::Var(id) | CExpr::DerefVar(id) => {
             vars.insert(*id);
+        }
+        CExpr::VarBinVar(_, a, b) => {
+            vars.insert(*a);
+            vars.insert(*b);
+        }
+        CExpr::VarBinLit(_, a, _) => {
+            vars.insert(*a);
+        }
+        CExpr::LitBinVar(_, _, b) => {
+            vars.insert(*b);
         }
         CExpr::Binary(_, l, r) => {
             cexpr_referenced_vars(l, vars);
@@ -316,7 +337,12 @@ fn cexpr_referenced_vars(expr: &CExpr, vars: &mut FxHashSet<VarId>) {
 fn cexpr_has_dynamic(expr: &CExpr) -> bool {
     match expr {
         CExpr::Dynamic(_) => true,
-        CExpr::Literal(_) | CExpr::Var(_) => false,
+        CExpr::Literal(_)
+        | CExpr::Var(_)
+        | CExpr::DerefVar(_)
+        | CExpr::VarBinVar(..)
+        | CExpr::VarBinLit(..)
+        | CExpr::LitBinVar(..) => false,
         CExpr::Binary(_, l, r) => cexpr_has_dynamic(l) || cexpr_has_dynamic(r),
         CExpr::Unary(_, e) | CExpr::Cast(e, _) => cexpr_has_dynamic(e),
         CExpr::Range { start, end, .. } => cexpr_has_dynamic(start) || cexpr_has_dynamic(end),
@@ -436,15 +462,37 @@ pub(crate) fn compile_expr(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
             }
         }
         syn::Expr::Binary(bin) => match compile_binop(&bin.op) {
-            Some(op) => CExpr::Binary(
-                op,
-                Box::new(compile_expr(&bin.left, interner)),
-                Box::new(compile_expr(&bin.right, interner)),
-            ),
+            Some(op) => {
+                let left = compile_expr(&bin.left, interner);
+                let right = compile_expr(&bin.right, interner);
+                // Specialize common patterns to avoid recursive eval_cexpr calls
+                match (&left, &right) {
+                    (CExpr::Var(a), CExpr::Var(b)) => CExpr::VarBinVar(op, *a, *b),
+                    (CExpr::Var(a), CExpr::Literal(v)) => CExpr::VarBinLit(op, *a, v.clone()),
+                    (CExpr::Literal(v), CExpr::Var(b)) => CExpr::LitBinVar(op, v.clone(), *b),
+                    // Also catch DerefVar patterns: `*x op y`, `x op *y`
+                    (CExpr::DerefVar(a), CExpr::Var(b)) | (CExpr::Var(a), CExpr::DerefVar(b)) => {
+                        CExpr::VarBinVar(op, *a, *b)
+                    }
+                    (CExpr::DerefVar(a), CExpr::Literal(v)) => CExpr::VarBinLit(op, *a, v.clone()),
+                    (CExpr::Literal(v), CExpr::DerefVar(b)) => CExpr::LitBinVar(op, v.clone(), *b),
+                    (CExpr::DerefVar(a), CExpr::DerefVar(b)) => CExpr::VarBinVar(op, *a, *b),
+                    _ => CExpr::Binary(op, Box::new(left), Box::new(right)),
+                }
+            }
             None => CExpr::Dynamic(expr.clone()),
         },
         syn::Expr::Unary(u) => match compile_unop(&u.op) {
-            Some(op) => CExpr::Unary(op, Box::new(compile_expr(&u.expr, interner))),
+            Some(op) => {
+                let inner = compile_expr(&u.expr, interner);
+                // Specialize `*var` (deref of variable — identity in Datalog)
+                if matches!(op, CUnOp::Deref)
+                    && let CExpr::Var(id) = inner
+                {
+                    return CExpr::DerefVar(id);
+                }
+                CExpr::Unary(op, Box::new(inner))
+            }
             None => CExpr::Dynamic(expr.clone()),
         },
         syn::Expr::Paren(p) => compile_expr(&p.expr, interner),
@@ -576,7 +624,21 @@ pub(crate) fn eval_cexpr(
 ) -> Option<Value> {
     match expr {
         CExpr::Literal(val) => Some(val.clone()),
-        CExpr::Var(var_id) => bindings.get(var_id).cloned(),
+        CExpr::Var(var_id) | CExpr::DerefVar(var_id) => bindings.get(var_id).cloned(),
+        // Specialized fast paths: binary ops on vars/literals without recursion
+        CExpr::VarBinVar(op, a, b) => {
+            let l = bindings.get(a)?;
+            let r = bindings.get(b)?;
+            eval_binary_op(*op, l, r)
+        }
+        CExpr::VarBinLit(op, a, v) => {
+            let l = bindings.get(a)?;
+            eval_binary_op(*op, l, v)
+        }
+        CExpr::LitBinVar(op, v, b) => {
+            let r = bindings.get(b)?;
+            eval_binary_op(*op, v, r)
+        }
         CExpr::Binary(op, left, right) => {
             // Short-circuit for logical operators
             if matches!(op, CBinOp::And | CBinOp::Or) {
