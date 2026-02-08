@@ -742,6 +742,11 @@ pub(crate) fn eval_cexpr(
 }
 
 fn eval_binary_op(op: CBinOp, left: &Value, right: &Value) -> Option<Value> {
+    // Fast path for i32 operands (the most common case in Datalog programs).
+    // Avoids double dispatch through Value method + 14-way type match.
+    if let (&Value::I32(l), &Value::I32(r)) = (left, right) {
+        return eval_i32_binary_op(op, l, r);
+    }
     match op {
         CBinOp::Add => left.add(right),
         CBinOp::Sub => left.sub(right),
@@ -761,4 +766,40 @@ fn eval_binary_op(op: CBinOp, left: &Value, right: &Value) -> Option<Value> {
         CBinOp::Ge => left.partial_cmp_val(right).map(|o| Value::Bool(o.is_ge())),
         CBinOp::And | CBinOp::Or => unreachable!("handled by short-circuit path"),
     }
+}
+
+/// Fast path for i32 binary operations, avoiding Value method dispatch.
+#[inline]
+fn eval_i32_binary_op(op: CBinOp, l: i32, r: i32) -> Option<Value> {
+    Some(match op {
+        CBinOp::Add => Value::I32(l + r),
+        CBinOp::Sub => Value::I32(l - r),
+        CBinOp::Mul => Value::I32(l * r),
+        CBinOp::Div => {
+            if r != 0 {
+                Value::I32(l / r)
+            } else {
+                return None;
+            }
+        }
+        CBinOp::Rem => {
+            if r != 0 {
+                Value::I32(l % r)
+            } else {
+                return None;
+            }
+        }
+        CBinOp::BitAnd => Value::I32(l & r),
+        CBinOp::BitOr => Value::I32(l | r),
+        CBinOp::BitXor => Value::I32(l ^ r),
+        CBinOp::Shl => Value::I32(l << (r as u32)),
+        CBinOp::Shr => Value::I32(l >> (r as u32)),
+        CBinOp::Eq => Value::Bool(l == r),
+        CBinOp::Ne => Value::Bool(l != r),
+        CBinOp::Lt => Value::Bool(l < r),
+        CBinOp::Le => Value::Bool(l <= r),
+        CBinOp::Gt => Value::Bool(l > r),
+        CBinOp::Ge => Value::Bool(l >= r),
+        CBinOp::And | CBinOp::Or => unreachable!("handled by short-circuit path"),
+    })
 }
