@@ -53,8 +53,9 @@ Baseline: 15–550x slower than compiled ascent (Criterion benchmarks).
 
 ### Medium-effort
 
-- [ ] Arena-allocate / pool binding maps (eliminate per-match HashMap clones)
-- [ ] Composite (multi-column) indices for join acceleration
+- [x] FxHashMap for all hot-path hash maps (bindings, indices, dedup sets)
+- [x] Eliminate per-match binding clones via undo log (rollback instead of clone)
+- [x] Multi-column index selection with pre-filter for join acceleration
 - [ ] Hash join for large relations (O(n+m) instead of nested-loop O(n×m))
 - [ ] Type specialization: fast path for all-i32 programs (skip 17-way Value match)
 
