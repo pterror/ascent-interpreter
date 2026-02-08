@@ -74,7 +74,7 @@ fn eval_expr_inner(
 }
 
 /// Evaluate a literal.
-fn eval_lit(lit: &syn::Lit) -> Option<Value> {
+pub(crate) fn eval_lit(lit: &syn::Lit) -> Option<Value> {
     match lit {
         syn::Lit::Int(i) => {
             let suffix = i.suffix();

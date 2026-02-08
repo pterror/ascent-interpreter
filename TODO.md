@@ -56,8 +56,8 @@ Baseline: 15–550x slower than compiled ascent (Criterion benchmarks).
 - [x] FxHashMap for all hot-path hash maps (bindings, indices, dedup sets)
 - [x] Eliminate per-match binding clones via undo log (rollback instead of clone)
 - [x] Multi-column index selection with pre-filter for join acceleration
-- [ ] Pre-compile rules: intern variable names to VarIds, pre-evaluate literals, flatten syn::Expr to CExpr
-- [ ] Avoid Box<dyn Iterator> in process_clause full-scan path (virtual dispatch per tuple)
+- [x] Pre-compile rules: intern variable names to VarIds, pre-evaluate literals, flatten syn::Expr to CExpr
+- [x] Avoid Box<dyn Iterator> in process_clause full-scan path (virtual dispatch per tuple)
 - [ ] Reuse head tuple buffer (avoid per-derivation Vec allocation)
 - [ ] Delta-specific indices (separate index for recent tuples, skip is_recent checks)
 - [ ] Hash join for large relations (O(n+m) instead of nested-loop O(n×m))

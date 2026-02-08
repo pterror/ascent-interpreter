@@ -34,6 +34,7 @@
 //! ```
 
 pub mod aggregators;
+mod compiled;
 mod eval;
 pub mod expr;
 mod relation;

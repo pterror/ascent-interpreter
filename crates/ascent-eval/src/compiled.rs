@@ -1,0 +1,534 @@
+//! Pre-compiled rule representation for fast evaluation.
+//!
+//! Transforms IR rules into an evaluation-friendly format:
+//! - Variable names pre-interned to VarId (no HashMap lookup per tuple)
+//! - Literals pre-evaluated to Values (no repeated parsing)
+//! - Expressions flattened from syn::Expr to CExpr (simpler dispatch)
+
+use ascent_ir::{Aggregation, BodyItem, Clause, ClauseArg, Condition, Generator, Rule};
+
+use crate::eval::{Bindings, TypeRegistry, VarId, VarInterner};
+use crate::expr::{eval_expr, eval_expr_with_registry, eval_lit};
+use crate::value::Value;
+
+// ─── Compiled expression types ──────────────────────────────────────
+
+/// Pre-compiled expression for fast evaluation.
+#[derive(Debug, Clone)]
+pub(crate) enum CExpr {
+    /// Pre-evaluated literal value (no repeated parsing).
+    Literal(Value),
+    /// Variable reference (pre-interned, no HashMap lookup to resolve name).
+    Var(VarId),
+    /// Binary operation.
+    Binary(CBinOp, Box<CExpr>, Box<CExpr>),
+    /// Unary operation.
+    Unary(CUnOp, Box<CExpr>),
+    /// Range expression.
+    Range {
+        start: Box<CExpr>,
+        end: Box<CExpr>,
+        inclusive: bool,
+    },
+    /// Tuple expression.
+    Tuple(Vec<CExpr>),
+    /// Function/constructor call (name pre-resolved).
+    Call(String, Vec<CExpr>),
+    /// Method call on a receiver.
+    MethodCall(Box<CExpr>, String, Vec<CExpr>),
+    /// Type cast.
+    Cast(Box<CExpr>, String),
+    /// Array expression (evaluated as tuple).
+    Array(Vec<CExpr>),
+    /// Fallback: expressions not yet compiled (blocks, if-let, etc).
+    Dynamic(syn::Expr),
+}
+
+/// Pre-compiled binary operator.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+}
+
+/// Pre-compiled unary operator.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CUnOp {
+    Neg,
+    Not,
+    Deref,
+}
+
+// ─── Compiled rule types ────────────────────────────────────────────
+
+/// Pre-compiled clause argument.
+#[derive(Debug, Clone)]
+pub(crate) enum CClauseArg {
+    Var(VarId),
+    Expr(CExpr),
+}
+
+/// Pre-compiled body clause.
+#[derive(Debug, Clone)]
+pub(crate) struct CClause {
+    pub relation: String,
+    pub args: Vec<CClauseArg>,
+    pub conditions: Vec<CCondition>,
+}
+
+/// Pre-compiled condition.
+#[derive(Debug, Clone)]
+pub(crate) enum CCondition {
+    If(CExpr),
+    IfLet { pattern: syn::Pat, expr: CExpr },
+    Let { pattern: syn::Pat, expr: CExpr },
+}
+
+/// Pre-compiled generator.
+#[derive(Debug, Clone)]
+pub(crate) struct CGenerator {
+    pub vars: Vec<VarId>,
+    pub expr: CExpr,
+}
+
+/// Pre-compiled aggregation argument (variable or expression).
+#[derive(Debug, Clone)]
+pub(crate) enum CAggArg {
+    Var(VarId),
+    Expr(CExpr),
+}
+
+/// Pre-compiled aggregation.
+#[derive(Debug, Clone)]
+pub(crate) struct CAggregation {
+    pub result_vars: Vec<VarId>,
+    pub aggregator_name: String,
+    pub bound_vars: Vec<VarId>,
+    pub relation: String,
+    pub args: Vec<CAggArg>,
+}
+
+/// Pre-compiled body item.
+#[derive(Debug, Clone)]
+pub(crate) enum CBodyItem {
+    Clause(CClause),
+    Generator(CGenerator),
+    Condition(CCondition),
+    Aggregation(CAggregation),
+}
+
+/// Pre-compiled head clause.
+#[derive(Debug, Clone)]
+pub(crate) struct CHeadClause {
+    pub relation: String,
+    pub args: Vec<CExpr>,
+}
+
+/// Pre-compiled rule.
+#[derive(Debug, Clone)]
+pub(crate) struct CRule {
+    pub heads: Vec<CHeadClause>,
+    pub body: Vec<CBodyItem>,
+}
+
+// ─── Compilation ────────────────────────────────────────────────────
+
+/// Compile an IR rule into the evaluation-friendly representation.
+pub(crate) fn compile_rule(rule: &Rule, interner: &VarInterner) -> CRule {
+    CRule {
+        heads: rule
+            .heads
+            .iter()
+            .map(|h| CHeadClause {
+                relation: h.relation.clone(),
+                args: h.args.iter().map(|a| compile_expr(a, interner)).collect(),
+            })
+            .collect(),
+        body: rule
+            .body
+            .iter()
+            .map(|item| compile_body_item(item, interner))
+            .collect(),
+    }
+}
+
+fn compile_body_item(item: &BodyItem, interner: &VarInterner) -> CBodyItem {
+    match item {
+        BodyItem::Clause(c) => CBodyItem::Clause(compile_clause(c, interner)),
+        BodyItem::Generator(g) => CBodyItem::Generator(compile_generator(g, interner)),
+        BodyItem::Condition(c) => CBodyItem::Condition(compile_condition(c, interner)),
+        BodyItem::Aggregation(a) => CBodyItem::Aggregation(compile_aggregation(a, interner)),
+    }
+}
+
+fn compile_clause(clause: &Clause, interner: &VarInterner) -> CClause {
+    CClause {
+        relation: clause.relation.clone(),
+        args: clause
+            .args
+            .iter()
+            .map(|a| compile_clause_arg(a, interner))
+            .collect(),
+        conditions: clause
+            .conditions
+            .iter()
+            .map(|c| compile_condition(c, interner))
+            .collect(),
+    }
+}
+
+fn compile_clause_arg(arg: &ClauseArg, interner: &VarInterner) -> CClauseArg {
+    match arg {
+        ClauseArg::Var(name) => CClauseArg::Var(interner.intern(name)),
+        ClauseArg::Expr(expr) => CClauseArg::Expr(compile_expr(expr, interner)),
+    }
+}
+
+fn compile_condition(cond: &Condition, interner: &VarInterner) -> CCondition {
+    match cond {
+        Condition::If(expr) => CCondition::If(compile_expr(expr, interner)),
+        Condition::IfLet { pattern, expr } => CCondition::IfLet {
+            pattern: pattern.clone(),
+            expr: compile_expr(expr, interner),
+        },
+        Condition::Let { pattern, expr } => CCondition::Let {
+            pattern: pattern.clone(),
+            expr: compile_expr(expr, interner),
+        },
+    }
+}
+
+fn compile_generator(generator: &Generator, interner: &VarInterner) -> CGenerator {
+    CGenerator {
+        vars: generator.vars.iter().map(|v| interner.intern(v)).collect(),
+        expr: compile_expr(&generator.expr, interner),
+    }
+}
+
+fn compile_aggregation(agg: &Aggregation, interner: &VarInterner) -> CAggregation {
+    CAggregation {
+        result_vars: agg.result_vars.iter().map(|v| interner.intern(v)).collect(),
+        aggregator_name: resolve_aggregator_name(&agg.aggregator),
+        bound_vars: agg.bound_vars.iter().map(|v| interner.intern(v)).collect(),
+        relation: agg.relation.clone(),
+        args: agg
+            .args
+            .iter()
+            .map(|a| compile_agg_arg(a, interner))
+            .collect(),
+    }
+}
+
+fn compile_agg_arg(expr: &syn::Expr, interner: &VarInterner) -> CAggArg {
+    // Check if the arg is a simple variable (common case in aggregations)
+    if let syn::Expr::Path(p) = expr
+        && let Some(ident) = p.path.get_ident()
+    {
+        let name = ident.to_string();
+        if name != "true" && name != "false" {
+            return CAggArg::Var(interner.intern(&name));
+        }
+    }
+    CAggArg::Expr(compile_expr(expr, interner))
+}
+
+/// Compile a syn expression into the flat CExpr representation.
+pub(crate) fn compile_expr(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
+    match expr {
+        syn::Expr::Lit(lit) => match eval_lit(&lit.lit) {
+            Some(val) => CExpr::Literal(val),
+            None => CExpr::Dynamic(expr.clone()),
+        },
+        syn::Expr::Path(p) => {
+            if let Some(ident) = p.path.get_ident() {
+                let name = ident.to_string();
+                match name.as_str() {
+                    "true" => CExpr::Literal(Value::Bool(true)),
+                    "false" => CExpr::Literal(Value::Bool(false)),
+                    _ => CExpr::Var(interner.intern(&name)),
+                }
+            } else {
+                CExpr::Dynamic(expr.clone())
+            }
+        }
+        syn::Expr::Binary(bin) => match compile_binop(&bin.op) {
+            Some(op) => CExpr::Binary(
+                op,
+                Box::new(compile_expr(&bin.left, interner)),
+                Box::new(compile_expr(&bin.right, interner)),
+            ),
+            None => CExpr::Dynamic(expr.clone()),
+        },
+        syn::Expr::Unary(u) => match compile_unop(&u.op) {
+            Some(op) => CExpr::Unary(op, Box::new(compile_expr(&u.expr, interner))),
+            None => CExpr::Dynamic(expr.clone()),
+        },
+        syn::Expr::Paren(p) => compile_expr(&p.expr, interner),
+        syn::Expr::Reference(r) => compile_expr(&r.expr, interner),
+        syn::Expr::Range(r) => {
+            let start = r
+                .start
+                .as_ref()
+                .map(|e| Box::new(compile_expr(e, interner)));
+            let end = r.end.as_ref().map(|e| Box::new(compile_expr(e, interner)));
+            match (start, end) {
+                (Some(s), Some(e)) => CExpr::Range {
+                    start: s,
+                    end: e,
+                    inclusive: matches!(r.limits, syn::RangeLimits::Closed(_)),
+                },
+                _ => CExpr::Dynamic(expr.clone()),
+            }
+        }
+        syn::Expr::Tuple(t) => {
+            CExpr::Tuple(t.elems.iter().map(|e| compile_expr(e, interner)).collect())
+        }
+        syn::Expr::Call(call) => {
+            if let syn::Expr::Path(p) = &*call.func {
+                let name = p
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let args: Vec<CExpr> = call
+                    .args
+                    .iter()
+                    .map(|a| compile_expr(a, interner))
+                    .collect();
+                CExpr::Call(name, args)
+            } else {
+                CExpr::Dynamic(expr.clone())
+            }
+        }
+        syn::Expr::MethodCall(mc) => {
+            let receiver = compile_expr(&mc.receiver, interner);
+            let method = mc.method.to_string();
+            let args: Vec<CExpr> = mc.args.iter().map(|a| compile_expr(a, interner)).collect();
+            CExpr::MethodCall(Box::new(receiver), method, args)
+        }
+        syn::Expr::Cast(cast) => {
+            if let syn::Type::Path(tp) = &*cast.ty {
+                let target = tp
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                CExpr::Cast(Box::new(compile_expr(&cast.expr, interner)), target)
+            } else {
+                CExpr::Dynamic(expr.clone())
+            }
+        }
+        syn::Expr::Array(arr) => CExpr::Array(
+            arr.elems
+                .iter()
+                .map(|e| compile_expr(e, interner))
+                .collect(),
+        ),
+        // Block, If, IfLet, etc. fall back to dynamic evaluation
+        _ => CExpr::Dynamic(expr.clone()),
+    }
+}
+
+fn compile_binop(op: &syn::BinOp) -> Option<CBinOp> {
+    Some(match op {
+        syn::BinOp::Add(_) => CBinOp::Add,
+        syn::BinOp::Sub(_) => CBinOp::Sub,
+        syn::BinOp::Mul(_) => CBinOp::Mul,
+        syn::BinOp::Div(_) => CBinOp::Div,
+        syn::BinOp::Rem(_) => CBinOp::Rem,
+        syn::BinOp::BitAnd(_) => CBinOp::BitAnd,
+        syn::BinOp::BitOr(_) => CBinOp::BitOr,
+        syn::BinOp::BitXor(_) => CBinOp::BitXor,
+        syn::BinOp::Shl(_) => CBinOp::Shl,
+        syn::BinOp::Shr(_) => CBinOp::Shr,
+        syn::BinOp::Eq(_) => CBinOp::Eq,
+        syn::BinOp::Ne(_) => CBinOp::Ne,
+        syn::BinOp::Lt(_) => CBinOp::Lt,
+        syn::BinOp::Le(_) => CBinOp::Le,
+        syn::BinOp::Gt(_) => CBinOp::Gt,
+        syn::BinOp::Ge(_) => CBinOp::Ge,
+        syn::BinOp::And(_) => CBinOp::And,
+        syn::BinOp::Or(_) => CBinOp::Or,
+        _ => return None,
+    })
+}
+
+fn compile_unop(op: &syn::UnOp) -> Option<CUnOp> {
+    Some(match op {
+        syn::UnOp::Neg(_) => CUnOp::Neg,
+        syn::UnOp::Not(_) => CUnOp::Not,
+        syn::UnOp::Deref(_) => CUnOp::Deref,
+        _ => return None,
+    })
+}
+
+/// Resolve the aggregator name from the expression (pre-computed at compile time).
+fn resolve_aggregator_name(expr: &syn::Expr) -> String {
+    if let syn::Expr::Path(p) = expr {
+        if let Some(ident) = p.path.get_ident() {
+            return ident.to_string();
+        }
+        // Handle ::ascent::aggregators::not → "not"
+        p.path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+// ─── Evaluation ─────────────────────────────────────────────────────
+
+/// Evaluate a pre-compiled expression.
+pub(crate) fn eval_cexpr(
+    expr: &CExpr,
+    bindings: &Bindings,
+    registry: Option<&TypeRegistry>,
+    interner: &VarInterner,
+) -> Option<Value> {
+    match expr {
+        CExpr::Literal(val) => Some(val.clone()),
+        CExpr::Var(var_id) => bindings.get(var_id).cloned(),
+        CExpr::Binary(op, left, right) => {
+            // Short-circuit for logical operators
+            if matches!(op, CBinOp::And | CBinOp::Or) {
+                let l = eval_cexpr(left, bindings, registry, interner)?;
+                return match op {
+                    CBinOp::And => {
+                        if !l.as_bool()? {
+                            Some(Value::Bool(false))
+                        } else {
+                            let r = eval_cexpr(right, bindings, registry, interner)?;
+                            Some(Value::Bool(r.as_bool()?))
+                        }
+                    }
+                    CBinOp::Or => {
+                        if l.as_bool()? {
+                            Some(Value::Bool(true))
+                        } else {
+                            let r = eval_cexpr(right, bindings, registry, interner)?;
+                            Some(Value::Bool(r.as_bool()?))
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+            }
+            let l = eval_cexpr(left, bindings, registry, interner)?;
+            let r = eval_cexpr(right, bindings, registry, interner)?;
+            eval_binary_op(*op, &l, &r)
+        }
+        CExpr::Unary(op, inner) => {
+            let v = eval_cexpr(inner, bindings, registry, interner)?;
+            match op {
+                CUnOp::Neg => v.neg(),
+                CUnOp::Not => v.not(),
+                CUnOp::Deref => Some(v), // identity in Datalog context
+            }
+        }
+        CExpr::Range {
+            start,
+            end,
+            inclusive,
+        } => {
+            let s = eval_cexpr(start, bindings, registry, interner)?;
+            let e = eval_cexpr(end, bindings, registry, interner)?;
+            Some(Value::Range {
+                start: Box::new(s),
+                end: Box::new(e),
+                inclusive: *inclusive,
+            })
+        }
+        CExpr::Tuple(exprs) => {
+            let vals: Option<Vec<Value>> = exprs
+                .iter()
+                .map(|e| eval_cexpr(e, bindings, registry, interner))
+                .collect();
+            vals.map(Value::tuple)
+        }
+        CExpr::Call(name, args) => {
+            let vals: Option<Vec<Value>> = args
+                .iter()
+                .map(|a| eval_cexpr(a, bindings, registry, interner))
+                .collect();
+            let vals = vals?;
+            match name.as_str() {
+                "Some" => vals
+                    .into_iter()
+                    .next()
+                    .map(|v| Value::Option(Some(Box::new(v)))),
+                "None" => Some(Value::Option(None)),
+                "Dual" => vals.into_iter().next().map(|v| Value::Dual(Box::new(v))),
+                _ => registry.and_then(|r| r.get(name).and_then(|ctor| ctor(&vals))),
+            }
+        }
+        CExpr::MethodCall(receiver, method, args) => {
+            let recv = eval_cexpr(receiver, bindings, registry, interner)?;
+            let _arg_vals: Option<Vec<Value>> = args
+                .iter()
+                .map(|a| eval_cexpr(a, bindings, registry, interner))
+                .collect();
+            match method.as_str() {
+                "abs" => recv.abs(),
+                "clone" => Some(recv),
+                _ => None,
+            }
+        }
+        CExpr::Cast(inner, target) => {
+            let v = eval_cexpr(inner, bindings, registry, interner)?;
+            v.cast_to(target)
+        }
+        CExpr::Array(exprs) => {
+            let vals: Option<Vec<Value>> = exprs
+                .iter()
+                .map(|e| eval_cexpr(e, bindings, registry, interner))
+                .collect();
+            vals.map(Value::tuple)
+        }
+        CExpr::Dynamic(expr) => match registry {
+            Some(reg) => eval_expr_with_registry(expr, bindings, reg, interner),
+            None => eval_expr(expr, bindings, interner),
+        },
+    }
+}
+
+fn eval_binary_op(op: CBinOp, left: &Value, right: &Value) -> Option<Value> {
+    match op {
+        CBinOp::Add => left.add(right),
+        CBinOp::Sub => left.sub(right),
+        CBinOp::Mul => left.mul(right),
+        CBinOp::Div => left.div(right),
+        CBinOp::Rem => left.rem(right),
+        CBinOp::BitAnd => left.bitand(right),
+        CBinOp::BitOr => left.bitor(right),
+        CBinOp::BitXor => left.bitxor(right),
+        CBinOp::Shl => left.shl(right),
+        CBinOp::Shr => left.shr(right),
+        CBinOp::Eq => Some(Value::Bool(left == right)),
+        CBinOp::Ne => Some(Value::Bool(left != right)),
+        CBinOp::Lt => left.partial_cmp_val(right).map(|o| Value::Bool(o.is_lt())),
+        CBinOp::Le => left.partial_cmp_val(right).map(|o| Value::Bool(o.is_le())),
+        CBinOp::Gt => left.partial_cmp_val(right).map(|o| Value::Bool(o.is_gt())),
+        CBinOp::Ge => left.partial_cmp_val(right).map(|o| Value::Bool(o.is_ge())),
+        CBinOp::And | CBinOp::Or => unreachable!("handled by short-circuit path"),
+    }
+}

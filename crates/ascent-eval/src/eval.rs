@@ -3,13 +3,17 @@
 use std::cell::RefCell;
 use std::fmt;
 
-use ascent_ir::{Aggregation, BodyItem, Clause, ClauseArg, Condition, Program, Rule};
+use ascent_ir::{BodyItem, Program};
 use petgraph::algo::{condensation, toposort};
 use petgraph::graph::DiGraph;
 use rustc_hash::FxHashMap;
 
 use crate::aggregators::apply_aggregator;
-use crate::expr::{eval_expr, eval_expr_with_registry, expand_range};
+use crate::compiled::{
+    CAggArg, CAggregation, CBodyItem, CClause, CClauseArg, CCondition, CGenerator, CHeadClause,
+    CRule, compile_rule, eval_cexpr,
+};
+use crate::expr::{eval_expr, expand_range};
 use crate::relation::RelationStorage;
 use crate::value::{DynValue, Tuple, Value};
 
@@ -214,14 +218,19 @@ impl Engine {
     /// topological order. Each SCC runs to fixpoint before dependent SCCs begin.
     pub fn run(&mut self, program: &Program) {
         let sccs = compute_rule_sccs(program);
+        let compiled: Vec<CRule> = program
+            .rules
+            .iter()
+            .map(|r| compile_rule(r, &self.var_interner))
+            .collect();
         for scc_indices in &sccs {
-            let rules: Vec<&Rule> = scc_indices.iter().map(|&i| &program.rules[i]).collect();
+            let rules: Vec<&CRule> = scc_indices.iter().map(|&i| &compiled[i]).collect();
             self.run_stratum(&rules);
         }
     }
 
     /// Run a set of rules to fixpoint.
-    fn run_stratum(&mut self, rules: &[&Rule]) {
+    fn run_stratum(&mut self, rules: &[&CRule]) {
         if rules.is_empty() {
             return;
         }
@@ -256,7 +265,7 @@ impl Engine {
     }
 
     /// Evaluate a single rule.
-    fn evaluate_rule(&mut self, rule: &Rule, use_recent: bool) {
+    fn evaluate_rule(&mut self, rule: &CRule, use_recent: bool) {
         if use_recent && !self.rule_has_recent_data(rule) {
             return;
         }
@@ -269,11 +278,11 @@ impl Engine {
     }
 
     /// Check if any relation referenced in the rule body has recent tuples.
-    fn rule_has_recent_data(&self, rule: &Rule) -> bool {
+    fn rule_has_recent_data(&self, rule: &CRule) -> bool {
         for item in &rule.body {
             let rel_name = match item {
-                BodyItem::Clause(clause) => &clause.relation,
-                BodyItem::Aggregation(agg) => &agg.relation,
+                CBodyItem::Clause(clause) => &clause.relation,
+                CBodyItem::Aggregation(agg) => &agg.relation,
                 _ => continue,
             };
             if let Some(rel) = self.relations.get(rel_name)
@@ -291,7 +300,7 @@ impl Engine {
     /// evaluate the rule with that clause using recent and all others using full.
     /// This ensures we discover all new derivations regardless of which clause
     /// received new data.
-    fn derive_tuples(&self, rule: &Rule, use_recent: bool) -> Vec<(String, Tuple)> {
+    fn derive_tuples(&self, rule: &CRule, use_recent: bool) -> Vec<(String, Tuple)> {
         let mut results = Vec::new();
 
         if !use_recent {
@@ -304,7 +313,7 @@ impl Engine {
         // Semi-naive: try each clause position with recent data
         for (idx, item) in rule.body.iter().enumerate() {
             let rel_name = match item {
-                BodyItem::Clause(c) => &c.relation,
+                CBodyItem::Clause(c) => &c.relation,
                 _ => continue,
             };
             if let Some(rel) = self.relations.get(rel_name)
@@ -322,7 +331,7 @@ impl Engine {
     /// Collect head tuples from a set of bindings.
     fn collect_head_tuples(
         &self,
-        rule: &Rule,
+        rule: &CRule,
         bindings: &[Bindings],
         results: &mut Vec<(String, Tuple)>,
     ) {
@@ -341,7 +350,7 @@ impl Engine {
     /// all other clauses use full. If None, all use full (initial iteration).
     fn process_body(
         &self,
-        body: &[BodyItem],
+        body: &[CBodyItem],
         bindings: Vec<Bindings>,
         recent_clause_idx: Option<usize>,
     ) -> Vec<Bindings> {
@@ -353,13 +362,13 @@ impl Engine {
             }
 
             current = match item {
-                BodyItem::Clause(clause) => {
+                CBodyItem::Clause(clause) => {
                     let use_recent = recent_clause_idx == Some(i);
                     self.process_clause(clause, current, use_recent)
                 }
-                BodyItem::Generator(generator) => self.process_generator(generator, current),
-                BodyItem::Condition(cond) => self.process_condition(cond, current),
-                BodyItem::Aggregation(agg) => self.process_aggregation(agg, current),
+                CBodyItem::Generator(generator) => self.process_generator(generator, current),
+                CBodyItem::Condition(cond) => self.process_condition(cond, current),
+                CBodyItem::Aggregation(agg) => self.process_aggregation(agg, current),
             };
         }
 
@@ -374,7 +383,7 @@ impl Engine {
     /// pre-filters remaining bound columns via direct comparison.
     fn process_clause(
         &self,
-        clause: &Clause,
+        clause: &CClause,
         bindings: Vec<Bindings>,
         use_recent: bool,
     ) -> Vec<Bindings> {
@@ -422,14 +431,18 @@ impl Engine {
                     }
                     rollback(&mut work, &mut undo, cp);
                 }
+            } else if use_recent {
+                for tuple in rel.iter_recent() {
+                    let cp = undo.len();
+                    if self.match_clause(clause, tuple, &mut work, &mut undo)
+                        && self.check_clause_conditions(clause, &mut work, &mut undo)
+                    {
+                        results.push(work.clone());
+                    }
+                    rollback(&mut work, &mut undo, cp);
+                }
             } else {
-                // No bound columns: full scan
-                let iter: Box<dyn Iterator<Item = &[Value]>> = if use_recent {
-                    Box::new(rel.iter_recent())
-                } else {
-                    Box::new(rel.iter_full())
-                };
-                for tuple in iter {
+                for tuple in rel.iter_full() {
                     let cp = undo.len();
                     if self.match_clause(clause, tuple, &mut work, &mut undo)
                         && self.check_clause_conditions(clause, &mut work, &mut undo)
@@ -448,23 +461,19 @@ impl Engine {
     ///
     /// Returns a list of (column_index, value) pairs for columns where
     /// the clause arg is a bound variable or evaluable expression.
-    fn find_bound_columns(&self, clause: &Clause, binding: &Bindings) -> Vec<(usize, Value)> {
+    fn find_bound_columns(&self, clause: &CClause, binding: &Bindings) -> Vec<(usize, Value)> {
         let mut bound = Vec::new();
         for (col, arg) in clause.args.iter().enumerate() {
             match arg {
-                ClauseArg::Var(var) => {
-                    let var_id = self.var_interner.intern(var);
-                    if let Some(val) = binding.get(&var_id) {
+                CClauseArg::Var(var_id) => {
+                    if let Some(val) = binding.get(var_id) {
                         bound.push((col, val.clone()));
                     }
                 }
-                ClauseArg::Expr(expr) => {
-                    if let Some(val) = eval_expr_with_registry(
-                        expr,
-                        binding,
-                        &self.type_registry,
-                        &self.var_interner,
-                    ) {
+                CClauseArg::Expr(expr) => {
+                    if let Some(val) =
+                        eval_cexpr(expr, binding, Some(&self.type_registry), &self.var_interner)
+                    {
                         bound.push((col, val));
                     }
                 }
@@ -479,7 +488,7 @@ impl Engine {
     /// On failure, rolls back any partial insertions via the undo log.
     fn match_clause(
         &self,
-        clause: &Clause,
+        clause: &CClause,
         tuple: &[Value],
         bindings: &mut Bindings,
         undo: &mut UndoLog,
@@ -491,23 +500,22 @@ impl Engine {
         let cp = undo.len();
         for (arg, value) in clause.args.iter().zip(tuple.iter()) {
             match arg {
-                ClauseArg::Var(var) => {
-                    let var_id = self.var_interner.intern(var);
-                    if let Some(existing) = bindings.get(&var_id) {
+                CClauseArg::Var(var_id) => {
+                    if let Some(existing) = bindings.get(var_id) {
                         if existing != value {
                             rollback(bindings, undo, cp);
                             return false;
                         }
                     } else {
-                        bindings.insert(var_id, value.clone());
-                        undo.push((var_id, None));
+                        bindings.insert(*var_id, value.clone());
+                        undo.push((*var_id, None));
                     }
                 }
-                ClauseArg::Expr(expr) => {
-                    if let Some(evaluated) = eval_expr_with_registry(
+                CClauseArg::Expr(expr) => {
+                    if let Some(evaluated) = eval_cexpr(
                         expr,
                         bindings,
-                        &self.type_registry,
+                        Some(&self.type_registry),
                         &self.var_interner,
                     ) && evaluated != *value
                     {
@@ -524,7 +532,7 @@ impl Engine {
     /// Check additional conditions on a clause, potentially extending bindings in place.
     fn check_clause_conditions(
         &self,
-        clause: &Clause,
+        clause: &CClause,
         bindings: &mut Bindings,
         undo: &mut UndoLog,
     ) -> bool {
@@ -537,25 +545,20 @@ impl Engine {
     }
 
     /// Process a generator.
-    fn process_generator(
-        &self,
-        generator: &ascent_ir::Generator,
-        bindings: Vec<Bindings>,
-    ) -> Vec<Bindings> {
+    fn process_generator(&self, generator: &CGenerator, bindings: Vec<Bindings>) -> Vec<Bindings> {
         let mut results = Vec::new();
 
         for binding in bindings {
-            if let Some(range_val) = eval_expr_with_registry(
+            if let Some(range_val) = eval_cexpr(
                 &generator.expr,
                 &binding,
-                &self.type_registry,
+                Some(&self.type_registry),
                 &self.var_interner,
             ) && let Some(values) = expand_range(&range_val)
             {
                 for value in values {
                     let mut new_binding = binding.clone();
-                    if let Some(var) = generator.vars.first() {
-                        let var_id = self.var_interner.intern(var);
+                    if let Some(&var_id) = generator.vars.first() {
                         new_binding.insert(var_id, value);
                     }
                     results.push(new_binding);
@@ -570,23 +573,12 @@ impl Engine {
     ///
     /// Uses in-place binding modification with undo log to avoid cloning
     /// the bindings map for each relation tuple during aggregation matching.
-    fn process_aggregation(&self, agg: &Aggregation, bindings: Vec<Bindings>) -> Vec<Bindings> {
+    fn process_aggregation(&self, agg: &CAggregation, bindings: Vec<Bindings>) -> Vec<Bindings> {
         let Some(rel) = self.relations.get(&agg.relation) else {
             return vec![];
         };
 
-        // Resolve aggregator name from the expression
-        let agg_name = resolve_aggregator_name(&agg.aggregator);
-
         let mut results = Vec::new();
-
-        // Pre-intern bound var ids once per aggregation
-        let bound_var_ids: Vec<VarId> = agg
-            .bound_vars
-            .iter()
-            .map(|var| self.var_interner.intern(var))
-            .collect();
-
         let mut undo = UndoLog::new();
 
         for binding in &bindings {
@@ -599,7 +591,7 @@ impl Engine {
                 let cp = undo.len();
                 if self.match_agg_args(agg, tuple, &mut work, &mut undo) {
                     collected.push(
-                        bound_var_ids
+                        agg.bound_vars
                             .iter()
                             .filter_map(|var_id| work.get(var_id).cloned())
                             .collect(),
@@ -609,13 +601,13 @@ impl Engine {
             }
 
             // Apply aggregator (streaming over the collected slice)
-            let agg_results = apply_aggregator(&agg_name, collected.iter().map(|v| v.as_slice()));
+            let agg_results =
+                apply_aggregator(&agg.aggregator_name, collected.iter().map(|v| v.as_slice()));
 
             // Bind results to output pattern variables
             for result_tuple in agg_results {
                 let mut new_binding = binding.clone();
-                for (var, val) in agg.result_vars.iter().zip(result_tuple) {
-                    let var_id = self.var_interner.intern(var);
+                for (&var_id, val) in agg.result_vars.iter().zip(result_tuple) {
                     new_binding.insert(var_id, val);
                 }
                 results.push(new_binding);
@@ -631,7 +623,7 @@ impl Engine {
     /// On failure, rolls back any partial insertions via the undo log.
     fn match_agg_args(
         &self,
-        agg: &Aggregation,
+        agg: &CAggregation,
         tuple: &[Value],
         bindings: &mut Bindings,
         undo: &mut UndoLog,
@@ -641,31 +633,31 @@ impl Engine {
         }
 
         let cp = undo.len();
-        for (arg_expr, value) in agg.args.iter().zip(tuple.iter()) {
-            // Check if the argument is a simple variable (bound var)
-            if let syn::Expr::Path(p) = arg_expr
-                && let Some(ident) = p.path.get_ident()
-            {
-                let var_id = self.var_interner.intern(&ident.to_string());
-                if let Some(existing) = bindings.get(&var_id) {
-                    if existing != value {
+        for (arg, value) in agg.args.iter().zip(tuple.iter()) {
+            match arg {
+                CAggArg::Var(var_id) => {
+                    if let Some(existing) = bindings.get(var_id) {
+                        if existing != value {
+                            rollback(bindings, undo, cp);
+                            return false;
+                        }
+                    } else {
+                        bindings.insert(*var_id, value.clone());
+                        undo.push((*var_id, None));
+                    }
+                }
+                CAggArg::Expr(expr) => {
+                    if let Some(evaluated) = eval_cexpr(
+                        expr,
+                        bindings,
+                        Some(&self.type_registry),
+                        &self.var_interner,
+                    ) && evaluated != *value
+                    {
                         rollback(bindings, undo, cp);
                         return false;
                     }
-                } else {
-                    bindings.insert(var_id, value.clone());
-                    undo.push((var_id, None));
                 }
-                continue;
-            }
-
-            // Otherwise evaluate and compare
-            if let Some(evaluated) =
-                eval_expr_with_registry(arg_expr, bindings, &self.type_registry, &self.var_interner)
-                && evaluated != *value
-            {
-                rollback(bindings, undo, cp);
-                return false;
             }
         }
 
@@ -673,7 +665,7 @@ impl Engine {
     }
 
     /// Process a condition, potentially binding new variables.
-    fn process_condition(&self, cond: &Condition, mut bindings: Vec<Bindings>) -> Vec<Bindings> {
+    fn process_condition(&self, cond: &CCondition, mut bindings: Vec<Bindings>) -> Vec<Bindings> {
         let mut undo = UndoLog::new();
         bindings.retain_mut(|b| {
             undo.clear();
@@ -686,20 +678,26 @@ impl Engine {
     /// Evaluate a condition in place. Returns `true` on success (bindings may be extended).
     fn eval_condition(
         &self,
-        cond: &Condition,
+        cond: &CCondition,
         bindings: &mut Bindings,
         undo: &mut UndoLog,
     ) -> bool {
         match cond {
-            Condition::If(expr) => {
-                eval_expr_with_registry(expr, bindings, &self.type_registry, &self.var_interner)
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-            }
-            Condition::IfLet { pattern, expr } | Condition::Let { pattern, expr } => {
-                if let Some(value) =
-                    eval_expr_with_registry(expr, bindings, &self.type_registry, &self.var_interner)
-                {
+            CCondition::If(expr) => eval_cexpr(
+                expr,
+                bindings,
+                Some(&self.type_registry),
+                &self.var_interner,
+            )
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+            CCondition::IfLet { pattern, expr } | CCondition::Let { pattern, expr } => {
+                if let Some(value) = eval_cexpr(
+                    expr,
+                    bindings,
+                    Some(&self.type_registry),
+                    &self.var_interner,
+                ) {
                     match_pattern(
                         pattern,
                         &value,
@@ -716,12 +714,12 @@ impl Engine {
     }
 
     /// Evaluate a head clause to produce a tuple.
-    fn eval_head_tuple(&self, head: &ascent_ir::HeadClause, bindings: &Bindings) -> Option<Tuple> {
+    fn eval_head_tuple(&self, head: &CHeadClause, bindings: &Bindings) -> Option<Tuple> {
         let mut tuple = Vec::with_capacity(head.args.len());
 
         for arg in &head.args {
             if let Some(value) =
-                eval_expr_with_registry(arg, bindings, &self.type_registry, &self.var_interner)
+                eval_cexpr(arg, bindings, Some(&self.type_registry), &self.var_interner)
             {
                 tuple.push(value);
             } else {
@@ -927,22 +925,6 @@ fn path_to_string(path: &syn::Path) -> String {
         .last()
         .map(|s| s.ident.to_string())
         .unwrap_or_default()
-}
-
-/// Extract the aggregator name from an expression.
-/// Handles both simple paths (`min`) and qualified paths (`ascent::aggregators::min`).
-fn resolve_aggregator_name(expr: &syn::Expr) -> String {
-    match expr {
-        syn::Expr::Path(p) => {
-            // Use the last segment of the path
-            p.path
-                .segments
-                .last()
-                .map(|s| s.ident.to_string())
-                .unwrap_or_default()
-        }
-        _ => String::new(),
-    }
 }
 
 #[cfg(feature = "serde")]
