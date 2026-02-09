@@ -371,6 +371,7 @@ impl Engine {
         let mut results = Vec::new();
         let mut binding = Bindings::new(self.var_count);
         let mut undo = UndoLog::new();
+        let mut scratch = Vec::new();
 
         if !use_recent {
             // Initial iteration: all clauses use full
@@ -382,6 +383,7 @@ impl Engine {
                 &mut undo,
                 None,
                 &mut results,
+                &mut scratch,
             );
             return results;
         }
@@ -403,6 +405,7 @@ impl Engine {
                     &mut undo,
                     Some(idx),
                     &mut results,
+                    &mut scratch,
                 );
             }
         }
@@ -426,6 +429,7 @@ impl Engine {
         undo: &mut UndoLog,
         recent_clause_idx: Option<usize>,
         results: &mut Vec<(&'a str, Tuple)>,
+        scratch: &mut Vec<Value>,
     ) {
         if offset >= body.len() {
             // All body items matched — emit head tuples
@@ -450,6 +454,7 @@ impl Engine {
                     undo,
                     recent_clause_idx,
                     results,
+                    scratch,
                 );
             }
             CBodyItem::Generator(generator) => {
@@ -474,6 +479,7 @@ impl Engine {
                             undo,
                             recent_clause_idx,
                             results,
+                            scratch,
                         );
                         rollback(binding, undo, cp);
                     }
@@ -490,6 +496,7 @@ impl Engine {
                         undo,
                         recent_clause_idx,
                         results,
+                        scratch,
                     );
                 }
                 rollback(binding, undo, cp);
@@ -504,6 +511,7 @@ impl Engine {
                     undo,
                     recent_clause_idx,
                     results,
+                    scratch,
                 );
             }
         }
@@ -525,6 +533,7 @@ impl Engine {
         undo: &mut UndoLog,
         recent_clause_idx: Option<usize>,
         results: &mut Vec<(&'a str, Tuple)>,
+        scratch: &mut Vec<Value>,
     ) {
         let Some(rel) = self.relations.get(&clause.relation) else {
             return;
@@ -534,13 +543,13 @@ impl Engine {
         // → build expected tuple directly and do single membership check,
         // skipping find_bound_columns allocation entirely.
         if clause.all_args_bound && !use_recent {
-            let mut expected = Vec::with_capacity(clause.args.len());
+            scratch.clear();
             let mut ok = true;
             for arg in &clause.args {
                 match arg {
                     CClauseArg::Var(var_id) => {
                         if let Some(val) = binding.get(var_id) {
-                            expected.push(val.clone());
+                            scratch.push(val.clone());
                         } else {
                             ok = false;
                             break;
@@ -550,7 +559,7 @@ impl Engine {
                         if let Some(val) =
                             eval_cexpr(expr, binding, Some(&self.type_registry), &self.var_interner)
                         {
-                            expected.push(val);
+                            scratch.push(val);
                         } else {
                             ok = false;
                             break;
@@ -558,7 +567,7 @@ impl Engine {
                     }
                 }
             }
-            if ok && rel.contains(&expected) {
+            if ok && rel.contains(scratch.as_slice()) {
                 if clause.conditions.is_empty() {
                     self.process_body_recursive(
                         body,
@@ -568,6 +577,7 @@ impl Engine {
                         undo,
                         recent_clause_idx,
                         results,
+                        scratch,
                     );
                 } else {
                     let cp = undo.len();
@@ -580,6 +590,7 @@ impl Engine {
                             undo,
                             recent_clause_idx,
                             results,
+                            scratch,
                         );
                     }
                     rollback(binding, undo, cp);
@@ -628,6 +639,7 @@ impl Engine {
                         undo,
                         recent_clause_idx,
                         results,
+                        scratch,
                     );
                 }
                 rollback(binding, undo, cp);
@@ -641,8 +653,9 @@ impl Engine {
         // Runtime fast path fallback: all columns happen to be bound
         // (catches cases the compile-time analysis missed, e.g. vars from if-let patterns).
         if !use_recent && bound_cols.len() == clause.args.len() {
-            let expected: Vec<Value> = bound_cols.iter().map(|(_, val)| val.clone()).collect();
-            if rel.contains(&expected) {
+            scratch.clear();
+            scratch.extend(bound_cols.iter().map(|(_, val)| val.clone()));
+            if rel.contains(scratch.as_slice()) {
                 if clause.conditions.is_empty() {
                     self.process_body_recursive(
                         body,
@@ -652,6 +665,7 @@ impl Engine {
                         undo,
                         recent_clause_idx,
                         results,
+                        scratch,
                     );
                 } else {
                     let cp = undo.len();
@@ -664,6 +678,7 @@ impl Engine {
                             undo,
                             recent_clause_idx,
                             results,
+                            scratch,
                         );
                     }
                     rollback(binding, undo, cp);
@@ -710,6 +725,7 @@ impl Engine {
                         undo,
                         recent_clause_idx,
                         results,
+                        scratch,
                     );
                 }
                 rollback(binding, undo, cp);
@@ -733,6 +749,7 @@ impl Engine {
                             undo,
                             recent_clause_idx,
                             results,
+                            scratch,
                         );
                     }
                     rollback(binding, undo, cp);
@@ -762,6 +779,7 @@ impl Engine {
                         undo,
                         recent_clause_idx,
                         results,
+                        scratch,
                     );
                 }
                 rollback(binding, undo, cp);
@@ -780,6 +798,7 @@ impl Engine {
                         undo,
                         recent_clause_idx,
                         results,
+                        scratch,
                     );
                 }
                 rollback(binding, undo, cp);
@@ -889,6 +908,7 @@ impl Engine {
         undo: &mut UndoLog,
         recent_clause_idx: Option<usize>,
         results: &mut Vec<(&'a str, Tuple)>,
+        scratch: &mut Vec<Value>,
     ) {
         let Some(rel) = self.relations.get(&agg.relation) else {
             return;
@@ -964,6 +984,7 @@ impl Engine {
                 undo,
                 recent_clause_idx,
                 results,
+                scratch,
             );
             rollback(binding, undo, cp);
         }

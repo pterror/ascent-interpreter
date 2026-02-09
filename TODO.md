@@ -63,7 +63,7 @@ Current: 6–32x (after optimizations below).
 - [x] Compile-time condition reordering (move `if` conditions earlier in body to filter before joins)
 - [x] Pre-computed `all_args_bound` flag (skip `find_bound_columns` allocation on fully-bound fast path)
 - [x] Pre-computed clause match plan (bound_cols + fresh_cols: skip find_bound_columns + match_clause)
-- [ ] Reuse head tuple buffer (avoid per-derivation Vec allocation)
+- [x] Reuse head tuple buffer (avoid per-derivation Vec allocation)
 - [x] Delta-specific indices (separate index for recent tuples, skip is_recent checks)
 - [x] Index-accelerated aggregation (use bound columns for index lookup instead of full scan)
 - [ ] Hash join for large relations (O(n+m) instead of nested-loop O(n×m))
