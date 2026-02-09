@@ -3,7 +3,7 @@ layout: home
 hero:
   name: Ascent Interpreter
   text: Interactive Datalog
-  tagline: An interpreter and REPL for Ascent Datalog programs
+  tagline: An interpreter and REPL for Ascent Datalog programs.
   actions:
     - theme: brand
       text: Getting Started
