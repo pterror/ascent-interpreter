@@ -33,18 +33,19 @@
 - [x] `?pattern` prefix for lattice value pattern matching
 - [x] Port lattice tests from ascent (shortest path, etc.)
 
-## Custom Types (BYOD)
+## Custom Types (BYOD — Rust embedding API)
 
 - [x] `DynValue` trait + `Value::Custom` variant for user-defined types
-- [x] `TypeRegistry` on Engine for registering custom constructors
+- [x] `TypeRegistry` on Engine for registering custom constructors/destructors
 - [x] Thread relation attributes through IR (`attrs: Vec<Attribute>`)
 - [x] Pattern matching support for custom types (destructuring in clauses)
 - [x] Serde-based automatic `DynValue` registration
+- [x] Full syntax support: parse from strings, type resolution at runtime
 
 ## Interpreter Performance
 
 Baseline: 15–550x slower than compiled ascent (Criterion benchmarks).
-Current: 6–32x (after optimizations below).
+Current: 6–52x (after optimizations below).
 
 The remaining gap is largely the inherent cost of interpretation: dynamic Value
 dispatch, runtime variable binding, indirect indexing. Further gains require
