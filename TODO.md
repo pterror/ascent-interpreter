@@ -66,8 +66,8 @@ Current: 6–32x (after optimizations below).
 - [x] Reuse head tuple buffer (avoid per-derivation Vec allocation)
 - [x] Delta-specific indices (separate index for recent tuples, skip is_recent checks)
 - [x] Index-accelerated aggregation (use bound columns for index lookup instead of full scan)
-- [ ] Hash join for large relations (O(n+m) instead of nested-loop O(n×m))
-- [ ] Type specialization: fast path for all-i32 programs (skip 17-way Value match)
+- [x] Hash join for large relations (per-column indices already implement hash-based join lookups)
+- [x] Type specialization: i32-specialized dedup in RelationStorage (FxHashSet<Vec<i32>> fast path)
 
 ### High-effort
 
