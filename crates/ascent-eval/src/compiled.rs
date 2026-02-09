@@ -435,7 +435,30 @@ fn optimize_body(body: Vec<CBodyItem>) -> Vec<CBodyItem> {
         result.push(item);
     }
 
-    // Phase 2: Compute all_args_bound, bound_cols, and fresh_cols for each clause.
+    // Phase 2: Merge standalone `if` conditions into the preceding clause.
+    // After reordering, conditions are placed right after the clause that defines
+    // their last variable. Merging them into clause.conditions eliminates a
+    // recursion level in process_body_recursive (one less function call per match).
+    // Only merge pure `if expr` conditions (not if-let/let which define new vars).
+    let mut merged = Vec::with_capacity(result.len());
+    for item in result {
+        if matches!(&item, CBodyItem::Condition(CCondition::If(_)))
+            && matches!(merged.last(), Some(CBodyItem::Clause(_)))
+        {
+            let CBodyItem::Condition(cond) = item else {
+                unreachable!()
+            };
+            let Some(CBodyItem::Clause(clause)) = merged.last_mut() else {
+                unreachable!()
+            };
+            clause.conditions.push(cond);
+            continue;
+        }
+        merged.push(item);
+    }
+    let mut result = merged;
+
+    // Phase 3: Compute all_args_bound, bound_cols, and fresh_cols for each clause.
     let mut defined = FxHashSet::default();
     for item in &mut result {
         if let CBodyItem::Clause(c) = item {
