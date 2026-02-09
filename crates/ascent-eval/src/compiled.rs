@@ -102,6 +102,12 @@ pub(crate) struct CClause {
     /// True if all args will be bound by preceding body items at evaluation time.
     /// Enables fast-path contains check without `find_bound_columns` allocation.
     pub all_args_bound: bool,
+    /// Pre-computed: column indices where the arg is bound by preceding body items.
+    /// Used for index lookup without runtime `find_bound_columns` allocation.
+    pub bound_cols: Vec<usize>,
+    /// Pre-computed: column indices + VarId where the arg is a fresh variable.
+    /// Used for direct binding without `match_clause` overhead.
+    pub fresh_cols: Vec<(usize, VarId)>,
 }
 
 /// Pre-compiled condition.
@@ -204,7 +210,9 @@ fn compile_clause(clause: &Clause, interner: &VarInterner) -> CClause {
             .iter()
             .map(|c| compile_condition(c, interner))
             .collect(),
-        all_args_bound: false, // computed by optimize_body
+        all_args_bound: false,  // computed by optimize_body
+        bound_cols: Vec::new(), // computed by optimize_body
+        fresh_cols: Vec::new(), // computed by optimize_body
     }
 }
 
@@ -427,7 +435,7 @@ fn optimize_body(body: Vec<CBodyItem>) -> Vec<CBodyItem> {
         result.push(item);
     }
 
-    // Phase 2: Compute all_args_bound for each clause.
+    // Phase 2: Compute all_args_bound, bound_cols, and fresh_cols for each clause.
     let mut defined = FxHashSet::default();
     for item in &mut result {
         if let CBodyItem::Clause(c) = item {
@@ -435,6 +443,36 @@ fn optimize_body(body: Vec<CBodyItem>) -> Vec<CBodyItem> {
                 CClauseArg::Var(id) => defined.contains(id),
                 CClauseArg::Expr(expr) => cexpr_vars_defined(expr, &defined),
             });
+
+            // Pre-compute bound/fresh column classification.
+            // Track vars seen within this clause to handle repeated vars correctly:
+            // first occurrence is fresh, subsequent occurrences are implicitly bound.
+            let mut seen_in_clause = FxHashSet::default();
+            let mut has_repeated = false;
+            for (col, arg) in c.args.iter().enumerate() {
+                match arg {
+                    CClauseArg::Var(id) => {
+                        if defined.contains(id) {
+                            c.bound_cols.push(col);
+                        } else if seen_in_clause.insert(*id) {
+                            c.fresh_cols.push((col, *id));
+                        } else {
+                            // Same var appears twice in this clause — fall back to match_clause
+                            has_repeated = true;
+                            break;
+                        }
+                    }
+                    CClauseArg::Expr(expr) => {
+                        if cexpr_vars_defined(expr, &defined) {
+                            c.bound_cols.push(col);
+                        }
+                    }
+                }
+            }
+            if has_repeated {
+                c.bound_cols.clear();
+                c.fresh_cols.clear();
+            }
         }
         add_defined_vars(item, &mut defined);
     }

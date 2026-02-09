@@ -588,6 +588,54 @@ impl Engine {
             return;
         }
 
+        // Pre-computed single bound column fast path: skip find_bound_columns
+        // allocation and match_clause overhead. Directly bind fresh vars.
+        if clause.bound_cols.len() == 1 {
+            let col = clause.bound_cols[0];
+            let val = match &clause.args[col] {
+                CClauseArg::Var(id) => {
+                    let Some(v) = binding.get(id) else { return };
+                    std::borrow::Cow::Borrowed(v)
+                }
+                CClauseArg::Expr(expr) => {
+                    let Some(v) =
+                        eval_cexpr(expr, binding, Some(&self.type_registry), &self.var_interner)
+                    else {
+                        return;
+                    };
+                    std::borrow::Cow::Owned(v)
+                }
+            };
+            let indices = if use_recent {
+                rel.lookup_recent(col, &val)
+            } else {
+                rel.lookup(col, &val)
+            };
+            for &idx in indices {
+                let tuple = rel.get(idx);
+                let cp = undo.len();
+                // Bind fresh vars directly (no match_clause overhead)
+                for &(c, var_id) in &clause.fresh_cols {
+                    binding.insert(var_id, tuple[c].clone());
+                    undo.push((var_id, None));
+                }
+                if self.check_clause_conditions(clause, binding, undo) {
+                    self.process_body_recursive(
+                        body,
+                        offset + 1,
+                        heads,
+                        binding,
+                        undo,
+                        recent_clause_idx,
+                        results,
+                    );
+                }
+                rollback(binding, undo, cp);
+            }
+            return;
+        }
+
+        // Multi-bound or fallback: use runtime find_bound_columns
         let bound_cols = self.find_bound_columns(clause, binding);
 
         // Runtime fast path fallback: all columns happen to be bound
@@ -666,7 +714,41 @@ impl Engine {
                 }
                 rollback(binding, undo, cp);
             }
+        } else if clause.bound_cols.is_empty() && !clause.fresh_cols.is_empty() {
+            // All args are fresh vars (first clause in body, or all new vars).
+            // Skip match_clause: directly bind fresh vars from tuples.
+            macro_rules! bind_fresh_and_recurse {
+                ($tuple:expr) => {{
+                    let cp = undo.len();
+                    for &(c, var_id) in &clause.fresh_cols {
+                        binding.insert(var_id, $tuple[c].clone());
+                        undo.push((var_id, None));
+                    }
+                    if self.check_clause_conditions(clause, binding, undo) {
+                        self.process_body_recursive(
+                            body,
+                            offset + 1,
+                            heads,
+                            binding,
+                            undo,
+                            recent_clause_idx,
+                            results,
+                        );
+                    }
+                    rollback(binding, undo, cp);
+                }};
+            }
+            if use_recent {
+                for tuple in rel.iter_recent() {
+                    bind_fresh_and_recurse!(tuple);
+                }
+            } else {
+                for tuple in rel.iter_full() {
+                    bind_fresh_and_recurse!(tuple);
+                }
+            }
         } else if use_recent {
+            // Fallback for complex patterns (expressions, repeated vars, etc.)
             for tuple in rel.iter_recent() {
                 let cp = undo.len();
                 if self.match_clause(clause, tuple, binding, undo)
