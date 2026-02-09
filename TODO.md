@@ -44,12 +44,12 @@
 ## Interpreter Performance
 
 Baseline: 15–550x slower than compiled ascent (Criterion benchmarks).
-Current: 7–56x (after optimizations below).
+Current: 6–32x (after optimizations below).
 
 ### Low-effort
 
 - [x] Intern variable names (u32 index instead of String keys in Bindings)
-- [x] Rc-wrap tuples to avoid cloning on dedup (Rc::clone instead of Vec::clone)
+- [x] ~~Rc-wrap tuples~~ Direct Vec<Value> storage (removed Rc, in-place lattice mutation)
 - [x] Stream aggregation instead of collecting into Vec then reducing
 
 ### Medium-effort
@@ -62,6 +62,7 @@ Current: 7–56x (after optimizations below).
 - [x] Avoid Box<dyn Iterator> in process_clause full-scan path (virtual dispatch per tuple)
 - [x] Compile-time condition reordering (move `if` conditions earlier in body to filter before joins)
 - [x] Pre-computed `all_args_bound` flag (skip `find_bound_columns` allocation on fully-bound fast path)
+- [x] Pre-computed clause match plan (bound_cols + fresh_cols: skip find_bound_columns + match_clause)
 - [ ] Reuse head tuple buffer (avoid per-derivation Vec allocation)
 - [x] Delta-specific indices (separate index for recent tuples, skip is_recent checks)
 - [x] Index-accelerated aggregation (use bound columns for index lookup instead of full scan)
