@@ -236,12 +236,6 @@ impl Parse for DisjunctionNode {
                 &content,
                 Punctuated::<BodyItemNode, Token![,]>::parse_separated_nonempty,
             )?;
-        if res
-            .pairs()
-            .any(|pair| matches!(pair.punct(), Some(DisjunctionToken::OrOr(_))))
-        {
-            eprintln!("WARNING: In Ascent rules, use `|` as the disjunction token instead of `||`")
-        }
         Ok(DisjunctionNode {
             paren,
             disjuncts: res,
