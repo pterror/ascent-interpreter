@@ -2,22 +2,17 @@
 //!
 //! Each relation maintains per-column hash indices for efficient joins.
 
-use std::rc::Rc;
-
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::value::{Tuple, Value};
 
-/// Rc-wrapped tuple for cheap cloning in dedup sets and storage.
-type StoredTuple = Rc<[Value]>;
-
 /// Storage for a single relation with per-column indices.
 #[derive(Debug, Clone, Default)]
 pub struct RelationStorage {
-    /// All tuples in the relation, stored as Rc-wrapped slices for cheap cloning.
-    tuples: Vec<StoredTuple>,
-    /// Deduplication set (Rc clones are O(1) refcount bumps).
-    seen: FxHashSet<StoredTuple>,
+    /// All tuples in the relation.
+    tuples: Vec<Vec<Value>>,
+    /// Deduplication set.
+    seen: FxHashSet<Vec<Value>>,
     /// Indices of tuples added in the current iteration (delta).
     delta: Vec<usize>,
     /// Indices of tuples from the previous iteration (for semi-naive).
@@ -85,26 +80,23 @@ impl RelationStorage {
             return self.insert_lattice(tuple);
         }
 
-        let stored: StoredTuple = Rc::from(tuple);
-        if self.seen.insert(stored.clone()) {
-            let idx = self.tuples.len();
-            // Update per-column indices
-            for (col, val) in stored.iter().enumerate() {
-                self.indices[col].entry(val.clone()).or_default().push(idx);
-            }
-            self.tuples.push(stored);
-            self.delta.push(idx);
-            true
-        } else {
-            false
+        if !self.seen.insert(tuple.clone()) {
+            return false;
         }
+        let idx = self.tuples.len();
+        // Update per-column indices
+        for (col, val) in tuple.iter().enumerate() {
+            self.indices[col].entry(val.clone()).or_default().push(idx);
+        }
+        self.tuples.push(tuple);
+        self.delta.push(idx);
+        true
     }
 
     /// Lattice insert: merge by key columns using lattice join on last column.
     fn insert_lattice(&mut self, tuple: Tuple) -> bool {
-        let stored: StoredTuple = Rc::from(tuple);
-        let key: Vec<Value> = stored[..self.arity - 1].to_vec();
-        let new_lat = &stored[self.arity - 1];
+        let key: Vec<Value> = tuple[..self.arity - 1].to_vec();
+        let new_lat = &tuple[self.arity - 1];
 
         if let Some(&idx) = self.key_index.get(&key) {
             // Key exists: try to merge lattice values
@@ -112,14 +104,11 @@ impl RelationStorage {
             if let Some(joined) = old_lat.lattice_join(new_lat)
                 && joined != *old_lat
             {
-                // Lattice value changed: rebuild tuple with new lattice value
-                let old_val = self.tuples[idx][self.arity - 1].clone();
-                let mut new_data: Vec<Value> = self.tuples[idx].to_vec();
-                new_data[self.arity - 1] = joined.clone();
-                self.tuples[idx] = Rc::from(new_data);
+                // Lattice value changed: mutate in place
+                let last_col = self.arity - 1;
+                let old_val = std::mem::replace(&mut self.tuples[idx][last_col], joined.clone());
 
                 // Update the last-column index
-                let last_col = self.arity - 1;
                 if let Some(entries) = self.indices[last_col].get_mut(&old_val) {
                     entries.retain(|&i| i != idx);
                 }
@@ -135,11 +124,11 @@ impl RelationStorage {
         } else {
             // New key: insert fresh tuple
             let idx = self.tuples.len();
-            for (col, val) in stored.iter().enumerate() {
+            for (col, val) in tuple.iter().enumerate() {
                 self.indices[col].entry(val.clone()).or_default().push(idx);
             }
             self.key_index.insert(key, idx);
-            self.tuples.push(stored);
+            self.tuples.push(tuple);
             self.delta.push(idx);
             true
         }
@@ -160,17 +149,17 @@ impl RelationStorage {
 
     /// Iterate over all tuples.
     pub fn iter(&self) -> impl Iterator<Item = &[Value]> {
-        self.tuples.iter().map(|t| t.as_ref())
+        self.tuples.iter().map(|t| t.as_slice())
     }
 
     /// Iterate over recent tuples (from last iteration).
     pub fn iter_recent(&self) -> impl Iterator<Item = &[Value]> {
-        self.recent.iter().map(|&i| self.tuples[i].as_ref())
+        self.recent.iter().map(|&i| self.tuples[i].as_slice())
     }
 
     /// Iterate over all tuples (for rules that don't use semi-naive).
     pub fn iter_full(&self) -> impl Iterator<Item = &[Value]> {
-        self.tuples.iter().map(|t| t.as_ref())
+        self.tuples.iter().map(|t| t.as_slice())
     }
 
     /// Look up tuples matching a value in the given column.
