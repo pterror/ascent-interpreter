@@ -46,6 +46,10 @@
 Baseline: 15–550x slower than compiled ascent (Criterion benchmarks).
 Current: 6–32x (after optimizations below).
 
+The remaining gap is largely the inherent cost of interpretation: dynamic Value
+dispatch, runtime variable binding, indirect indexing. Further gains require
+building a compiler (Cranelift/native codegen), which is a different project.
+
 ### Low-effort
 
 - [x] Intern variable names (u32 index instead of String keys in Bindings)
@@ -71,12 +75,13 @@ Current: 6–32x (after optimizations below).
 
 ### High-effort
 
-- [ ] Expression compilation (flatten tree-walk to bytecode or closures)
 - [x] Rule body pipeline without intermediate Vec<Bindings> (recursive streaming with undo log)
-- [ ] Parallel SCC evaluation (independent strata run on separate threads)
-- [ ] Cranelift backend for hot loops
-- [ ] Compile frequently-used rules to native code
-- [ ] Benchmark against interpreted mode
+
+### Diminishing returns (not planned)
+
+- ~Expression compilation~ — CExpr already flattened syn::Expr; typical Datalog expressions are trivial, not the bottleneck
+- ~Parallel SCC evaluation~ — strata are sequential by definition; intra-stratum parallelism is a research problem
+- ~Cranelift backend / native codegen~ — effectively building a compiler; different project
 
 ## Testing
 
