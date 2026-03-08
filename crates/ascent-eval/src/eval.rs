@@ -182,6 +182,8 @@ impl fmt::Debug for TypeRegistry {
 pub struct Engine {
     /// Storage for each relation.
     relations: FxHashMap<String, RelationStorage>,
+    /// Declared column types per relation (primitive type name, or None for complex types).
+    col_types: FxHashMap<String, Vec<Option<String>>>,
     /// Registry of custom type constructors.
     pub type_registry: TypeRegistry,
     /// Intern table for variable names.
@@ -194,6 +196,7 @@ impl Engine {
     /// Create a new engine from a program.
     pub fn new(program: &Program) -> Self {
         let mut relations = FxHashMap::default();
+        let mut col_types = FxHashMap::default();
 
         for (name, rel) in &program.relations {
             let arity = rel.column_types.len();
@@ -201,10 +204,23 @@ impl Engine {
                 name.clone(),
                 RelationStorage::with_lattice(arity, rel.is_lattice),
             );
+            let types: Vec<Option<String>> = rel
+                .column_types
+                .iter()
+                .map(|ty| {
+                    if let syn::Type::Path(tp) = ty {
+                        tp.path.get_ident().map(|id| id.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            col_types.insert(name.clone(), types);
         }
 
         Engine {
             relations,
+            col_types,
             type_registry: TypeRegistry::new(),
             var_interner: VarInterner::default(),
             var_count: 0,
@@ -1102,21 +1118,38 @@ impl Engine {
     }
 
     /// Evaluate a head clause to produce a tuple.
+    ///
+    /// Coerces numeric values to match the declared column types, so that
+    /// unsuffixed integer literals (which default to i32) work correctly
+    /// in relations declared with other integer types (e.g. u32).
     fn eval_head_tuple(&self, head: &CHeadClause, bindings: &Bindings) -> Option<Tuple> {
         let mut tuple = Vec::with_capacity(head.args.len());
+        let declared = self.col_types.get(head.relation.as_str());
 
-        for arg in &head.args {
-            if let Some(value) =
-                eval_cexpr(arg, bindings, Some(&self.type_registry), &self.var_interner)
+        for (col_idx, arg) in head.args.iter().enumerate() {
+            let value = eval_cexpr(arg, bindings, Some(&self.type_registry), &self.var_interner)?;
+            let value = if let Some(ty_name) = declared
+                .and_then(|cols| cols.get(col_idx))
+                .and_then(|t| t.as_deref())
             {
-                tuple.push(value);
+                coerce_to_col_type(value, ty_name)
             } else {
-                return None;
-            }
+                value
+            };
+            tuple.push(value);
         }
 
         Some(tuple)
     }
+}
+
+/// Coerce a value to a declared column type if they are compatible integer types.
+///
+/// This handles the case where an unsuffixed literal (e.g. `0`) is evaluated as
+/// `Value::I32` but the column is declared as `u32` or another integer type.
+/// Only coerces between numeric types; leaves all other values unchanged.
+fn coerce_to_col_type(value: Value, ty_name: &str) -> Value {
+    value.cast_to(ty_name).unwrap_or(value)
 }
 
 /// Compute strongly connected components of the rule dependency graph.
@@ -1372,6 +1405,30 @@ mod tests {
 
         engine.run(&program);
         engine
+    }
+
+    #[test]
+    fn test_unsuffixed_literal_coercion() {
+        // Unsuffixed literals default to i32 in the evaluator, but should be
+        // coerced to the declared column type (e.g. u32) at head insertion time.
+        let engine = run_program(
+            r#"
+            relation node(u32);
+            relation edge(u32, u32);
+            relation path(u32, u32);
+            node(0);
+            node(1);
+            edge(0, 1);
+            path(x, y) <-- edge(x, y);
+        "#,
+        );
+
+        let node = engine.relation("node").unwrap();
+        assert!(node.contains(&[Value::U32(0)]));
+        assert!(node.contains(&[Value::U32(1)]));
+
+        let path = engine.relation("path").unwrap();
+        assert!(path.contains(&[Value::U32(0), Value::U32(1)]));
     }
 
     #[test]
