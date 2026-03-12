@@ -10,6 +10,18 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::value::{Tuple, Value};
 
+/// Opaque identifier for a fact source (file, REPL input, module, etc.).
+///
+/// Facts can be tagged with a `SourceId` to enable bulk retraction:
+/// retract all facts from a given source without touching the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SourceId(pub u32);
+
+impl SourceId {
+    /// The default source for untagged facts.
+    pub const ANONYMOUS: SourceId = SourceId(0);
+}
+
 /// Compute a hash for a tuple slice using FxHasher.
 fn hash_tuple(tuple: &[Value]) -> u64 {
     let mut hasher = FxHasher::default();
@@ -46,6 +58,8 @@ pub struct RelationStorage {
     is_lattice: bool,
     /// For lattice relations: key columns hash → tuple index (for merge-by-key).
     key_index: HashTable<usize>,
+    /// Source tag per tuple, parallel to the flat buffer (one per tuple index).
+    source_tags: Vec<SourceId>,
 }
 
 impl Default for RelationStorage {
@@ -62,6 +76,7 @@ impl Default for RelationStorage {
             arity: 0,
             is_lattice: false,
             key_index: HashTable::new(),
+            source_tags: Vec::new(),
         }
     }
 }
@@ -86,6 +101,7 @@ impl RelationStorage {
             arity,
             is_lattice,
             key_index: HashTable::new(),
+            source_tags: Vec::new(),
         }
     }
 
@@ -110,16 +126,21 @@ impl RelationStorage {
         self.count
     }
 
-    /// Insert a tuple. Returns true if data changed.
+    /// Insert a tuple with [`SourceId::ANONYMOUS`]. Returns true if data changed.
     ///
     /// For regular relations: deduplicates by full tuple equality.
     /// For lattice relations: merges by key columns (all except last),
     /// applying lattice join on the last column.
     pub fn insert(&mut self, tuple: Tuple) -> bool {
+        self.insert_with_source(tuple, SourceId::ANONYMOUS)
+    }
+
+    /// Insert a tuple tagged with a source. Returns true if data changed.
+    pub fn insert_with_source(&mut self, tuple: Tuple, source: SourceId) -> bool {
         debug_assert_eq!(tuple.len(), self.arity, "tuple arity mismatch");
 
         if self.is_lattice && self.arity > 0 {
-            return self.insert_lattice(tuple);
+            return self.insert_lattice(tuple, source);
         }
 
         // Zero-arity: at most one tuple
@@ -128,6 +149,7 @@ impl RelationStorage {
                 return false;
             }
             self.count = 1;
+            self.source_tags.push(source);
             self.delta.push(0);
             return true;
         }
@@ -152,6 +174,7 @@ impl RelationStorage {
             self.indices[col].entry(val.clone()).or_default().push(idx);
         }
         self.data.extend(tuple);
+        self.source_tags.push(source);
         self.count += 1;
         self.delta.push(idx);
 
@@ -164,7 +187,7 @@ impl RelationStorage {
     }
 
     /// Lattice insert: merge by key columns using lattice join on last column.
-    fn insert_lattice(&mut self, tuple: Tuple) -> bool {
+    fn insert_lattice(&mut self, tuple: Tuple, source: SourceId) -> bool {
         let last_col = self.arity - 1;
         let key = &tuple[..last_col];
         let new_lat = &tuple[last_col];
@@ -191,6 +214,9 @@ impl RelationStorage {
                 }
                 self.indices[last_col].entry(joined).or_default().push(idx);
 
+                // Update source to the latest writer
+                self.source_tags[idx] = source;
+
                 // Mark as changed
                 if !self.delta.contains(&idx) {
                     self.delta.push(idx);
@@ -212,6 +238,7 @@ impl RelationStorage {
             });
 
             self.data.extend(tuple);
+            self.source_tags.push(source);
             self.count += 1;
             self.delta.push(idx);
             true
@@ -329,6 +356,97 @@ impl RelationStorage {
     /// Total number of tuples (for index bounds).
     pub fn tuple_count(&self) -> usize {
         self.count
+    }
+
+    /// Get the source tag for a tuple by index.
+    pub fn source_of(&self, idx: usize) -> SourceId {
+        self.source_tags
+            .get(idx)
+            .copied()
+            .unwrap_or(SourceId::ANONYMOUS)
+    }
+
+    /// Remove all tuples tagged with the given source. Returns the number removed.
+    ///
+    /// Rebuilds internal data structures (indices, dedup) from surviving tuples.
+    /// Delta and recent are cleared since they reference pre-retraction indices.
+    pub fn retract_source(&mut self, source: SourceId) -> usize {
+        let keep: Vec<bool> = self.source_tags.iter().map(|&s| s != source).collect();
+        let removed = keep.iter().filter(|&&k| !k).count();
+        if removed == 0 {
+            return 0;
+        }
+        self.rebuild_keeping(&keep);
+        removed
+    }
+
+    /// Rebuild the relation keeping only tuples where `keep[i]` is true.
+    fn rebuild_keeping(&mut self, keep: &[bool]) {
+        let arity = self.arity;
+
+        // Handle zero-arity specially
+        if arity == 0 {
+            if self.count > 0 && !keep.first().copied().unwrap_or(true) {
+                self.count = 0;
+                self.source_tags.clear();
+            }
+            self.delta.clear();
+            self.recent.clear();
+            self.recent_set.clear();
+            return;
+        }
+
+        let mut new_data = Vec::with_capacity(self.data.len());
+        let mut new_sources = Vec::with_capacity(self.source_tags.len());
+        let mut new_dedup = HashTable::new();
+        let mut new_indices: Vec<FxHashMap<Value, Vec<usize>>> =
+            (0..arity).map(|_| FxHashMap::default()).collect();
+        let mut new_key_index = HashTable::new();
+        let mut new_count = 0;
+
+        for (i, &kept) in keep.iter().enumerate().take(self.count) {
+            if !kept {
+                continue;
+            }
+            let tuple = &self.data[i * arity..(i + 1) * arity];
+            let idx = new_count;
+
+            new_data.extend_from_slice(tuple);
+            new_sources.push(self.source_tags[i]);
+
+            for (col, val) in tuple.iter().enumerate() {
+                new_indices[col].entry(val.clone()).or_default().push(idx);
+            }
+
+            let hash = hash_tuple(tuple);
+            new_dedup.insert_unique(hash, idx, |&j| {
+                hash_tuple(&new_data[j * arity..(j + 1) * arity])
+            });
+
+            if self.is_lattice && arity > 0 {
+                let key = &tuple[..arity - 1];
+                let key_hash = hash_tuple(key);
+                new_key_index.insert_unique(key_hash, idx, |&j| {
+                    hash_tuple(&new_data[j * arity..j * arity + arity - 1])
+                });
+            }
+
+            new_count += 1;
+        }
+
+        self.data = new_data;
+        self.source_tags = new_sources;
+        self.count = new_count;
+        self.dedup = new_dedup;
+        self.indices = new_indices;
+        self.key_index = new_key_index;
+        // Delta/recent reference old indices — clear them
+        self.delta.clear();
+        self.recent.clear();
+        self.recent_set.clear();
+        for col in &mut self.recent_col_indices {
+            col.clear();
+        }
     }
 }
 

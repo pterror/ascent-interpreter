@@ -14,7 +14,7 @@ use crate::compiled::{
     compile_rule, eval_cexpr,
 };
 use crate::expr::{eval_expr, expand_range};
-use crate::relation::RelationStorage;
+use crate::relation::{RelationStorage, SourceId};
 use crate::value::{DynValue, Tuple, Value};
 
 /// Interned variable identifier (u32 index instead of String).
@@ -190,6 +190,12 @@ pub struct Engine {
     pub(crate) var_interner: VarInterner,
     /// Number of interned variables (for pre-allocating Bindings).
     var_count: usize,
+    /// Source name → SourceId interning.
+    source_names: FxHashMap<String, SourceId>,
+    /// Next source ID to allocate (0 is reserved for ANONYMOUS).
+    next_source_id: u32,
+    /// Active source context — facts from empty-body rules get this tag during `run`.
+    current_source: SourceId,
 }
 
 impl Engine {
@@ -224,6 +230,9 @@ impl Engine {
             type_registry: TypeRegistry::new(),
             var_interner: VarInterner::default(),
             var_count: 0,
+            source_names: FxHashMap::default(),
+            next_source_id: 1,
+            current_source: SourceId::ANONYMOUS,
         }
     }
 
@@ -285,13 +294,56 @@ impl Engine {
         self.relations.get_mut(name)
     }
 
-    /// Insert a tuple into a relation.
+    /// Insert a tuple into a relation (untagged / [`SourceId::ANONYMOUS`]).
     pub fn insert(&mut self, relation: &str, tuple: Tuple) -> bool {
         if let Some(rel) = self.relations.get_mut(relation) {
             rel.insert(tuple)
         } else {
             false
         }
+    }
+
+    /// Insert a tuple tagged with a source.
+    pub fn insert_with_source(&mut self, relation: &str, tuple: Tuple, source: SourceId) -> bool {
+        if let Some(rel) = self.relations.get_mut(relation) {
+            rel.insert_with_source(tuple, source)
+        } else {
+            false
+        }
+    }
+
+    /// Intern a source name, returning a stable [`SourceId`].
+    ///
+    /// Repeated calls with the same name return the same ID.
+    pub fn intern_source(&mut self, name: &str) -> SourceId {
+        if let Some(&id) = self.source_names.get(name) {
+            return id;
+        }
+        let id = SourceId(self.next_source_id);
+        self.next_source_id += 1;
+        self.source_names.insert(name.to_string(), id);
+        id
+    }
+
+    /// Set the active source context. Facts from empty-body rules during
+    /// subsequent `run()` calls will be tagged with this source.
+    pub fn set_source(&mut self, source: SourceId) {
+        self.current_source = source;
+    }
+
+    /// Get the currently active source context.
+    pub fn source(&self) -> SourceId {
+        self.current_source
+    }
+
+    /// Remove all facts tagged with the given source from every relation.
+    /// Returns the total number of tuples removed.
+    pub fn retract_source(&mut self, source: SourceId) -> usize {
+        let mut total = 0;
+        for rel in self.relations.values_mut() {
+            total += rel.retract_source(source);
+        }
+        total
     }
 
     /// Run the program to fixpoint using semi-naive evaluation with SCC-based stratification.
@@ -385,8 +437,16 @@ impl Engine {
 
         let derived = self.derive_tuples(rule, use_recent);
 
+        // Facts from empty-body rules (base facts) get the current source tag.
+        // Derived facts from rules with bodies stay anonymous.
+        let source = if rule.body.is_empty() {
+            self.current_source
+        } else {
+            SourceId::ANONYMOUS
+        };
+
         for (relation, tuple) in derived {
-            self.insert(relation, tuple);
+            self.insert_with_source(relation, tuple, source);
         }
     }
 

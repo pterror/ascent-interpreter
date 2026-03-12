@@ -44,5 +44,5 @@ pub mod serde_bridge;
 pub mod value;
 
 pub use eval::{Bindings, Engine, TypeRegistry, ValueDestructor, VarId, VarInterner};
-pub use relation::RelationStorage;
+pub use relation::{RelationStorage, SourceId};
 pub use value::{DynValue, Tuple, Value};
