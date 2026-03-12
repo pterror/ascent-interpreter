@@ -37,6 +37,7 @@ pub mod aggregators;
 mod compiled;
 mod eval;
 pub mod expr;
+pub mod intern;
 mod relation;
 #[cfg(feature = "serde")]
 pub mod serde_bridge;

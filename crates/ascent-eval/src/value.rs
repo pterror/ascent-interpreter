@@ -6,6 +6,8 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
+use crate::intern::{self, SymbolId};
+
 /// Object-safe trait for user-defined types in the interpreter.
 ///
 /// Library consumers implement this (typically via the blanket impl) to register
@@ -91,8 +93,8 @@ pub enum Value {
     F64(OrderedFloat<f64>),
     /// Character.
     Char(char),
-    /// String.
-    String(Rc<String>),
+    /// Interned string (O(1) clone, eq, hash).
+    String(SymbolId),
     /// Tuple of values.
     Tuple(Rc<Vec<Value>>),
     /// Option type.
@@ -129,7 +131,7 @@ impl Clone for Value {
             Value::F32(v) => Value::F32(*v),
             Value::F64(v) => Value::F64(*v),
             Value::Char(v) => Value::Char(*v),
-            Value::String(v) => Value::String(v.clone()),
+            Value::String(v) => Value::String(*v),
             Value::Tuple(v) => Value::Tuple(v.clone()),
             Value::Option(v) => Value::Option(v.clone()),
             Value::Dual(v) => Value::Dual(v.clone()),
@@ -294,7 +296,7 @@ impl fmt::Debug for Value {
             Value::F32(v) => write!(f, "{:?}f32", v.0),
             Value::F64(v) => write!(f, "{:?}f64", v.0),
             Value::Char(v) => write!(f, "{v:?}"),
-            Value::String(v) => write!(f, "{v:?}"),
+            Value::String(v) => write!(f, "{:?}", intern::resolve(*v)),
             Value::Tuple(v) => {
                 write!(f, "(")?;
                 for (i, val) in v.iter().enumerate() {
@@ -330,7 +332,7 @@ impl fmt::Debug for Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::String(s) => write!(f, "{s}"),
+            Value::String(s) => write!(f, "{}", intern::resolve(*s)),
             Value::Char(c) => write!(f, "{c}"),
             Value::Custom(v) => v.display_fmt(f),
             other => write!(f, "{other:?}"),
@@ -352,9 +354,9 @@ impl Value {
         Value::Custom(Box::new(v))
     }
 
-    /// Create a string value.
-    pub fn string(s: impl Into<String>) -> Self {
-        Value::String(Rc::new(s.into()))
+    /// Create a string value (interns the string).
+    pub fn string(s: impl AsRef<str>) -> Self {
+        Value::String(intern::intern(s.as_ref()))
     }
 
     /// Try to get as i32.
@@ -525,7 +527,9 @@ impl Value {
             (Value::F32(a), Value::F32(b)) => Some(a.cmp(b)),
             (Value::F64(a), Value::F64(b)) => Some(a.cmp(b)),
             (Value::Char(a), Value::Char(b)) => Some(a.cmp(b)),
-            (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+            (Value::String(a), Value::String(b)) => {
+                Some(intern::resolve(*a).cmp(intern::resolve(*b)))
+            }
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
             // Dual reverses the ordering
             (Value::Dual(a), Value::Dual(b)) => b.partial_cmp_val(a),

@@ -410,10 +410,7 @@ mod tests {
         assert_eq!(rel.seen_i32.len(), 2);
 
         // Insert non-i32 tuple triggers migration
-        rel.insert(vec![
-            Value::I32(5),
-            Value::String(String::from("hello").into()),
-        ]);
+        rel.insert(vec![Value::I32(5), Value::string("hello")]);
         assert!(!rel.all_i32);
         assert!(rel.seen_i32.is_empty());
         assert_eq!(rel.seen.len(), 3); // All 3 tuples in Value dedup set
@@ -421,7 +418,7 @@ mod tests {
 
         // Contains still works after migration
         assert!(rel.contains(&[Value::I32(1), Value::I32(2)]));
-        assert!(rel.contains(&[Value::I32(5), Value::String(String::from("hello").into())]));
+        assert!(rel.contains(&[Value::I32(5), Value::string("hello")]));
     }
 
     #[test]
@@ -432,7 +429,7 @@ mod tests {
         rel.insert(vec![Value::I32(2)]);
 
         // Force migration
-        rel.insert(vec![Value::String(String::from("x").into())]);
+        rel.insert(vec![Value::string("x")]);
 
         // Duplicate after migration should still be rejected
         assert!(!rel.insert(vec![Value::I32(1)]));

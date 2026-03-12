@@ -6,7 +6,6 @@
 //! alternative to manually writing constructor/destructor closures.
 
 use std::fmt;
-use std::rc::Rc;
 
 use serde::de::{self, DeserializeSeed, SeqAccess, Visitor};
 use serde::ser::{self, SerializeStruct, SerializeTupleStruct};
@@ -114,7 +113,7 @@ impl ser::Serializer for FieldSerializer {
     }
 
     fn serialize_str(self, v: &str) -> Result<Value, BridgeError> {
-        Ok(Value::String(Rc::new(v.to_string())))
+        Ok(Value::string(v))
     }
 
     fn serialize_bytes(self, _v: &[u8]) -> Result<Value, BridgeError> {
@@ -470,7 +469,7 @@ impl<'de> de::Deserializer<'de> for FieldDeserializer<'de> {
             Value::F32(OrderedFloat(v)) => visitor.visit_f32(*v),
             Value::F64(OrderedFloat(v)) => visitor.visit_f64(*v),
             Value::Char(v) => visitor.visit_char(*v),
-            Value::String(v) => visitor.visit_str(v),
+            Value::String(v) => visitor.visit_str(crate::intern::resolve(*v)),
             Value::Option(None) => visitor.visit_none(),
             Value::Option(Some(inner)) => visitor.visit_some(FieldDeserializer { value: inner }),
             _ => Err(BridgeError(format!(
@@ -498,7 +497,7 @@ impl<'de> de::Deserializer<'de> for FieldDeserializer<'de> {
 
     fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, BridgeError> {
         match self.value {
-            Value::String(v) => visitor.visit_string(v.as_ref().clone()),
+            Value::String(v) => visitor.visit_string(crate::intern::resolve(*v).to_string()),
             _ => self.deserialize_any(visitor),
         }
     }
@@ -673,10 +672,7 @@ mod tests {
     fn round_trip_tuple_struct() {
         let pair = Pair(42, "hello".to_string());
         let values = to_values(&pair).unwrap();
-        assert_eq!(
-            values,
-            vec![Value::I32(42), Value::String(Rc::new("hello".into()))]
-        );
+        assert_eq!(values, vec![Value::I32(42), Value::string("hello")]);
         let pair2: Pair = from_values(&values).unwrap();
         assert_eq!(pair, pair2);
     }
