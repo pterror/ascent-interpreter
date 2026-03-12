@@ -343,6 +343,24 @@ impl RelationStorage {
         self.recent_set.clear();
     }
 
+    /// Remove all data from this relation, resetting it to empty.
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.count = 0;
+        self.dedup = HashTable::new();
+        self.delta.clear();
+        self.recent.clear();
+        self.recent_set.clear();
+        for idx in &mut self.indices {
+            idx.clear();
+        }
+        for idx in &mut self.recent_col_indices {
+            idx.clear();
+        }
+        self.key_index = HashTable::new();
+        self.source_tags.clear();
+    }
+
     /// Check if a tuple index is in the recent set (O(1)).
     pub fn is_recent(&self, idx: usize) -> bool {
         self.recent_set.contains(&idx)

@@ -6,7 +6,7 @@ use std::fmt;
 use ascent_ir::{BodyItem, Program};
 use petgraph::algo::{condensation, toposort};
 use petgraph::graph::DiGraph;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::aggregators::apply_aggregator;
 use crate::compiled::{
@@ -177,6 +177,68 @@ impl fmt::Debug for TypeRegistry {
     }
 }
 
+/// Pre-computed SCC stratification with compiled rules.
+///
+/// Caches the dependency structure and compiled rules so that
+/// `run_incremental` can selectively re-run only affected strata.
+#[derive(Debug, Clone)]
+struct Stratification {
+    /// Rule indices per SCC, in topological order.
+    sccs: Vec<Vec<usize>>,
+    /// Relations read by each SCC (body clauses + aggregations).
+    scc_reads: Vec<FxHashSet<String>>,
+    /// Relations written by each SCC (head clauses).
+    scc_writes: Vec<FxHashSet<String>>,
+    /// Compiled rules (indexed by original rule index in the program).
+    compiled: Vec<CRule>,
+}
+
+impl Stratification {
+    /// Build stratification from a program and variable interner.
+    fn build(program: &Program, interner: &VarInterner) -> Self {
+        let sccs = compute_rule_sccs(program);
+        let compiled: Vec<CRule> = program
+            .rules
+            .iter()
+            .map(|r| compile_rule(r, interner))
+            .collect();
+
+        let mut scc_reads = Vec::with_capacity(sccs.len());
+        let mut scc_writes = Vec::with_capacity(sccs.len());
+
+        for scc_indices in &sccs {
+            let mut reads = FxHashSet::default();
+            let mut writes = FxHashSet::default();
+            for &rule_idx in scc_indices {
+                let rule = &compiled[rule_idx];
+                for item in &rule.body {
+                    match item {
+                        CBodyItem::Clause(c) => {
+                            reads.insert(c.relation.clone());
+                        }
+                        CBodyItem::Aggregation(a) => {
+                            reads.insert(a.relation.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                for head in &rule.heads {
+                    writes.insert(head.relation.clone());
+                }
+            }
+            scc_reads.push(reads);
+            scc_writes.push(writes);
+        }
+
+        Stratification {
+            sccs,
+            scc_reads,
+            scc_writes,
+            compiled,
+        }
+    }
+}
+
 /// The evaluation engine state.
 #[derive(Debug)]
 pub struct Engine {
@@ -196,6 +258,8 @@ pub struct Engine {
     next_source_id: u32,
     /// Active source context — facts from empty-body rules get this tag during `run`.
     current_source: SourceId,
+    /// Cached stratification for incremental re-runs.
+    stratification: Option<Stratification>,
 }
 
 impl Engine {
@@ -233,6 +297,7 @@ impl Engine {
             source_names: FxHashMap::default(),
             next_source_id: 1,
             current_source: SourceId::ANONYMOUS,
+            stratification: None,
         }
     }
 
@@ -368,12 +433,13 @@ impl Engine {
     /// Rules are grouped into strongly connected components and processed in
     /// topological order. Each SCC runs to fixpoint before dependent SCCs begin.
     pub fn run(&mut self, program: &Program) {
-        let sccs = compute_rule_sccs(program);
-        let compiled: Vec<CRule> = program
-            .rules
-            .iter()
-            .map(|r| compile_rule(r, &self.var_interner))
-            .collect();
+        self.ensure_stratification(program);
+        let strat = self.stratification.as_ref().unwrap();
+
+        // Clone the SCC indices to avoid borrow conflict with self.
+        let sccs: Vec<Vec<usize>> = strat.sccs.clone();
+        let compiled: Vec<CRule> = strat.compiled.clone();
+
         self.var_count = self.var_interner.len();
         for scc_indices in &sccs {
             let rules: Vec<&CRule> = scc_indices.iter().map(|&i| &compiled[i]).collect();
@@ -386,11 +452,90 @@ impl Engine {
         }
     }
 
+    /// Run only the strata affected by changes to the given "dirty" relations.
+    ///
+    /// Walks the SCC DAG in topological order. For each SCC whose reads
+    /// intersect the current dirty set, clears its output relations and
+    /// re-runs the stratum to fixpoint. Newly written relations propagate
+    /// as dirty to downstream strata.
+    ///
+    /// Returns the set of all relation names that were re-derived.
+    pub fn run_incremental(
+        &mut self,
+        program: &Program,
+        dirty: &FxHashSet<String>,
+    ) -> FxHashSet<String> {
+        if dirty.is_empty() {
+            return FxHashSet::default();
+        }
+
+        self.ensure_stratification(program);
+        let strat = self.stratification.as_ref().unwrap();
+
+        let sccs: Vec<Vec<usize>> = strat.sccs.clone();
+        let scc_reads: Vec<FxHashSet<String>> = strat.scc_reads.clone();
+        let scc_writes: Vec<FxHashSet<String>> = strat.scc_writes.clone();
+        let compiled: Vec<CRule> = strat.compiled.clone();
+
+        self.var_count = self.var_interner.len();
+
+        // Phase 1: identify all dirty SCCs via forward propagation through the DAG.
+        let mut dirty_sccs = vec![false; sccs.len()];
+        let mut current_dirty = dirty.clone();
+        for (scc_idx, _) in sccs.iter().enumerate() {
+            if scc_reads[scc_idx].iter().any(|r| current_dirty.contains(r)) {
+                dirty_sccs[scc_idx] = true;
+                for rel_name in &scc_writes[scc_idx] {
+                    current_dirty.insert(rel_name.clone());
+                }
+            }
+        }
+
+        // Phase 2: clear all output relations of dirty SCCs (once, before any re-run).
+        let mut all_rederived = FxHashSet::default();
+        for (scc_idx, _) in sccs.iter().enumerate() {
+            if !dirty_sccs[scc_idx] {
+                continue;
+            }
+            for rel_name in &scc_writes[scc_idx] {
+                if let Some(rel) = self.relations.get_mut(rel_name) {
+                    rel.clear();
+                }
+                all_rederived.insert(rel_name.clone());
+            }
+        }
+
+        // Phase 3: re-run dirty SCCs in topological order.
+        for (scc_idx, scc_indices) in sccs.iter().enumerate() {
+            if !dirty_sccs[scc_idx] {
+                continue;
+            }
+            let rules: Vec<&CRule> = scc_indices.iter().map(|&i| &compiled[i]).collect();
+            self.run_stratum(&rules);
+        }
+
+        // Clear recent/delta so stale data doesn't confuse the next run.
+        for rel in self.relations.values_mut() {
+            rel.clear_recent();
+        }
+
+        all_rederived
+    }
+
+    /// Ensure the stratification cache is populated.
+    fn ensure_stratification(&mut self, program: &Program) {
+        if self.stratification.is_none() {
+            self.stratification = Some(Stratification::build(program, &self.var_interner));
+        }
+    }
+
     /// Sync the engine's relation registry with a (potentially changed) program.
     ///
     /// Creates storage for new relations without disturbing existing ones.
     /// Existing relation data is preserved for incremental re-evaluation.
+    /// Invalidates the cached stratification so it is rebuilt on next run.
     pub fn update_program(&mut self, program: &Program) {
+        self.stratification = None;
         for (name, rel) in &program.relations {
             let arity = rel.column_types.len();
             self.relations
@@ -2466,5 +2611,124 @@ mod tests {
             assert!(unwrapped.contains(&[Value::I32(1), Value::I32(10), Value::I32(20)]));
             assert!(unwrapped.contains(&[Value::I32(2), Value::I32(30), Value::I32(40)]));
         }
+    }
+
+    // ─── Incremental re-evaluation tests ────────────────────────────
+
+    #[test]
+    fn test_run_incremental_empty_dirty_set_is_noop() {
+        let input = r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- edge(x, y), path(y, z);
+        "#;
+        let ast: AscentProgram = syn::parse_str(input).unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
+        engine.run(&program);
+
+        let rederived = engine.run_incremental(&program, &FxHashSet::default());
+        assert!(rederived.is_empty());
+        // path should still have its data
+        assert_eq!(engine.relation("path").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_run_incremental_retract_and_rederive() {
+        let input = r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- edge(x, y), path(y, z);
+        "#;
+        let ast: AscentProgram = syn::parse_str(input).unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+
+        let src = engine.intern_source("initial");
+        engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], src);
+        engine.insert_with_source("edge", vec![Value::I32(2), Value::I32(3)], src);
+        engine.run(&program);
+        assert_eq!(engine.relation("path").unwrap().len(), 3); // (1,2), (2,3), (1,3)
+
+        // Retract and add different edges
+        engine.retract_source(src);
+        let src2 = engine.intern_source("updated");
+        engine.insert_with_source("edge", vec![Value::I32(10), Value::I32(20)], src2);
+
+        let dirty = FxHashSet::from_iter(["edge".to_string()]);
+        let rederived = engine.run_incremental(&program, &dirty);
+
+        assert!(rederived.contains("path"));
+        let path = engine.relation("path").unwrap();
+        assert_eq!(path.len(), 1);
+        assert!(path.contains(&[Value::I32(10), Value::I32(20)]));
+    }
+
+    #[test]
+    fn test_run_incremental_multi_level_propagation() {
+        // A → B → C chain: dirtying A should re-derive B and C
+        let input = r#"
+            relation a(i32);
+            relation b(i32);
+            relation c(i32);
+            relation unrelated(i32);
+            b(x) <-- a(x);
+            c(x) <-- b(x);
+            unrelated(42);
+        "#;
+        let ast: AscentProgram = syn::parse_str(input).unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        engine.insert("a", vec![Value::I32(1)]);
+        engine.run(&program);
+
+        assert_eq!(engine.relation("b").unwrap().len(), 1);
+        assert_eq!(engine.relation("c").unwrap().len(), 1);
+        assert_eq!(engine.relation("unrelated").unwrap().len(), 1);
+
+        // Change a's contents
+        engine.relation_mut("a").unwrap().clear();
+        engine.insert("a", vec![Value::I32(2)]);
+        engine.insert("a", vec![Value::I32(3)]);
+
+        let dirty = FxHashSet::from_iter(["a".to_string()]);
+        let rederived = engine.run_incremental(&program, &dirty);
+
+        assert!(rederived.contains("b"));
+        assert!(rederived.contains("c"));
+        // unrelated should NOT be in rederived
+        assert!(!rederived.contains("unrelated"));
+
+        let b = engine.relation("b").unwrap();
+        assert_eq!(b.len(), 2);
+        assert!(b.contains(&[Value::I32(2)]));
+        assert!(b.contains(&[Value::I32(3)]));
+
+        let c = engine.relation("c").unwrap();
+        assert_eq!(c.len(), 2);
+
+        // unrelated should still have its original data
+        assert_eq!(engine.relation("unrelated").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_run_incremental_returns_affected_relations() {
+        let input = r#"
+            relation src(i32);
+            relation derived(i32);
+            derived(x) <-- src(x);
+        "#;
+        let ast: AscentProgram = syn::parse_str(input).unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        engine.insert("src", vec![Value::I32(1)]);
+        engine.run(&program);
+
+        let dirty = FxHashSet::from_iter(["src".to_string()]);
+        let rederived = engine.run_incremental(&program, &dirty);
+        assert_eq!(rederived, FxHashSet::from_iter(["derived".to_string()]));
     }
 }
