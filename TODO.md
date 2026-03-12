@@ -93,7 +93,7 @@ Steps 1–2 are representation changes. Step 3 is the highest-value item for LSP
    - [x] Incremental addition — insert new facts as deltas, re-run affected strata from deltas only (monotone strata)
    - [x] Non-monotone strata re-derivation — clear and re-derive strata containing negation/aggregation when inputs change
 4. [x] Bytecode compiler for expressions — compile `CExpr` to a flat bytecode with a tight eval loop (LOAD_VAR, LOAD_CONST, ADD, CMP_EQ, etc.). Replaces tree-walk `eval_expr`. Can be worked in parallel with step 3.
-5. [ ] Arity-specialized eval routines (feature-gated: `specialized`) — at rule load time, classify relations by type signature. All-u32 relations with arity 2–6 dispatch to monomorphized `[u32; N]` join/insert/dedup routines (stamped out via macro). Mixed/wide relations fall back to generic `Vec<Value>` path. Bridges flat storage and JIT — covers ~95% of symbol graph relations without cranelift.
+5. [x] Arity-specialized eval routines (feature-gated: `specialized`) — at rule load time, classify relations by type signature. Relations with all u32-representable columns (i32, u32, String, bool) use `PackedStorage` with dual-buffer layout: u32 flat buffer for fast dedup/index, Value buffer for eval loop reads. Graceful downgrade to generic on type mismatch. Mixed/wide relations fall back to generic `Vec<Value>` path.
 6. [ ] Cranelift JIT (feature-gated: `jit`) — compile rule bodies to native code. Inner join/filter loops become typed loads, index lookups, inserts with no interpretation overhead. Semi-naive loop and stratification stay as-is.
 
 ### Not planned

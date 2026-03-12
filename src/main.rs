@@ -10,7 +10,7 @@ use std::io::{self, BufRead, Write};
 use std::{env, fs};
 
 use ascent_eval::value::Value;
-use ascent_eval::{Engine, RelationStorage};
+use ascent_eval::{Engine, Relation};
 use ascent_ir::Program;
 use ascent_syntax::AscentProgram;
 
@@ -305,7 +305,7 @@ fn show_changes(engine: &Engine, program: &Program, prev_counts: &mut HashMap<St
     names.sort();
 
     for name in names {
-        let count = engine.relation(name).map_or(0, RelationStorage::len);
+        let count = engine.relation(name).map_or(0, Relation::len);
         let prev = prev_counts.get(name).copied().unwrap_or(0);
         prev_counts.insert(name.to_string(), count);
 
@@ -330,7 +330,7 @@ fn list_relations(engine: &Engine, program: &Program) {
     names.sort();
 
     for name in names {
-        let count = engine.relation(name).map_or(0, RelationStorage::len);
+        let count = engine.relation(name).map_or(0, Relation::len);
         println!(
             "  {name}: {count} tuple{}",
             if count == 1 { "" } else { "s" }
@@ -406,7 +406,7 @@ fn matches_pattern(value: &Value, pat: &QueryPat) -> bool {
     }
 }
 
-fn print_filtered(name: &str, rel: &RelationStorage, pats: &[QueryPat]) {
+fn print_filtered(name: &str, rel: &Relation, pats: &[QueryPat]) {
     let mut tuples: Vec<&[Value]> = rel
         .iter()
         .filter(|tuple| {
@@ -459,7 +459,7 @@ fn dump_all(engine: &Engine, program: &Program) {
     }
 }
 
-fn print_tuples(name: &str, rel: &RelationStorage) {
+fn print_tuples(name: &str, rel: &Relation) {
     println!(
         "{name} ({} tuple{}):",
         rel.len(),

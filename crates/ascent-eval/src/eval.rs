@@ -14,7 +14,7 @@ use crate::compiled::{
     compile_rule, eval_cexpr,
 };
 use crate::expr::{eval_expr, expand_range};
-use crate::relation::{RelationStorage, SourceId};
+use crate::relation::{Relation, SourceId};
 use crate::value::{DynValue, Tuple, Value};
 
 /// Interned variable identifier (u32 index instead of String).
@@ -254,7 +254,7 @@ impl Stratification {
 #[derive(Debug)]
 pub struct Engine {
     /// Storage for each relation.
-    relations: FxHashMap<String, RelationStorage>,
+    relations: FxHashMap<String, Relation>,
     /// Declared column types per relation (primitive type name, or None for complex types).
     col_types: FxHashMap<String, Vec<Option<String>>>,
     /// Registry of custom type constructors.
@@ -281,10 +281,6 @@ impl Engine {
 
         for (name, rel) in &program.relations {
             let arity = rel.column_types.len();
-            relations.insert(
-                name.clone(),
-                RelationStorage::with_lattice(arity, rel.is_lattice),
-            );
             let types: Vec<Option<String>> = rel
                 .column_types
                 .iter()
@@ -296,6 +292,10 @@ impl Engine {
                     }
                 })
                 .collect();
+            relations.insert(
+                name.clone(),
+                Relation::new_auto(arity, rel.is_lattice, &types),
+            );
             col_types.insert(name.clone(), types);
         }
 
@@ -361,12 +361,12 @@ impl Engine {
     }
 
     /// Get a relation by name.
-    pub fn relation(&self, name: &str) -> Option<&RelationStorage> {
+    pub fn relation(&self, name: &str) -> Option<&Relation> {
         self.relations.get(name)
     }
 
     /// Get a mutable relation by name.
-    pub fn relation_mut(&mut self, name: &str) -> Option<&mut RelationStorage> {
+    pub fn relation_mut(&mut self, name: &str) -> Option<&mut Relation> {
         self.relations.get_mut(name)
     }
 
@@ -600,21 +600,21 @@ impl Engine {
         self.stratification = None;
         for (name, rel) in &program.relations {
             let arity = rel.column_types.len();
+            let types: Vec<Option<String>> = rel
+                .column_types
+                .iter()
+                .map(|ty| {
+                    if let syn::Type::Path(tp) = ty {
+                        tp.path.get_ident().map(|id| id.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             self.relations
                 .entry(name.clone())
-                .or_insert_with(|| RelationStorage::with_lattice(arity, rel.is_lattice));
-            self.col_types.entry(name.clone()).or_insert_with(|| {
-                rel.column_types
-                    .iter()
-                    .map(|ty| {
-                        if let syn::Type::Path(tp) = ty {
-                            tp.path.get_ident().map(|id| id.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            });
+                .or_insert_with(|| Relation::new_auto(arity, rel.is_lattice, &types));
+            self.col_types.entry(name.clone()).or_insert_with(|| types);
         }
     }
 

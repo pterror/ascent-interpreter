@@ -2,12 +2,18 @@
 //!
 //! Each relation maintains per-column hash indices for efficient joins.
 //! Tuples are stored in a flat contiguous buffer with stride-based access.
+//!
+//! The [`Relation`] enum wraps either a generic [`RelationStorage`] or
+//! (with the `specialized` feature) a [`PackedStorage`] for relations
+//! whose columns are all u32-representable.
 
 use std::hash::{Hash, Hasher};
 
 use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
+#[cfg(feature = "specialized")]
+use crate::specialized::{PackedStorage, try_packed_col_types};
 use crate::value::{Tuple, Value};
 
 /// Opaque identifier for a fact source (file, REPL input, module, etc.).
@@ -37,29 +43,29 @@ fn hash_tuple(tuple: &[Value]) -> u64 {
 #[derive(Debug, Clone)]
 pub struct RelationStorage {
     /// Flat tuple data buffer. Tuple `i` is at `data[i*arity..(i+1)*arity]`.
-    data: Vec<Value>,
+    pub(crate) data: Vec<Value>,
     /// Number of tuples stored (== data.len() / arity, except when arity == 0).
-    count: usize,
+    pub(crate) count: usize,
     /// Deduplication table: stores tuple indices into `data`.
-    dedup: HashTable<usize>,
+    pub(crate) dedup: HashTable<usize>,
     /// Indices of tuples added in the current iteration (delta).
-    delta: Vec<usize>,
+    pub(crate) delta: Vec<usize>,
     /// Indices of tuples from the previous iteration (for semi-naive).
-    recent: Vec<usize>,
+    pub(crate) recent: Vec<usize>,
     /// Set version of recent for O(1) membership checks.
-    recent_set: FxHashSet<usize>,
+    pub(crate) recent_set: FxHashSet<usize>,
     /// Per-column index: (column, value) → list of tuple indices.
-    indices: Vec<FxHashMap<Value, Vec<usize>>>,
+    pub(crate) indices: Vec<FxHashMap<Value, Vec<usize>>>,
     /// Per-column index for recent tuples only (rebuilt on advance).
-    recent_col_indices: Vec<FxHashMap<Value, Vec<usize>>>,
+    pub(crate) recent_col_indices: Vec<FxHashMap<Value, Vec<usize>>>,
     /// Number of columns.
-    arity: usize,
+    pub(crate) arity: usize,
     /// Whether this is a lattice relation (last column is the lattice value).
-    is_lattice: bool,
+    pub(crate) is_lattice: bool,
     /// For lattice relations: key columns hash → tuple index (for merge-by-key).
-    key_index: HashTable<usize>,
+    pub(crate) key_index: HashTable<usize>,
     /// Source tag per tuple, parallel to the flat buffer (one per tuple index).
-    source_tags: Vec<SourceId>,
+    pub(crate) source_tags: Vec<SourceId>,
 }
 
 impl Default for RelationStorage {
@@ -520,6 +526,264 @@ impl RelationStorage {
     }
 }
 
+/// Unified relation type that dispatches to either generic or packed storage.
+///
+/// Without the `specialized` feature, this is always `Generic`.
+/// With the feature, relations whose columns are all u32-representable
+/// (i32, u32, interned strings, booleans) use [`PackedStorage`] for
+/// faster dedup and index operations.
+#[derive(Debug, Clone)]
+pub enum Relation {
+    Generic(RelationStorage),
+    #[cfg(feature = "specialized")]
+    Packed(PackedStorage),
+}
+
+impl Default for Relation {
+    fn default() -> Self {
+        Relation::Generic(RelationStorage::default())
+    }
+}
+
+impl Relation {
+    /// Create a generic relation with the given arity.
+    pub fn new(arity: usize) -> Self {
+        Relation::Generic(RelationStorage::new(arity))
+    }
+
+    /// Create a generic relation with the given arity, optionally as a lattice.
+    pub fn with_lattice(arity: usize, is_lattice: bool) -> Self {
+        Relation::Generic(RelationStorage::with_lattice(arity, is_lattice))
+    }
+
+    /// Create a relation, using packed storage when all columns are u32-representable.
+    ///
+    /// Falls back to generic storage for lattice relations, zero-arity relations,
+    /// or relations with non-packable column types.
+    pub fn new_auto(arity: usize, is_lattice: bool, _col_types: &[Option<String>]) -> Self {
+        #[cfg(feature = "specialized")]
+        if !is_lattice {
+            if let Some(packed_types) = try_packed_col_types(_col_types) {
+                return Relation::Packed(PackedStorage::new(packed_types));
+            }
+        }
+        Relation::Generic(RelationStorage::with_lattice(arity, is_lattice))
+    }
+
+    /// Whether this relation uses packed storage.
+    pub fn is_packed(&self) -> bool {
+        match self {
+            Relation::Generic(_) => false,
+            #[cfg(feature = "specialized")]
+            Relation::Packed(_) => true,
+        }
+    }
+
+    pub fn arity(&self) -> usize {
+        match self {
+            Relation::Generic(r) => r.arity(),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.arity(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Relation::Generic(r) => r.is_empty(),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.is_empty(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Relation::Generic(r) => r.len(),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.len(),
+        }
+    }
+
+    pub fn insert(&mut self, tuple: Tuple) -> bool {
+        self.insert_with_source(tuple, SourceId::ANONYMOUS)
+    }
+
+    pub fn insert_with_source(&mut self, tuple: Tuple, source: SourceId) -> bool {
+        match self {
+            Relation::Generic(r) => r.insert_with_source(tuple, source),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => match p.try_insert_with_source(tuple, source) {
+                Ok(inserted) => inserted,
+                Err(tuple) => {
+                    // Type mismatch: downgrade to generic storage
+                    let packed = match std::mem::replace(self, Relation::default()) {
+                        Relation::Packed(p) => p,
+                        _ => unreachable!(),
+                    };
+                    *self = Relation::Generic(packed.into_generic());
+                    self.insert_with_source(tuple, source)
+                }
+            },
+        }
+    }
+
+    pub fn contains(&self, tuple: &[Value]) -> bool {
+        match self {
+            Relation::Generic(r) => r.contains(tuple),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.contains(tuple),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &[Value]> + '_ {
+        let (data, count, arity) = match self {
+            Relation::Generic(r) => (r.data.as_slice(), r.count, r.arity),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => (p.value_data.as_slice(), p.count, p.arity),
+        };
+        (0..count).map(move |i| &data[i * arity..(i + 1) * arity])
+    }
+
+    pub fn iter_recent(&self) -> impl Iterator<Item = &[Value]> + '_ {
+        let (data, arity, recent) = match self {
+            Relation::Generic(r) => (r.data.as_slice(), r.arity, r.recent.as_slice()),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => (p.value_data.as_slice(), p.arity, p.recent.as_slice()),
+        };
+        recent
+            .iter()
+            .map(move |&i| &data[i * arity..(i + 1) * arity])
+    }
+
+    pub fn iter_full(&self) -> impl Iterator<Item = &[Value]> + '_ {
+        let (data, count, arity) = match self {
+            Relation::Generic(r) => (r.data.as_slice(), r.count, r.arity),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => (p.value_data.as_slice(), p.count, p.arity),
+        };
+        (0..count).map(move |i| &data[i * arity..(i + 1) * arity])
+    }
+
+    pub fn lookup(&self, col: usize, value: &Value) -> &[usize] {
+        match self {
+            Relation::Generic(r) => r.lookup(col, value),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.lookup(col, value),
+        }
+    }
+
+    pub fn lookup_recent(&self, col: usize, value: &Value) -> &[usize] {
+        match self {
+            Relation::Generic(r) => r.lookup_recent(col, value),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.lookup_recent(col, value),
+        }
+    }
+
+    pub fn get(&self, idx: usize) -> &[Value] {
+        match self {
+            Relation::Generic(r) => r.get(idx),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.get(idx),
+        }
+    }
+
+    pub fn has_delta(&self) -> bool {
+        match self {
+            Relation::Generic(r) => r.has_delta(),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.has_delta(),
+        }
+    }
+
+    pub fn advance(&mut self) -> bool {
+        match self {
+            Relation::Generic(r) => r.advance(),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.advance(),
+        }
+    }
+
+    pub fn advance_peek(&mut self) -> bool {
+        match self {
+            Relation::Generic(r) => r.advance_peek(),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.advance_peek(),
+        }
+    }
+
+    pub fn set_delta_range(&mut self, start: usize) {
+        match self {
+            Relation::Generic(r) => r.set_delta_range(start),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.set_delta_range(start),
+        }
+    }
+
+    pub fn clear_recent(&mut self) {
+        match self {
+            Relation::Generic(r) => r.clear_recent(),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.clear_recent(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        match self {
+            Relation::Generic(r) => r.clear(),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.clear(),
+        }
+    }
+
+    pub fn is_recent(&self, idx: usize) -> bool {
+        match self {
+            Relation::Generic(r) => r.is_recent(idx),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.is_recent(idx),
+        }
+    }
+
+    pub fn recent_indices(&self) -> &[usize] {
+        match self {
+            Relation::Generic(r) => r.recent_indices(),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.recent_indices(),
+        }
+    }
+
+    pub fn tuple_count(&self) -> usize {
+        match self {
+            Relation::Generic(r) => r.tuple_count(),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.tuple_count(),
+        }
+    }
+
+    pub fn source_of(&self, idx: usize) -> SourceId {
+        match self {
+            Relation::Generic(r) => r.source_of(idx),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.source_of(idx),
+        }
+    }
+
+    pub fn retract_source(&mut self, source: SourceId) -> usize {
+        match self {
+            Relation::Generic(r) => r.retract_source(source),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.retract_source(source),
+        }
+    }
+
+    pub fn retract_sources(&mut self, sources: &FxHashSet<SourceId>) -> usize {
+        match self {
+            Relation::Generic(r) => r.retract_sources(sources),
+            #[cfg(feature = "specialized")]
+            Relation::Packed(p) => p.retract_sources(sources),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +922,74 @@ mod tests {
         assert!(!rel.insert(vec![])); // duplicate
         assert_eq!(rel.len(), 1);
         assert!(rel.contains(&[]));
+    }
+
+    #[test]
+    fn test_relation_new_auto_generic() {
+        // Lattice → always generic
+        let rel = Relation::new_auto(2, true, &[Some("i32".into()), Some("i32".into())]);
+        assert!(!rel.is_packed());
+    }
+
+    #[test]
+    fn test_relation_new_auto_unknown_types() {
+        // Unknown column type → generic
+        let rel = Relation::new_auto(2, false, &[Some("i32".into()), None]);
+        assert!(!rel.is_packed());
+    }
+
+    #[cfg(feature = "specialized")]
+    #[test]
+    fn test_relation_new_auto_packed() {
+        let rel = Relation::new_auto(2, false, &[Some("i32".into()), Some("i32".into())]);
+        assert!(rel.is_packed());
+    }
+
+    #[cfg(feature = "specialized")]
+    #[test]
+    fn test_relation_packed_downgrade() {
+        // Create packed relation, insert non-packable value → downgrades to generic
+        let mut rel = Relation::new_auto(2, false, &[Some("i32".into()), Some("i32".into())]);
+        assert!(rel.is_packed());
+
+        // Normal packed insert
+        assert!(rel.insert(vec![Value::I32(1), Value::I32(2)]));
+        assert!(rel.is_packed());
+
+        // Insert non-packable value → triggers downgrade
+        assert!(rel.insert(vec![Value::I32(3), Value::string("oops")]));
+        assert!(!rel.is_packed());
+
+        // All data preserved after downgrade
+        assert_eq!(rel.len(), 2);
+        assert!(rel.contains(&[Value::I32(1), Value::I32(2)]));
+        assert!(rel.contains(&[Value::I32(3), Value::string("oops")]));
+    }
+
+    #[cfg(feature = "specialized")]
+    #[test]
+    fn test_relation_packed_via_enum() {
+        // Verify the Relation enum delegates correctly to packed storage
+        let mut rel = Relation::new_auto(2, false, &[Some("i32".into()), Some("i32".into())]);
+        assert!(rel.is_packed());
+
+        rel.insert(vec![Value::I32(1), Value::I32(10)]);
+        rel.insert(vec![Value::I32(1), Value::I32(20)]);
+        rel.insert(vec![Value::I32(2), Value::I32(30)]);
+        assert_eq!(rel.len(), 3);
+
+        // Index lookup through enum
+        assert_eq!(rel.lookup(0, &Value::I32(1)).len(), 2);
+        assert_eq!(rel.lookup(0, &Value::I32(2)).len(), 1);
+
+        // Delta/advance through enum
+        assert!(rel.has_delta());
+        assert!(rel.advance());
+        assert!(!rel.has_delta());
+        assert_eq!(rel.lookup_recent(0, &Value::I32(1)).len(), 2);
+
+        // Iter through enum
+        let count = rel.iter_full().count();
+        assert_eq!(count, 3);
     }
 }

@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap;
 
 /// An interned string identifier. Copy-cheap, with O(1) equality and hashing.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SymbolId(u32);
+pub struct SymbolId(pub(crate) u32);
 
 impl fmt::Debug for SymbolId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

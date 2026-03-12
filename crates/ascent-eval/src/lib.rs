@@ -42,8 +42,10 @@ pub mod intern;
 mod relation;
 #[cfg(feature = "serde")]
 pub mod serde_bridge;
+#[cfg(feature = "specialized")]
+mod specialized;
 pub mod value;
 
 pub use eval::{Bindings, Engine, TypeRegistry, ValueDestructor, VarId, VarInterner};
-pub use relation::{RelationStorage, SourceId};
+pub use relation::{Relation, RelationStorage, SourceId};
 pub use value::{DynValue, Tuple, Value};
