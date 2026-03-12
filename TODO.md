@@ -89,7 +89,7 @@ Steps 1–2 are representation changes. Step 3 is the highest-value item for LSP
 3. [ ] Incremental evaluation — highest value for LSP; after interning, diffing facts is cheap `[u32; N]` comparison.
    - [x] Persist engine state across queries (don't rebuild relations from scratch)
    - [x] Source-tagged facts — tag facts with `SourceId`, bulk retract/re-assert by source (files, modules, REPL lines, etc.)
-   - [ ] Strata invalidation — given changed relation names, identify and re-run only affected strata
+   - [x] Strata invalidation — given changed relation names, identify and re-run only affected strata
    - [ ] Incremental addition — insert new facts as deltas, re-run affected strata from deltas only (monotone strata)
    - [ ] Non-monotone strata re-derivation — clear and re-derive strata containing negation/aggregation when inputs change
 4. [ ] Bytecode compiler for expressions — compile `CExpr` to a flat bytecode with a tight eval loop (LOAD_VAR, LOAD_CONST, ADD, CMP_EQ, etc.). Replaces tree-walk `eval_expr`. Can be worked in parallel with step 3.
