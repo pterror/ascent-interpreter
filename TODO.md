@@ -87,7 +87,7 @@ Steps 1–2 are representation changes. Step 3 is the highest-value item for LSP
 1. [x] String interning — thread-local intern table, `Value::String(SymbolId)` where `SymbolId` is `u32`. Equality/hashing are integer ops; cloning is Copy. Lexicographic ordering resolves through the interner.
 2. [x] Flat tuple storage — `Vec<Value>` flat buffer with stride-based access + `hashbrown::HashTable<usize>` for allocation-free dedup. Eliminates per-tuple heap allocations.
 3. [ ] Incremental evaluation — highest value for LSP; after interning, diffing facts is cheap `[u32; N]` comparison.
-   - [ ] Persist engine state across queries (don't rebuild relations from scratch)
+   - [x] Persist engine state across queries (don't rebuild relations from scratch)
    - [ ] File-scoped fact sets — tag base facts with source file, bulk retract/re-assert on file change
    - [ ] Strata invalidation — given changed relation names, identify and re-run only affected strata
    - [ ] Incremental addition — insert new facts as deltas, re-run affected strata from deltas only (monotone strata)
