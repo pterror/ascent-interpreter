@@ -78,11 +78,27 @@ building a compiler (Cranelift/native codegen), which is a different project.
 
 - [x] Rule body pipeline without intermediate Vec<Bindings> (recursive streaming with undo log)
 
-### Diminishing returns (not planned)
+### Next-gen performance (targeting LSP-grade incremental queries)
 
-- ~Expression compilation~ — CExpr already flattened syn::Expr; typical Datalog expressions are trivial, not the bottleneck
+Goal: close the 6–52x gap with compiled ascent; enable >>60fps incremental evaluation on symbol graphs.
+
+Steps 1–2 are representation changes. Step 3 is the highest-value item for LSP (process the delta, not the world). Steps 4–6 are throughput optimizations, largely orthogonal to step 3.
+
+1. [ ] String interning — global intern table, symbols become `u32`, comparisons/hashing go from `Arc<str>` → integer ops. Touches `Value`, `RelationStorage`, expression eval.
+2. [ ] Flat tuple storage — relations with known arity/types use `Vec<[InternedValue; N]>` or columnar layout instead of `Vec<Vec<Value>>`. Requires type info from relation declarations.
+3. [ ] Incremental evaluation — highest value for LSP; after interning, diffing facts is cheap `[u32; N]` comparison.
+   - [ ] Persist engine state across queries (don't rebuild relations from scratch)
+   - [ ] File-scoped fact sets — tag base facts with source file, bulk retract/re-assert on file change
+   - [ ] Strata invalidation — given changed relation names, identify and re-run only affected strata
+   - [ ] Incremental addition — insert new facts as deltas, re-run affected strata from deltas only (monotone strata)
+   - [ ] Non-monotone strata re-derivation — clear and re-derive strata containing negation/aggregation when inputs change
+4. [ ] Bytecode compiler for expressions — compile `CExpr` to a flat bytecode with a tight eval loop (LOAD_VAR, LOAD_CONST, ADD, CMP_EQ, etc.). Replaces tree-walk `eval_expr`. Can be worked in parallel with step 3.
+5. [ ] Arity-specialized eval routines (feature-gated: `specialized`) — at rule load time, classify relations by type signature. All-u32 relations with arity 2–6 dispatch to monomorphized `[u32; N]` join/insert/dedup routines (stamped out via macro). Mixed/wide relations fall back to generic `Vec<Value>` path. Bridges flat storage and JIT — covers ~95% of symbol graph relations without cranelift.
+6. [ ] Cranelift JIT (feature-gated: `jit`) — compile rule bodies to native code. Inner join/filter loops become typed loads, index lookups, inserts with no interpretation overhead. Semi-naive loop and stratification stay as-is.
+
+### Not planned
+
 - ~Parallel SCC evaluation~ — strata are sequential by definition; intra-stratum parallelism is a research problem
-- ~Cranelift backend / native codegen~ — effectively building a compiler; different project
 
 ## Testing
 
