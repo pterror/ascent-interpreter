@@ -8,6 +8,7 @@
 use ascent_ir::{Aggregation, BodyItem, Clause, ClauseArg, Condition, Generator, Rule};
 use rustc_hash::FxHashSet;
 
+use crate::bytecode::{BytecodeProgram, eval_bytecode, try_compile_to_bytecode};
 use crate::eval::{Bindings, TypeRegistry, VarId, VarInterner};
 use crate::expr::{eval_expr, eval_expr_with_registry, eval_lit};
 use crate::value::Value;
@@ -49,6 +50,8 @@ pub(crate) enum CExpr {
     Cast(Box<CExpr>, String),
     /// Array expression (evaluated as tuple).
     Array(Vec<CExpr>),
+    /// Flat bytecode for complex expressions (eliminates recursive tree-walk).
+    Bytecode(BytecodeProgram),
     /// Fallback: expressions not yet compiled (blocks, if-let, etc).
     Dynamic(syn::Expr),
 }
@@ -291,6 +294,7 @@ fn cexpr_vars_defined(expr: &CExpr, defined: &FxHashSet<VarId>) -> bool {
         CExpr::MethodCall(recv, _, args) => {
             cexpr_vars_defined(recv, defined) && args.iter().all(|a| cexpr_vars_defined(a, defined))
         }
+        CExpr::Bytecode(bc) => bc.referenced_vars.iter().all(|id| defined.contains(id)),
         CExpr::Dynamic(_) => false,
     }
 }
@@ -337,6 +341,11 @@ fn cexpr_referenced_vars(expr: &CExpr, vars: &mut FxHashSet<VarId>) {
                 cexpr_referenced_vars(a, vars);
             }
         }
+        CExpr::Bytecode(bc) => {
+            for id in &bc.referenced_vars {
+                vars.insert(*id);
+            }
+        }
         CExpr::Dynamic(_) => {} // conservative: unknown vars
     }
 }
@@ -359,6 +368,7 @@ fn cexpr_has_dynamic(expr: &CExpr) -> bool {
         CExpr::MethodCall(recv, _, args) => {
             cexpr_has_dynamic(recv) || args.iter().any(cexpr_has_dynamic)
         }
+        CExpr::Bytecode(_) => false,
     }
 }
 
@@ -504,7 +514,19 @@ fn optimize_body(body: Vec<CBodyItem>) -> Vec<CBodyItem> {
 }
 
 /// Compile a syn expression into the flat CExpr representation.
+///
+/// Complex expressions (nested Binary/Unary trees) are additionally compiled
+/// to bytecode for flat evaluation without recursive function calls.
 pub(crate) fn compile_expr(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
+    let cexpr = compile_expr_inner(expr, interner);
+    // Try to compile complex expressions to bytecode
+    if let Some(bytecode) = try_compile_to_bytecode(&cexpr) {
+        return CExpr::Bytecode(bytecode);
+    }
+    cexpr
+}
+
+fn compile_expr_inner(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
     match expr {
         syn::Expr::Lit(lit) => match eval_lit(&lit.lit) {
             Some(val) => CExpr::Literal(val),
@@ -524,8 +546,8 @@ pub(crate) fn compile_expr(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
         }
         syn::Expr::Binary(bin) => match compile_binop(&bin.op) {
             Some(op) => {
-                let left = compile_expr(&bin.left, interner);
-                let right = compile_expr(&bin.right, interner);
+                let left = compile_expr_inner(&bin.left, interner);
+                let right = compile_expr_inner(&bin.right, interner);
                 // Specialize common patterns to avoid recursive eval_cexpr calls
                 match (&left, &right) {
                     (CExpr::Var(a), CExpr::Var(b)) => CExpr::VarBinVar(op, *a, *b),
@@ -545,7 +567,7 @@ pub(crate) fn compile_expr(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
         },
         syn::Expr::Unary(u) => match compile_unop(&u.op) {
             Some(op) => {
-                let inner = compile_expr(&u.expr, interner);
+                let inner = compile_expr_inner(&u.expr, interner);
                 // Specialize `*var` (deref of variable — identity in Datalog)
                 if matches!(op, CUnOp::Deref)
                     && let CExpr::Var(id) = inner
@@ -556,14 +578,17 @@ pub(crate) fn compile_expr(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
             }
             None => CExpr::Dynamic(expr.clone()),
         },
-        syn::Expr::Paren(p) => compile_expr(&p.expr, interner),
-        syn::Expr::Reference(r) => compile_expr(&r.expr, interner),
+        syn::Expr::Paren(p) => compile_expr_inner(&p.expr, interner),
+        syn::Expr::Reference(r) => compile_expr_inner(&r.expr, interner),
         syn::Expr::Range(r) => {
             let start = r
                 .start
                 .as_ref()
-                .map(|e| Box::new(compile_expr(e, interner)));
-            let end = r.end.as_ref().map(|e| Box::new(compile_expr(e, interner)));
+                .map(|e| Box::new(compile_expr_inner(e, interner)));
+            let end = r
+                .end
+                .as_ref()
+                .map(|e| Box::new(compile_expr_inner(e, interner)));
             match (start, end) {
                 (Some(s), Some(e)) => CExpr::Range {
                     start: s,
@@ -573,9 +598,12 @@ pub(crate) fn compile_expr(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
                 _ => CExpr::Dynamic(expr.clone()),
             }
         }
-        syn::Expr::Tuple(t) => {
-            CExpr::Tuple(t.elems.iter().map(|e| compile_expr(e, interner)).collect())
-        }
+        syn::Expr::Tuple(t) => CExpr::Tuple(
+            t.elems
+                .iter()
+                .map(|e| compile_expr_inner(e, interner))
+                .collect(),
+        ),
         syn::Expr::Call(call) => {
             if let syn::Expr::Path(p) = &*call.func {
                 let name = p
@@ -587,7 +615,7 @@ pub(crate) fn compile_expr(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
                 let args: Vec<CExpr> = call
                     .args
                     .iter()
-                    .map(|a| compile_expr(a, interner))
+                    .map(|a| compile_expr_inner(a, interner))
                     .collect();
                 CExpr::Call(name, args)
             } else {
@@ -595,9 +623,13 @@ pub(crate) fn compile_expr(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
             }
         }
         syn::Expr::MethodCall(mc) => {
-            let receiver = compile_expr(&mc.receiver, interner);
+            let receiver = compile_expr_inner(&mc.receiver, interner);
             let method = mc.method.to_string();
-            let args: Vec<CExpr> = mc.args.iter().map(|a| compile_expr(a, interner)).collect();
+            let args: Vec<CExpr> = mc
+                .args
+                .iter()
+                .map(|a| compile_expr_inner(a, interner))
+                .collect();
             CExpr::MethodCall(Box::new(receiver), method, args)
         }
         syn::Expr::Cast(cast) => {
@@ -608,7 +640,7 @@ pub(crate) fn compile_expr(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
                     .last()
                     .map(|s| s.ident.to_string())
                     .unwrap_or_default();
-                CExpr::Cast(Box::new(compile_expr(&cast.expr, interner)), target)
+                CExpr::Cast(Box::new(compile_expr_inner(&cast.expr, interner)), target)
             } else {
                 CExpr::Dynamic(expr.clone())
             }
@@ -616,7 +648,7 @@ pub(crate) fn compile_expr(expr: &syn::Expr, interner: &VarInterner) -> CExpr {
         syn::Expr::Array(arr) => CExpr::Array(
             arr.elems
                 .iter()
-                .map(|e| compile_expr(e, interner))
+                .map(|e| compile_expr_inner(e, interner))
                 .collect(),
         ),
         // Block, If, IfLet, etc. fall back to dynamic evaluation
@@ -795,6 +827,7 @@ pub(crate) fn eval_cexpr(
                 .collect();
             vals.map(Value::tuple)
         }
+        CExpr::Bytecode(bc) => eval_bytecode(bc, bindings),
         CExpr::Dynamic(expr) => match registry {
             Some(reg) => eval_expr_with_registry(expr, bindings, reg, interner),
             None => eval_expr(expr, bindings, interner),
@@ -802,7 +835,7 @@ pub(crate) fn eval_cexpr(
     }
 }
 
-fn eval_binary_op(op: CBinOp, left: &Value, right: &Value) -> Option<Value> {
+pub(crate) fn eval_binary_op(op: CBinOp, left: &Value, right: &Value) -> Option<Value> {
     // Fast path for i32 operands (the most common case in Datalog programs).
     // Avoids double dispatch through Value method + 14-way type match.
     if let (&Value::I32(l), &Value::I32(r)) = (left, right) {
