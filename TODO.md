@@ -84,7 +84,7 @@ Goal: close the 6–52x gap with compiled ascent; enable >>60fps incremental eva
 
 Steps 1–2 are representation changes. Step 3 is the highest-value item for LSP (process the delta, not the world). Steps 4–6 are throughput optimizations, largely orthogonal to step 3.
 
-1. [ ] String interning — global intern table, symbols become `u32`, comparisons/hashing go from `Arc<str>` → integer ops. Touches `Value`, `RelationStorage`, expression eval.
+1. [x] String interning — thread-local intern table, `Value::String(SymbolId)` where `SymbolId` is `u32`. Equality/hashing are integer ops; cloning is Copy. Lexicographic ordering resolves through the interner.
 2. [ ] Flat tuple storage — relations with known arity/types use `Vec<[InternedValue; N]>` or columnar layout instead of `Vec<Vec<Value>>`. Requires type info from relation declarations.
 3. [ ] Incremental evaluation — highest value for LSP; after interning, diffing facts is cheap `[u32; N]` comparison.
    - [ ] Persist engine state across queries (don't rebuild relations from scratch)
