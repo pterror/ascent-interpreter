@@ -191,6 +191,9 @@ struct Stratification {
     scc_writes: Vec<FxHashSet<String>>,
     /// Compiled rules (indexed by original rule index in the program).
     compiled: Vec<CRule>,
+    /// Whether each SCC is monotone (no negation).
+    /// Monotone SCCs can use delta-only incremental evaluation on pure additions.
+    scc_is_monotone: Vec<bool>,
 }
 
 impl Stratification {
@@ -206,9 +209,12 @@ impl Stratification {
         let mut scc_reads = Vec::with_capacity(sccs.len());
         let mut scc_writes = Vec::with_capacity(sccs.len());
 
+        let mut scc_is_monotone = Vec::with_capacity(sccs.len());
+
         for scc_indices in &sccs {
             let mut reads = FxHashSet::default();
             let mut writes = FxHashSet::default();
+            let mut monotone = true;
             for &rule_idx in scc_indices {
                 let rule = &compiled[rule_idx];
                 for item in &rule.body {
@@ -218,6 +224,9 @@ impl Stratification {
                         }
                         CBodyItem::Aggregation(a) => {
                             reads.insert(a.relation.clone());
+                            if a.aggregator_name == "not" {
+                                monotone = false;
+                            }
                         }
                         _ => {}
                     }
@@ -228,6 +237,7 @@ impl Stratification {
             }
             scc_reads.push(reads);
             scc_writes.push(writes);
+            scc_is_monotone.push(monotone);
         }
 
         Stratification {
@@ -235,6 +245,7 @@ impl Stratification {
             scc_reads,
             scc_writes,
             compiled,
+            scc_is_monotone,
         }
     }
 }
@@ -459,11 +470,17 @@ impl Engine {
     /// re-runs the stratum to fixpoint. Newly written relations propagate
     /// as dirty to downstream strata.
     ///
+    /// `retracted` lists relations that had data removed (not just added).
+    /// Monotone SCCs that only read addition-only dirty relations can use
+    /// delta-only incremental evaluation; those that read retracted relations
+    /// fall back to full clear-and-rederive.
+    ///
     /// Returns the set of all relation names that were re-derived.
     pub fn run_incremental(
         &mut self,
         program: &Program,
         dirty: &FxHashSet<String>,
+        retracted: &FxHashSet<String>,
     ) -> FxHashSet<String> {
         if dirty.is_empty() {
             return FxHashSet::default();
@@ -476,6 +493,7 @@ impl Engine {
         let scc_reads: Vec<FxHashSet<String>> = strat.scc_reads.clone();
         let scc_writes: Vec<FxHashSet<String>> = strat.scc_writes.clone();
         let compiled: Vec<CRule> = strat.compiled.clone();
+        let scc_is_monotone: Vec<bool> = strat.scc_is_monotone.clone();
 
         self.var_count = self.var_interner.len();
 
@@ -491,10 +509,31 @@ impl Engine {
             }
         }
 
-        // Phase 2: clear all output relations of dirty SCCs (once, before any re-run).
-        let mut all_rederived = FxHashSet::default();
+        // Phase 2: classify each dirty SCC as incremental (delta-only) or full (clear+rederive).
+        // An SCC needs full eval if it's non-monotone, reads a retracted relation,
+        // or reads a relation cleared by another full-eval SCC.
+        let mut needs_full_eval = vec![false; sccs.len()];
+        let mut cleared_relations: FxHashSet<String> = retracted.clone();
         for (scc_idx, _) in sccs.iter().enumerate() {
             if !dirty_sccs[scc_idx] {
+                continue;
+            }
+            if !scc_is_monotone[scc_idx]
+                || scc_reads[scc_idx]
+                    .iter()
+                    .any(|r| cleared_relations.contains(r))
+            {
+                needs_full_eval[scc_idx] = true;
+                for rel_name in &scc_writes[scc_idx] {
+                    cleared_relations.insert(rel_name.clone());
+                }
+            }
+        }
+
+        // Phase 2b: clear all output relations of full-eval SCCs (once, before any re-run).
+        let mut all_rederived = FxHashSet::default();
+        for (scc_idx, _) in sccs.iter().enumerate() {
+            if !dirty_sccs[scc_idx] || !needs_full_eval[scc_idx] {
                 continue;
             }
             for rel_name in &scc_writes[scc_idx] {
@@ -505,13 +544,36 @@ impl Engine {
             }
         }
 
-        // Phase 3: re-run dirty SCCs in topological order.
+        // Phase 3: walk dirty SCCs in topological order.
         for (scc_idx, scc_indices) in sccs.iter().enumerate() {
             if !dirty_sccs[scc_idx] {
                 continue;
             }
             let rules: Vec<&CRule> = scc_indices.iter().map(|&i| &compiled[i]).collect();
-            self.run_stratum(&rules);
+
+            if needs_full_eval[scc_idx] {
+                self.run_stratum(&rules);
+            } else {
+                // Snapshot counts of owned relations before incremental eval
+                let pre_counts: Vec<(String, usize)> = scc_writes[scc_idx]
+                    .iter()
+                    .filter_map(|name| self.relations.get(name).map(|r| (name.clone(), r.len())))
+                    .collect();
+
+                self.run_stratum_incremental(&rules, &scc_writes[scc_idx]);
+
+                // Propagate newly-derived tuples as deltas for downstream SCCs
+                for (name, old_count) in pre_counts {
+                    if let Some(rel) = self.relations.get_mut(&name)
+                        && rel.len() > old_count
+                    {
+                        rel.set_delta_range(old_count);
+                    }
+                }
+            }
+            for rel_name in &scc_writes[scc_idx] {
+                all_rederived.insert(rel_name.clone());
+            }
         }
 
         // Clear recent/delta so stale data doesn't confuse the next run.
@@ -587,6 +649,57 @@ impl Engine {
                 if rel.advance() {
                     changed = true;
                 }
+            }
+        }
+    }
+
+    /// Run a set of rules incrementally (delta-only, no initial full evaluation).
+    ///
+    /// Assumes new facts are already in `delta` on input relations.
+    /// `owned` is the set of relation names this SCC writes to.
+    /// Owned relations are advanced normally; input relations use peek-advance
+    /// so their deltas survive for downstream SCCs.
+    fn run_stratum_incremental(&mut self, rules: &[&CRule], owned: &FxHashSet<String>) {
+        if rules.is_empty() {
+            return;
+        }
+
+        // Initial advance: owned relations consume delta, input relations peek
+        let mut changed = false;
+        for (name, rel) in &mut self.relations {
+            if owned.contains(name) {
+                if rel.advance() {
+                    changed = true;
+                }
+            } else if rel.advance_peek() {
+                changed = true;
+            }
+        }
+
+        if !changed {
+            return;
+        }
+
+        // Semi-naive loop: evaluate with use_recent=true, advance, repeat
+        loop {
+            for rule in rules {
+                self.evaluate_rule(rule, true);
+            }
+
+            changed = false;
+            for (name, rel) in &mut self.relations {
+                if owned.contains(name) {
+                    if rel.advance() {
+                        changed = true;
+                    }
+                } else {
+                    // Input relations: clear recent (was peeked), don't advance again
+                    rel.clear_recent();
+                }
+            }
+
+            if !changed {
+                break;
             }
         }
     }
@@ -2629,7 +2742,8 @@ mod tests {
         engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
         engine.run(&program);
 
-        let rederived = engine.run_incremental(&program, &FxHashSet::default());
+        let rederived =
+            engine.run_incremental(&program, &FxHashSet::default(), &FxHashSet::default());
         assert!(rederived.is_empty());
         // path should still have its data
         assert_eq!(engine.relation("path").unwrap().len(), 1);
@@ -2659,7 +2773,8 @@ mod tests {
         engine.insert_with_source("edge", vec![Value::I32(10), Value::I32(20)], src2);
 
         let dirty = FxHashSet::from_iter(["edge".to_string()]);
-        let rederived = engine.run_incremental(&program, &dirty);
+        let retracted = FxHashSet::from_iter(["edge".to_string()]);
+        let rederived = engine.run_incremental(&program, &dirty, &retracted);
 
         assert!(rederived.contains("path"));
         let path = engine.relation("path").unwrap();
@@ -2695,7 +2810,8 @@ mod tests {
         engine.insert("a", vec![Value::I32(3)]);
 
         let dirty = FxHashSet::from_iter(["a".to_string()]);
-        let rederived = engine.run_incremental(&program, &dirty);
+        let retracted = FxHashSet::from_iter(["a".to_string()]);
+        let rederived = engine.run_incremental(&program, &dirty, &retracted);
 
         assert!(rederived.contains("b"));
         assert!(rederived.contains("c"));
@@ -2728,7 +2844,172 @@ mod tests {
         engine.run(&program);
 
         let dirty = FxHashSet::from_iter(["src".to_string()]);
-        let rederived = engine.run_incremental(&program, &dirty);
+        let rederived = engine.run_incremental(&program, &dirty, &FxHashSet::default());
         assert_eq!(rederived, FxHashSet::from_iter(["derived".to_string()]));
+    }
+
+    // ─── Incremental addition (delta-only) tests ─────────────────────
+
+    #[test]
+    fn test_incremental_addition_monotone_preserves_old_and_adds_new() {
+        // Monotone transitive closure: adding edges should preserve old paths
+        // and derive only new ones via delta-only evaluation.
+        let input = r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- edge(x, y), path(y, z);
+        "#;
+        let ast: AscentProgram = syn::parse_str(input).unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
+        engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
+        engine.run(&program);
+        assert_eq!(engine.relation("path").unwrap().len(), 3); // (1,2), (2,3), (1,3)
+
+        // Add a new edge — old paths should be preserved, new ones derived
+        engine.insert("edge", vec![Value::I32(3), Value::I32(4)]);
+        let dirty = FxHashSet::from_iter(["edge".to_string()]);
+        engine.run_incremental(&program, &dirty, &FxHashSet::default());
+
+        let path = engine.relation("path").unwrap();
+        // Old: (1,2), (2,3), (1,3)
+        // New: (3,4), (2,4), (1,4)
+        assert_eq!(path.len(), 6);
+        assert!(path.contains(&[Value::I32(1), Value::I32(2)]));
+        assert!(path.contains(&[Value::I32(2), Value::I32(3)]));
+        assert!(path.contains(&[Value::I32(1), Value::I32(3)]));
+        assert!(path.contains(&[Value::I32(3), Value::I32(4)]));
+        assert!(path.contains(&[Value::I32(2), Value::I32(4)]));
+        assert!(path.contains(&[Value::I32(1), Value::I32(4)]));
+    }
+
+    #[test]
+    fn test_incremental_addition_negation_clears_and_rederives() {
+        // Non-monotone SCC (contains negation) should clear and re-derive.
+        let input = r#"
+            relation node(i32);
+            relation excluded(i32);
+            relation included(i32);
+            included(x) <-- node(x), !excluded(x);
+        "#;
+        let ast: AscentProgram = syn::parse_str(input).unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        engine.insert("node", vec![Value::I32(1)]);
+        engine.insert("node", vec![Value::I32(2)]);
+        engine.insert("node", vec![Value::I32(3)]);
+        engine.run(&program);
+        assert_eq!(engine.relation("included").unwrap().len(), 3);
+
+        // Add an exclusion — negation SCC must re-derive from scratch
+        engine.insert("excluded", vec![Value::I32(2)]);
+        let dirty = FxHashSet::from_iter(["excluded".to_string()]);
+        engine.run_incremental(&program, &dirty, &FxHashSet::default());
+
+        let included = engine.relation("included").unwrap();
+        assert_eq!(included.len(), 2);
+        assert!(included.contains(&[Value::I32(1)]));
+        assert!(included.contains(&[Value::I32(3)]));
+        assert!(!included.contains(&[Value::I32(2)]));
+    }
+
+    #[test]
+    fn test_incremental_monotone_feeds_nonmonotone() {
+        // Monotone SCC A feeds non-monotone SCC B.
+        // A should use delta-only; B should clear and re-derive.
+        let input = r#"
+            relation raw(i32);
+            relation derived(i32);
+            relation excluded(i32);
+            relation filtered(i32);
+            derived(x) <-- raw(x);
+            filtered(x) <-- derived(x), !excluded(x);
+        "#;
+        let ast: AscentProgram = syn::parse_str(input).unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        engine.insert("raw", vec![Value::I32(1)]);
+        engine.insert("raw", vec![Value::I32(2)]);
+        engine.insert("excluded", vec![Value::I32(2)]);
+        engine.run(&program);
+
+        let filtered = engine.relation("filtered").unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains(&[Value::I32(1)]));
+
+        // Add more raw data — derived uses delta, filtered re-derives
+        engine.insert("raw", vec![Value::I32(3)]);
+        let dirty = FxHashSet::from_iter(["raw".to_string()]);
+        engine.run_incremental(&program, &dirty, &FxHashSet::default());
+
+        let derived = engine.relation("derived").unwrap();
+        assert_eq!(derived.len(), 3);
+
+        let filtered = engine.relation("filtered").unwrap();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.contains(&[Value::I32(1)]));
+        assert!(filtered.contains(&[Value::I32(3)]));
+    }
+
+    #[test]
+    fn test_incremental_monotone_downstream_of_nonmonotone_falls_back() {
+        // Non-monotone SCC clears relation R, monotone SCC downstream reads R.
+        // The downstream monotone SCC should fall back to full eval.
+        let input = r#"
+            relation node(i32);
+            relation excluded(i32);
+            relation kept(i32);
+            relation doubled(i32);
+            kept(x) <-- node(x), !excluded(x);
+            doubled(x) <-- kept(x);
+        "#;
+        let ast: AscentProgram = syn::parse_str(input).unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        engine.insert("node", vec![Value::I32(1)]);
+        engine.insert("node", vec![Value::I32(2)]);
+        engine.insert("node", vec![Value::I32(3)]);
+        engine.run(&program);
+        assert_eq!(engine.relation("doubled").unwrap().len(), 3);
+
+        // Exclude node 2 — kept clears (non-monotone), doubled must also re-derive
+        engine.insert("excluded", vec![Value::I32(2)]);
+        let dirty = FxHashSet::from_iter(["excluded".to_string()]);
+        engine.run_incremental(&program, &dirty, &FxHashSet::default());
+
+        let kept = engine.relation("kept").unwrap();
+        assert_eq!(kept.len(), 2);
+        let doubled = engine.relation("doubled").unwrap();
+        assert_eq!(doubled.len(), 2);
+        assert!(doubled.contains(&[Value::I32(1)]));
+        assert!(doubled.contains(&[Value::I32(3)]));
+        assert!(!doubled.contains(&[Value::I32(2)]));
+    }
+
+    #[test]
+    fn test_incremental_addition_no_change_is_noop() {
+        // If no new deltas exist in a monotone SCC, run_stratum_incremental
+        // should return immediately.
+        let input = r#"
+            relation src(i32);
+            relation dst(i32);
+            dst(x) <-- src(x);
+        "#;
+        let ast: AscentProgram = syn::parse_str(input).unwrap();
+        let program = Program::from_ast(ast);
+        let mut engine = Engine::new(&program);
+        engine.insert("src", vec![Value::I32(1)]);
+        engine.run(&program);
+        assert_eq!(engine.relation("dst").unwrap().len(), 1);
+
+        // Insert same fact again (deduplication means no actual delta)
+        engine.insert("src", vec![Value::I32(1)]);
+        let dirty = FxHashSet::from_iter(["src".to_string()]);
+        engine.run_incremental(&program, &dirty, &FxHashSet::default());
+
+        // Should still have exactly 1 tuple
+        assert_eq!(engine.relation("dst").unwrap().len(), 1);
     }
 }

@@ -337,6 +337,41 @@ impl RelationStorage {
         had_delta
     }
 
+    /// Advance delta to recent without consuming delta.
+    ///
+    /// Like `advance`, but preserves the delta so downstream strata can still
+    /// see it. Used for input relations during incremental stratum evaluation.
+    pub fn advance_peek(&mut self) -> bool {
+        let had_delta = !self.delta.is_empty();
+        self.recent = self.delta.clone();
+        self.recent_set = self.recent.iter().copied().collect();
+        for col_idx in &mut self.recent_col_indices {
+            col_idx.clear();
+        }
+        for &idx in &self.recent {
+            let start = idx * self.arity;
+            let end = start + self.arity;
+            for (col, val) in self.data[start..end].iter().enumerate() {
+                self.recent_col_indices[col]
+                    .entry(val.clone())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+        had_delta
+    }
+
+    /// Set delta to contain indices in [start..self.count).
+    ///
+    /// Used after incremental stratum evaluation to propagate newly-derived
+    /// tuples as deltas for downstream strata.
+    pub fn set_delta_range(&mut self, start: usize) {
+        self.delta.clear();
+        for i in start..self.count {
+            self.delta.push(i);
+        }
+    }
+
     /// Clear the recent set (after all rules have been evaluated).
     pub fn clear_recent(&mut self) {
         self.recent.clear();
