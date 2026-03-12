@@ -1,25 +1,35 @@
 //! Relation storage for the interpreter.
 //!
 //! Each relation maintains per-column hash indices for efficient joins.
+//! Tuples are stored in a flat contiguous buffer with stride-based access.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use std::hash::{Hash, Hasher};
+
+use hashbrown::HashTable;
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::value::{Tuple, Value};
 
-/// Maximum arity for the i32 stack-array fast path.
-const I32_FAST_PATH_MAX_ARITY: usize = 8;
+/// Compute a hash for a tuple slice using FxHasher.
+fn hash_tuple(tuple: &[Value]) -> u64 {
+    let mut hasher = FxHasher::default();
+    tuple.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Storage for a single relation with per-column indices.
-#[derive(Debug, Clone, Default)]
+///
+/// Tuples are stored in a flat `Vec<Value>` buffer. Tuple `i` occupies
+/// `data[i * arity .. (i+1) * arity]`. Deduplication uses a `HashTable<usize>`
+/// storing tuple indices, with custom hash/eq closures over the flat buffer.
+#[derive(Debug, Clone)]
 pub struct RelationStorage {
-    /// All tuples in the relation.
-    tuples: Vec<Vec<Value>>,
-    /// Deduplication set (used when `all_i32` is false).
-    seen: FxHashSet<Vec<Value>>,
-    /// Whether all tuples so far contain only `Value::I32` values.
-    all_i32: bool,
-    /// i32-specialized dedup set (used when `all_i32` is true).
-    seen_i32: FxHashSet<Vec<i32>>,
+    /// Flat tuple data buffer. Tuple `i` is at `data[i*arity..(i+1)*arity]`.
+    data: Vec<Value>,
+    /// Number of tuples stored (== data.len() / arity, except when arity == 0).
+    count: usize,
+    /// Deduplication table: stores tuple indices into `data`.
+    dedup: HashTable<usize>,
     /// Indices of tuples added in the current iteration (delta).
     delta: Vec<usize>,
     /// Indices of tuples from the previous iteration (for semi-naive).
@@ -34,8 +44,26 @@ pub struct RelationStorage {
     arity: usize,
     /// Whether this is a lattice relation (last column is the lattice value).
     is_lattice: bool,
-    /// For lattice relations: key columns → tuple index (for merge-by-key).
-    key_index: FxHashMap<Vec<Value>, usize>,
+    /// For lattice relations: key columns hash → tuple index (for merge-by-key).
+    key_index: HashTable<usize>,
+}
+
+impl Default for RelationStorage {
+    fn default() -> Self {
+        Self {
+            data: Vec::new(),
+            count: 0,
+            dedup: HashTable::new(),
+            delta: Vec::new(),
+            recent: Vec::new(),
+            recent_set: FxHashSet::default(),
+            indices: Vec::new(),
+            recent_col_indices: Vec::new(),
+            arity: 0,
+            is_lattice: false,
+            key_index: HashTable::new(),
+        }
+    }
 }
 
 impl RelationStorage {
@@ -47,10 +75,9 @@ impl RelationStorage {
     /// Create a new relation with the given arity, optionally as a lattice.
     pub fn with_lattice(arity: usize, is_lattice: bool) -> Self {
         Self {
-            tuples: Vec::new(),
-            seen: FxHashSet::default(),
-            all_i32: !is_lattice,
-            seen_i32: FxHashSet::default(),
+            data: Vec::new(),
+            count: 0,
+            dedup: HashTable::new(),
             delta: Vec::new(),
             recent: Vec::new(),
             recent_set: FxHashSet::default(),
@@ -58,8 +85,14 @@ impl RelationStorage {
             recent_col_indices: (0..arity).map(|_| FxHashMap::default()).collect(),
             arity,
             is_lattice,
-            key_index: FxHashMap::default(),
+            key_index: HashTable::new(),
         }
+    }
+
+    /// Get the slice for tuple at the given logical index.
+    #[inline]
+    fn tuple_slice(&self, idx: usize) -> &[Value] {
+        &self.data[idx * self.arity..(idx + 1) * self.arity]
     }
 
     /// Get the arity (number of columns).
@@ -69,12 +102,12 @@ impl RelationStorage {
 
     /// Check if the relation is empty.
     pub fn is_empty(&self) -> bool {
-        self.tuples.is_empty()
+        self.count == 0
     }
 
     /// Get the number of tuples.
     pub fn len(&self) -> usize {
-        self.tuples.len()
+        self.count
     }
 
     /// Insert a tuple. Returns true if data changed.
@@ -89,86 +122,68 @@ impl RelationStorage {
             return self.insert_lattice(tuple);
         }
 
-        // i32 fast path: use specialized dedup set for all-i32 tuples with arity ≤ 8
-        if self.all_i32 && self.arity <= I32_FAST_PATH_MAX_ARITY {
-            if let Some(is_new) = self.try_insert_i32(&tuple) {
-                if !is_new {
-                    return false;
-                }
-                // New tuple via i32 fast path — skip `seen`, go straight to storage
-                let idx = self.tuples.len();
-                for (col, val) in tuple.iter().enumerate() {
-                    self.indices[col].entry(val.clone()).or_default().push(idx);
-                }
-                self.tuples.push(tuple);
-                self.delta.push(idx);
-                return true;
+        // Zero-arity: at most one tuple
+        if self.arity == 0 {
+            if self.count > 0 {
+                return false;
             }
-            // Non-i32 value encountered: migrate to Value mode
-            self.migrate_to_value_mode();
+            self.count = 1;
+            self.delta.push(0);
+            return true;
         }
 
-        if !self.seen.insert(tuple.clone()) {
+        // Check for duplicate using dedup table
+        let hash = hash_tuple(&tuple);
+        let data = &self.data;
+        let arity = self.arity;
+        if self
+            .dedup
+            .find(hash, |&idx| {
+                &data[idx * arity..(idx + 1) * arity] == tuple.as_slice()
+            })
+            .is_some()
+        {
             return false;
         }
-        let idx = self.tuples.len();
-        // Update per-column indices
+
+        // New tuple: append to flat buffer
+        let idx = self.count;
         for (col, val) in tuple.iter().enumerate() {
             self.indices[col].entry(val.clone()).or_default().push(idx);
         }
-        self.tuples.push(tuple);
+        self.data.extend(tuple);
+        self.count += 1;
         self.delta.push(idx);
+
+        // Insert into dedup table
+        let data = &self.data;
+        self.dedup.insert_unique(hash, idx, |&i| {
+            hash_tuple(&data[i * arity..(i + 1) * arity])
+        });
         true
-    }
-
-    /// Try to extract i32 values from a tuple into a stack buffer.
-    /// Returns `None` if any value is not `Value::I32`.
-    fn extract_i32s(tuple: &[Value]) -> Option<[i32; I32_FAST_PATH_MAX_ARITY]> {
-        let mut buf = [0i32; I32_FAST_PATH_MAX_ARITY];
-        for (i, v) in tuple.iter().enumerate() {
-            match v {
-                Value::I32(n) => buf[i] = *n,
-                _ => return None,
-            }
-        }
-        Some(buf)
-    }
-
-    /// Try to insert using the i32 fast path.
-    /// Returns `Some(true)` if inserted, `Some(false)` if duplicate, `None` if non-i32.
-    fn try_insert_i32(&mut self, tuple: &[Value]) -> Option<bool> {
-        let buf = Self::extract_i32s(tuple)?;
-        let slice = &buf[..self.arity];
-        if self.seen_i32.contains(slice) {
-            Some(false)
-        } else {
-            self.seen_i32.insert(slice.to_vec());
-            Some(true)
-        }
-    }
-
-    /// Migrate from i32-specialized dedup to generic Value dedup.
-    /// Rebuilds `seen` from existing tuples and clears `seen_i32`.
-    fn migrate_to_value_mode(&mut self) {
-        self.all_i32 = false;
-        self.seen = self.tuples.iter().cloned().collect();
-        self.seen_i32 = FxHashSet::default();
     }
 
     /// Lattice insert: merge by key columns using lattice join on last column.
     fn insert_lattice(&mut self, tuple: Tuple) -> bool {
-        let key: Vec<Value> = tuple[..self.arity - 1].to_vec();
-        let new_lat = &tuple[self.arity - 1];
+        let last_col = self.arity - 1;
+        let key = &tuple[..last_col];
+        let new_lat = &tuple[last_col];
+        let key_hash = hash_tuple(key);
 
-        if let Some(&idx) = self.key_index.get(&key) {
+        let data = &self.data;
+        let arity = self.arity;
+
+        if let Some(&idx) = self.key_index.find(key_hash, |&idx| {
+            &data[idx * arity..idx * arity + last_col] == key
+        }) {
             // Key exists: try to merge lattice values
-            let old_lat = &self.tuples[idx][self.arity - 1];
+            let old_lat = &self.data[idx * arity + last_col];
             if let Some(joined) = old_lat.lattice_join(new_lat)
                 && joined != *old_lat
             {
                 // Lattice value changed: mutate in place
-                let last_col = self.arity - 1;
-                let old_val = std::mem::replace(&mut self.tuples[idx][last_col], joined.clone());
+                let old_val =
+                    std::mem::replace(&mut self.data[idx * arity + last_col], joined.clone());
 
                 // Update the last-column index
                 if let Some(entries) = self.indices[last_col].get_mut(&old_val) {
@@ -185,12 +200,19 @@ impl RelationStorage {
             false
         } else {
             // New key: insert fresh tuple
-            let idx = self.tuples.len();
+            let idx = self.count;
             for (col, val) in tuple.iter().enumerate() {
                 self.indices[col].entry(val.clone()).or_default().push(idx);
             }
-            self.key_index.insert(key, idx);
-            self.tuples.push(tuple);
+
+            // Insert into key_index
+            let data_ref = &self.data;
+            self.key_index.insert_unique(key_hash, idx, |&i| {
+                hash_tuple(&data_ref[i * arity..i * arity + last_col])
+            });
+
+            self.data.extend(tuple);
+            self.count += 1;
             self.delta.push(idx);
             true
         }
@@ -198,37 +220,46 @@ impl RelationStorage {
 
     /// Check if a tuple exists.
     pub fn contains(&self, tuple: &[Value]) -> bool {
+        if self.arity == 0 {
+            return self.count > 0;
+        }
+
         if self.is_lattice && self.arity > 0 {
             // For lattice relations, look up by key and check the full tuple
-            let key = &tuple[..self.arity - 1];
-            if let Some(&idx) = self.key_index.get(key) {
-                return *self.tuples[idx] == *tuple;
+            let last_col = self.arity - 1;
+            let key = &tuple[..last_col];
+            let key_hash = hash_tuple(key);
+            let data = &self.data;
+            let arity = self.arity;
+            if let Some(&idx) = self.key_index.find(key_hash, |&idx| {
+                &data[idx * arity..idx * arity + last_col] == key
+            }) {
+                return self.tuple_slice(idx) == tuple;
             }
             return false;
         }
-        // i32 fast path
-        if self.all_i32
-            && self.arity <= I32_FAST_PATH_MAX_ARITY
-            && let Some(buf) = Self::extract_i32s(tuple)
-        {
-            return self.seen_i32.contains(&buf[..self.arity]);
-        }
-        self.seen.contains(tuple)
+
+        let hash = hash_tuple(tuple);
+        let data = &self.data;
+        let arity = self.arity;
+        self.dedup
+            .find(hash, |&idx| &data[idx * arity..(idx + 1) * arity] == tuple)
+            .is_some()
     }
 
     /// Iterate over all tuples.
     pub fn iter(&self) -> impl Iterator<Item = &[Value]> {
-        self.tuples.iter().map(|t| t.as_slice())
+        (0..self.count).map(move |i| self.tuple_slice(i))
     }
 
     /// Iterate over recent tuples (from last iteration).
     pub fn iter_recent(&self) -> impl Iterator<Item = &[Value]> {
-        self.recent.iter().map(|&i| self.tuples[i].as_slice())
+        self.recent.iter().map(|&i| self.tuple_slice(i))
     }
 
     /// Iterate over all tuples (for rules that don't use semi-naive).
     pub fn iter_full(&self) -> impl Iterator<Item = &[Value]> {
-        self.tuples.iter().map(|t| t.as_slice())
+        (0..self.count).map(move |i| self.tuple_slice(i))
     }
 
     /// Look up tuples matching a value in the given column.
@@ -249,7 +280,7 @@ impl RelationStorage {
 
     /// Get a tuple by index.
     pub fn get(&self, idx: usize) -> &[Value] {
-        &self.tuples[idx]
+        self.tuple_slice(idx)
     }
 
     /// Check if there are new tuples in the delta.
@@ -267,7 +298,9 @@ impl RelationStorage {
             col_idx.clear();
         }
         for &idx in &self.recent {
-            for (col, val) in self.tuples[idx].iter().enumerate() {
+            let start = idx * self.arity;
+            let end = start + self.arity;
+            for (col, val) in self.data[start..end].iter().enumerate() {
                 self.recent_col_indices[col]
                     .entry(val.clone())
                     .or_default()
@@ -295,7 +328,7 @@ impl RelationStorage {
 
     /// Total number of tuples (for index bounds).
     pub fn tuple_count(&self) -> usize {
-        self.tuples.len()
+        self.count
     }
 }
 
@@ -380,66 +413,30 @@ mod tests {
     }
 
     #[test]
-    fn test_i32_fast_path() {
+    fn test_dedup_with_mixed_types() {
         let mut rel = RelationStorage::new(2);
-        assert!(rel.all_i32);
 
-        // Pure i32 inserts use fast path
+        // Pure i32 inserts
         assert!(rel.insert(vec![Value::I32(1), Value::I32(2)]));
-        assert!(rel.all_i32);
-        assert_eq!(rel.seen_i32.len(), 1);
-        assert!(rel.seen.is_empty()); // Value dedup set not used
-
-        // Duplicate rejected via fast path
-        assert!(!rel.insert(vec![Value::I32(1), Value::I32(2)]));
+        assert!(!rel.insert(vec![Value::I32(1), Value::I32(2)])); // duplicate
         assert_eq!(rel.len(), 1);
 
-        // Contains works via fast path
+        // Contains works
         assert!(rel.contains(&[Value::I32(1), Value::I32(2)]));
         assert!(!rel.contains(&[Value::I32(3), Value::I32(4)]));
-    }
 
-    #[test]
-    fn test_i32_migration_on_mixed_types() {
-        let mut rel = RelationStorage::new(2);
+        // Mixed types work seamlessly
+        assert!(rel.insert(vec![Value::I32(5), Value::string("hello")]));
+        assert_eq!(rel.len(), 2);
 
-        // Insert i32 tuples
-        rel.insert(vec![Value::I32(1), Value::I32(2)]);
-        rel.insert(vec![Value::I32(3), Value::I32(4)]);
-        assert!(rel.all_i32);
-        assert_eq!(rel.seen_i32.len(), 2);
+        // Dedup still works for both
+        assert!(!rel.insert(vec![Value::I32(1), Value::I32(2)]));
+        assert!(!rel.insert(vec![Value::I32(5), Value::string("hello")]));
+        assert_eq!(rel.len(), 2);
 
-        // Insert non-i32 tuple triggers migration
-        rel.insert(vec![Value::I32(5), Value::string("hello")]);
-        assert!(!rel.all_i32);
-        assert!(rel.seen_i32.is_empty());
-        assert_eq!(rel.seen.len(), 3); // All 3 tuples in Value dedup set
-        assert_eq!(rel.len(), 3);
-
-        // Contains still works after migration
+        // Contains works for both
         assert!(rel.contains(&[Value::I32(1), Value::I32(2)]));
         assert!(rel.contains(&[Value::I32(5), Value::string("hello")]));
-    }
-
-    #[test]
-    fn test_i32_migration_preserves_dedup() {
-        let mut rel = RelationStorage::new(1);
-
-        rel.insert(vec![Value::I32(1)]);
-        rel.insert(vec![Value::I32(2)]);
-
-        // Force migration
-        rel.insert(vec![Value::string("x")]);
-
-        // Duplicate after migration should still be rejected
-        assert!(!rel.insert(vec![Value::I32(1)]));
-        assert_eq!(rel.len(), 3);
-    }
-
-    #[test]
-    fn test_lattice_skips_i32_optimization() {
-        let rel = RelationStorage::with_lattice(2, true);
-        assert!(!rel.all_i32);
     }
 
     #[test]
@@ -464,5 +461,14 @@ mod tests {
         // Lookup col 0 = 99 → should return 0
         let matches = rel.lookup(0, &Value::I32(99));
         assert_eq!(matches.len(), 0);
+    }
+
+    #[test]
+    fn test_zero_arity() {
+        let mut rel = RelationStorage::new(0);
+        assert!(rel.insert(vec![]));
+        assert!(!rel.insert(vec![])); // duplicate
+        assert_eq!(rel.len(), 1);
+        assert!(rel.contains(&[]));
     }
 }

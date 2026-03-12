@@ -21,6 +21,7 @@ derive-syn-parse = "0.2"
 itertools = "0.14"
 petgraph = "0.6"
 rustc-hash = "2"
+hashbrown = "0.16"
 serde = { version = "1", features = ["derive"] }
 
 [package]
