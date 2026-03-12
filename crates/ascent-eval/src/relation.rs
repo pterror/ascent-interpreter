@@ -380,6 +380,23 @@ impl RelationStorage {
         removed
     }
 
+    /// Remove all tuples tagged with any of the given sources. Returns the number removed.
+    ///
+    /// More efficient than calling `retract_source` in a loop — does a single rebuild pass.
+    pub fn retract_sources(&mut self, sources: &rustc_hash::FxHashSet<SourceId>) -> usize {
+        let keep: Vec<bool> = self
+            .source_tags
+            .iter()
+            .map(|s| !sources.contains(s))
+            .collect();
+        let removed = keep.iter().filter(|&&k| !k).count();
+        if removed == 0 {
+            return 0;
+        }
+        self.rebuild_keeping(&keep);
+        removed
+    }
+
     /// Rebuild the relation keeping only tuples where `keep[i]` is true.
     fn rebuild_keeping(&mut self, keep: &[bool]) {
         let arity = self.arity;

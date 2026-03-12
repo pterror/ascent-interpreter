@@ -346,6 +346,23 @@ impl Engine {
         total
     }
 
+    /// Remove all facts tagged with any of the given sources from every relation.
+    /// Returns the total number of tuples removed.
+    ///
+    /// More efficient than calling `retract_source` in a loop — each relation
+    /// is rebuilt at most once regardless of how many sources are retracted.
+    pub fn retract_sources(&mut self, sources: impl IntoIterator<Item = SourceId>) -> usize {
+        let set: rustc_hash::FxHashSet<SourceId> = sources.into_iter().collect();
+        if set.is_empty() {
+            return 0;
+        }
+        let mut total = 0;
+        for rel in self.relations.values_mut() {
+            total += rel.retract_sources(&set);
+        }
+        total
+    }
+
     /// Run the program to fixpoint using semi-naive evaluation with SCC-based stratification.
     ///
     /// Rules are grouped into strongly connected components and processed in

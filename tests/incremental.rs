@@ -337,3 +337,31 @@ fn source_untagged_facts_survive_retraction() {
     let tuples = collect_rel(&engine, "node");
     assert_eq!(tuples, vec![vec![Value::I32(1)], vec![Value::I32(3)]]);
 }
+
+#[test]
+fn source_batch_retract() {
+    let src = r#"
+        relation fact(i32);
+    "#;
+    let program = parse(src);
+    let mut engine = Engine::new(&program);
+
+    let a = engine.intern_source("a");
+    let b = engine.intern_source("b");
+    let c = engine.intern_source("c");
+
+    engine.insert_with_source("fact", vec![Value::I32(1)], a);
+    engine.insert_with_source("fact", vec![Value::I32(2)], b);
+    engine.insert_with_source("fact", vec![Value::I32(3)], c);
+    engine.insert_with_source("fact", vec![Value::I32(4)], a);
+    engine.insert_with_source("fact", vec![Value::I32(5)], b);
+    assert_eq!(engine.relation("fact").unwrap().len(), 5);
+
+    // Retract a and b in one pass — single rebuild per relation
+    let removed = engine.retract_sources([a, b]);
+    assert_eq!(removed, 4);
+    assert_eq!(engine.relation("fact").unwrap().len(), 1);
+
+    let tuples = collect_rel(&engine, "fact");
+    assert_eq!(tuples, vec![vec![Value::I32(3)]]);
+}
