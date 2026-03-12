@@ -55,6 +55,11 @@ fn eval_source(source: &str) -> Result<(Engine, Program), syn::Error> {
     Ok((engine, program))
 }
 
+fn try_parse_program(source: &str) -> Result<Program, syn::Error> {
+    let ast: AscentProgram = syn::parse_str(source)?;
+    Ok(Program::from_ast(ast))
+}
+
 fn repl() {
     println!("Ascent Datalog Interpreter");
     println!("Type :help for commands, :quit to exit.\n");
@@ -63,6 +68,8 @@ fn repl() {
     let mut source = String::new();
     let mut line_buf = String::new();
     let mut prev_counts: HashMap<String, usize> = HashMap::new();
+    let mut engine: Option<Engine> = None;
+    let mut current_program: Option<Program> = None;
 
     loop {
         if line_buf.is_empty() {
@@ -101,6 +108,8 @@ fn repl() {
                 ":clear" => {
                     source.clear();
                     prev_counts.clear();
+                    engine = None;
+                    current_program = None;
                     eprintln!("(cleared)");
                 }
                 ":source" | ":src" => {
@@ -111,31 +120,31 @@ fn repl() {
                     }
                 }
                 ":dump" | ":d" => {
-                    if source.is_empty() {
+                    if let (Some(eng), Some(prog)) = (&engine, &current_program) {
+                        dump_all(eng, prog);
+                    } else {
                         eprintln!("(no program)");
-                    } else if let Ok((engine, program)) = eval_source(&source) {
-                        dump_all(&engine, &program);
                     }
                 }
                 ":query" | ":q" => {
                     if arg.is_empty() {
                         eprintln!("usage: :query <relation> or :query rel(pattern, ...)");
-                    } else if source.is_empty() {
+                    } else if let Some(eng) = &engine {
+                        query_relation(eng, arg);
+                    } else {
                         eprintln!("(no program)");
-                    } else if let Ok((engine, _)) = eval_source(&source) {
-                        query_relation(&engine, arg);
                     }
                 }
                 ":count" => {
                     if arg.is_empty() {
                         eprintln!("usage: :count <relation>");
-                    } else if source.is_empty() {
-                        eprintln!("(no program)");
-                    } else if let Ok((engine, _)) = eval_source(&source) {
-                        match engine.relation(arg) {
+                    } else if let Some(eng) = &engine {
+                        match eng.relation(arg) {
                             Some(rel) => eprintln!("  {arg}: {}", rel.len()),
                             None => eprintln!("  unknown relation: {arg}"),
                         }
+                    } else {
+                        eprintln!("(no program)");
                     }
                 }
                 ":undo" => {
@@ -146,22 +155,34 @@ fn repl() {
                         source.truncate(pos);
                         // Verify the remaining source still parses
                         if !source.trim().is_empty() {
-                            if let Err(e) = eval_source(&source) {
-                                // Restore if it breaks
-                                source.push('\n');
-                                source.push_str(&removed);
-                                eprintln!("undo failed (would break program): {e}");
-                            } else {
-                                eprintln!("(removed: {removed})");
-                                prev_counts.clear();
+                            match try_parse_program(&source) {
+                                Ok(prog) => {
+                                    // Destructive: rebuild from scratch
+                                    let mut eng = Engine::new(&prog);
+                                    eng.run(&prog);
+                                    engine = Some(eng);
+                                    current_program = Some(prog);
+                                    prev_counts.clear();
+                                    eprintln!("(removed: {removed})");
+                                }
+                                Err(e) => {
+                                    // Restore if it breaks
+                                    source.push('\n');
+                                    source.push_str(&removed);
+                                    eprintln!("undo failed (would break program): {e}");
+                                }
                             }
                         } else {
-                            eprintln!("(removed: {removed})");
+                            engine = None;
+                            current_program = None;
                             prev_counts.clear();
+                            eprintln!("(removed: {removed})");
                         }
                     } else {
                         let removed = source.trim().to_string();
                         source.clear();
+                        engine = None;
+                        current_program = None;
                         prev_counts.clear();
                         eprintln!("(removed: {removed})");
                     }
@@ -189,6 +210,16 @@ fn repl() {
                         }
                         if found {
                             source = new_source;
+                            // Destructive: rebuild from scratch
+                            if source.trim().is_empty() {
+                                engine = None;
+                                current_program = None;
+                            } else if let Ok(prog) = try_parse_program(&source) {
+                                let mut eng = Engine::new(&prog);
+                                eng.run(&prog);
+                                engine = Some(eng);
+                                current_program = Some(prog);
+                            }
                             prev_counts.clear();
                             eprintln!("(retracted: {needle})");
                         } else {
@@ -197,10 +228,10 @@ fn repl() {
                     }
                 }
                 ":relations" | ":rels" => {
-                    if source.is_empty() {
+                    if let (Some(eng), Some(prog)) = (&engine, &current_program) {
+                        list_relations(eng, prog);
+                    } else {
                         eprintln!("(no relations)");
-                    } else if let Ok((engine, program)) = eval_source(&source) {
-                        list_relations(&engine, &program);
                     }
                 }
                 _ => eprintln!("unknown command: {cmd} (type :help for commands)"),
@@ -224,10 +255,26 @@ fn repl() {
         };
         line_buf.clear();
 
-        match eval_source(&candidate) {
-            Ok((engine, program)) => {
+        match try_parse_program(&candidate) {
+            Ok(program) => {
+                match engine.as_mut() {
+                    Some(eng) => {
+                        eng.update_program(&program);
+                        eng.run(&program);
+                    }
+                    None => {
+                        let mut eng = Engine::new(&program);
+                        eng.run(&program);
+                        engine = Some(eng);
+                    }
+                }
                 source = candidate;
-                show_changes(&engine, &program, &mut prev_counts);
+                current_program = Some(program);
+                show_changes(
+                    engine.as_ref().unwrap(),
+                    current_program.as_ref().unwrap(),
+                    &mut prev_counts,
+                );
             }
             Err(e) => eprintln!("error: {e}"),
         }

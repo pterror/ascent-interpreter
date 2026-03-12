@@ -310,6 +310,36 @@ impl Engine {
             let rules: Vec<&CRule> = scc_indices.iter().map(|&i| &compiled[i]).collect();
             self.run_stratum(&rules);
         }
+
+        // Clear recent/delta so stale data doesn't confuse the next run.
+        for rel in self.relations.values_mut() {
+            rel.clear_recent();
+        }
+    }
+
+    /// Sync the engine's relation registry with a (potentially changed) program.
+    ///
+    /// Creates storage for new relations without disturbing existing ones.
+    /// Existing relation data is preserved for incremental re-evaluation.
+    pub fn update_program(&mut self, program: &Program) {
+        for (name, rel) in &program.relations {
+            let arity = rel.column_types.len();
+            self.relations
+                .entry(name.clone())
+                .or_insert_with(|| RelationStorage::with_lattice(arity, rel.is_lattice));
+            self.col_types.entry(name.clone()).or_insert_with(|| {
+                rel.column_types
+                    .iter()
+                    .map(|ty| {
+                        if let syn::Type::Path(tp) = ty {
+                            tp.path.get_ident().map(|id| id.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            });
+        }
     }
 
     /// Run a set of rules to fixpoint.
