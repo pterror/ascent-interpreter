@@ -160,6 +160,20 @@ impl PackedStorage {
         self.arity
     }
 
+    /// Look up the index for a packed u32 key in column `col`.
+    /// Used by the typed packed JIT helpers.
+    pub(crate) fn lookup_packed(&self, col: usize, key: u32, use_recent: bool) -> &[usize] {
+        if use_recent {
+            self.recent_col_indices[col]
+                .get(&key)
+                .map_or(&[], |v: &Vec<usize>| v.as_slice())
+        } else {
+            self.indices[col]
+                .get(&key)
+                .map_or(&[], |v: &Vec<usize>| v.as_slice())
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }

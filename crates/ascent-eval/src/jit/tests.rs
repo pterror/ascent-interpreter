@@ -49,6 +49,12 @@ fn assert_jit_equivalence(input: &str, facts: &[(&str, Vec<Vec<Value>>)], query_
     );
 }
 
+/// Run a program with JIT+specialized enabled, assert same results as interpreter.
+#[cfg(feature = "specialized")]
+fn assert_packed_jit_equivalence(input: &str, facts: &[(&str, Vec<Vec<Value>>)], query_rel: &str) {
+    assert_jit_equivalence(input, facts, query_rel);
+}
+
 #[test]
 fn test_jit_compiler_creation() {
     let compiler = super::JitCompiler::new();
@@ -166,5 +172,151 @@ fn test_jit_self_join() {
             ],
         )],
         "triangle",
+    );
+}
+
+// ─── Packed JIT tests ───────────────────────────────────────────────
+
+/// These test the typed packed JIT path, which requires the `specialized` feature.
+/// The packed JIT reads u32 directly from PackedStorage, bypassing Value enum.
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_single_clause_copy() {
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+            ],
+        )],
+        "path",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_transitive_closure() {
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- edge(x, y), path(y, z);
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(4)],
+            ],
+        )],
+        "path",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_triangle_detection() {
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation triangle(i32, i32, i32);
+            triangle(a, b, c) <-- edge(a, b), edge(b, c), edge(c, a);
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(1)],
+                vec![Value::I32(4), Value::I32(5)], // not part of a triangle
+            ],
+        )],
+        "triangle",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_string_relations() {
+    use crate::intern;
+    let hello = Value::String(intern::intern("hello"));
+    let world = Value::String(intern::intern("world"));
+    let foo = Value::String(intern::intern("foo"));
+    let bar = Value::String(intern::intern("bar"));
+    assert_packed_jit_equivalence(
+        r#"
+            relation src(String, String);
+            relation dst(String, String);
+            dst(x, y) <-- src(x, y);
+        "#,
+        &[(
+            "src",
+            vec![
+                vec![hello.clone(), world.clone()],
+                vec![foo.clone(), bar.clone()],
+            ],
+        )],
+        "dst",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_two_clause_join() {
+    assert_packed_jit_equivalence(
+        r#"
+            relation a(i32, i32);
+            relation b(i32, i32);
+            relation c(i32, i32);
+            c(x, z) <-- a(x, y), b(y, z);
+        "#,
+        &[
+            (
+                "a",
+                vec![
+                    vec![Value::I32(1), Value::I32(10)],
+                    vec![Value::I32(2), Value::I32(20)],
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    vec![Value::I32(10), Value::I32(100)],
+                    vec![Value::I32(20), Value::I32(200)],
+                ],
+            ),
+        ],
+        "c",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_multi_bound_columns() {
+    // Tests the secondary-column icmp check path
+    assert_packed_jit_equivalence(
+        r#"
+            relation r(i32, i32, i32);
+            relation s(i32, i32, i32);
+            s(x, y, z) <-- r(x, y, z), r(y, x, z);
+        "#,
+        &[(
+            "r",
+            vec![
+                vec![Value::I32(1), Value::I32(2), Value::I32(99)],
+                vec![Value::I32(2), Value::I32(1), Value::I32(99)], // forms a pair
+                vec![Value::I32(3), Value::I32(4), Value::I32(77)], // no match
+            ],
+        )],
+        "s",
     );
 }

@@ -769,8 +769,24 @@ impl Engine {
         // Try JIT path first
         #[cfg(feature = "jit")]
         if let Some(ref jit_cell) = self.jit {
-            // Use a dummy rule_idx based on rule pointer for caching
             let rule_idx = rule as *const CRule as usize;
+
+            // Try typed packed JIT when all clause relations are PackedStorage
+            #[cfg(feature = "specialized")]
+            {
+                let packed_compiled = {
+                    let mut jit = jit_cell.borrow_mut();
+                    jit.get_or_compile_packed(rule_idx, rule).is_some()
+                };
+                if packed_compiled {
+                    if let Some(results) = self.derive_tuples_packed_jit(rule, use_recent, rule_idx)
+                    {
+                        return results;
+                    }
+                }
+            }
+
+            // Fall back to trampoline JIT
             let compiled = {
                 let mut jit = jit_cell.borrow_mut();
                 jit.get_or_compile(rule_idx, rule).is_some()
@@ -895,6 +911,103 @@ impl Engine {
         let results: Vec<(&'a str, Tuple)> = indexed_results
             .into_iter()
             .map(|(head_idx, tuple)| (rule.heads[head_idx].relation.as_str(), tuple))
+            .collect();
+
+        Some(results)
+    }
+
+    /// Typed packed JIT path: reads u32 directly from PackedStorage.
+    ///
+    /// Returns None if any clause relation is not packed (fall through to trampoline JIT).
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    fn derive_tuples_packed_jit<'a>(
+        &self,
+        rule: &'a CRule,
+        use_recent: bool,
+        rule_idx: usize,
+    ) -> Option<Vec<(&'a str, Tuple)>> {
+        use crate::jit::packed_helpers::PackedJitContext;
+        use crate::relation::Relation;
+        use crate::specialized::PackedStorage;
+
+        // Collect PackedStorage pointers for each clause relation
+        let clause_packed: Vec<*const PackedStorage> = rule
+            .body
+            .iter()
+            .filter_map(|item| match item {
+                CBodyItem::Clause(c) => match self.relations.get(&c.relation)? {
+                    Relation::Packed(p) => Some(p as *const PackedStorage),
+                    Relation::Generic(_) => None,
+                },
+                _ => None,
+            })
+            .collect();
+
+        let clause_count = rule
+            .body
+            .iter()
+            .filter(|i| matches!(i, CBodyItem::Clause(_)))
+            .count();
+
+        // Bail if any relation is not packed
+        if clause_packed.len() != clause_count {
+            return None;
+        }
+
+        let jit = self.jit.as_ref()?.borrow();
+        let compiled = jit.packed_cache.get(&rule_idx)?.as_ref()?;
+
+        // Flat u32 binding scratch (one slot per var_id)
+        let mut bindings: Vec<u32> = vec![0u32; self.var_count];
+        let mut packed_results: Vec<(usize, Vec<u32>)> = Vec::new();
+
+        let mut ctx = PackedJitContext {
+            rels: clause_packed.as_ptr(),
+            rels_len: clause_packed.len() as u32,
+            _pad: 0,
+            bindings: bindings.as_mut_ptr(),
+            results: &mut packed_results,
+        };
+
+        if !use_recent {
+            if let Some(fn_ptr) = compiled.full_variant() {
+                unsafe { fn_ptr(&mut ctx) };
+            }
+        } else {
+            let mut clause_seq = 0;
+            for item in rule.body.iter() {
+                let rel_name = match item {
+                    CBodyItem::Clause(c) => &c.relation,
+                    _ => continue,
+                };
+                if let Some(rel) = self.relations.get(rel_name)
+                    && rel.iter_recent().next().is_some()
+                    && let Some(fn_ptr) = compiled.recent_variant(clause_seq)
+                {
+                    unsafe { fn_ptr(&mut ctx) };
+                }
+                clause_seq += 1;
+            }
+        }
+
+        // Convert packed u32 results back to (relation_name, Tuple)
+        let results: Vec<(&'a str, Tuple)> = packed_results
+            .into_iter()
+            .filter_map(|(head_idx, packed_tuple)| {
+                let head = &rule.heads[head_idx];
+                let rel_name = head.relation.as_str();
+                // Get the head relation's col_types for unpacking
+                let col_types = match self.relations.get(rel_name)? {
+                    Relation::Packed(p) => &p.col_types,
+                    Relation::Generic(_) => return None,
+                };
+                let tuple: Tuple = packed_tuple
+                    .iter()
+                    .zip(col_types.iter())
+                    .map(|(&raw, ty)| ty.unpack(raw))
+                    .collect();
+                Some((rel_name, tuple))
+            })
             .collect();
 
         Some(results)

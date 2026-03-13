@@ -7,6 +7,10 @@
 mod codegen;
 pub(crate) mod helpers;
 pub(crate) mod layout;
+#[cfg(feature = "specialized")]
+mod packed_codegen;
+#[cfg(feature = "specialized")]
+pub(crate) mod packed_helpers;
 #[cfg(test)]
 mod tests;
 
@@ -18,6 +22,8 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 use rustc_hash::FxHashMap;
 
+#[cfg(feature = "specialized")]
+use crate::compiled::CExpr;
 use crate::compiled::{CBodyItem, CCondition, CRule};
 
 pub(crate) use self::helpers::JitContext;
@@ -49,6 +55,34 @@ pub(crate) struct JitHelperIds {
     drop_value: FuncId,
 }
 
+/// IDs of packed helper functions declared in the JIT module.
+#[cfg(feature = "specialized")]
+pub(crate) struct PackedJitHelperIds {
+    pub(crate) packed_count: FuncId,
+    pub(crate) packed_data_ptr: FuncId,
+    pub(crate) packed_recent_idx: FuncId,
+    pub(crate) packed_lookup: FuncId,
+    pub(crate) packed_push_result: FuncId,
+}
+
+/// A packed-JIT compiled rule with semi-naive variants.
+#[cfg(feature = "specialized")]
+pub struct PackedJitCompiledRule {
+    /// `variants[0]` = no-recent. `variants[i+1]` = recent for clause i.
+    variants: Vec<Option<packed_helpers::PackedJitFn>>,
+}
+
+#[cfg(feature = "specialized")]
+impl PackedJitCompiledRule {
+    pub fn full_variant(&self) -> Option<packed_helpers::PackedJitFn> {
+        self.variants.first().copied().flatten()
+    }
+
+    pub fn recent_variant(&self, clause_seq_idx: usize) -> Option<packed_helpers::PackedJitFn> {
+        self.variants.get(clause_seq_idx + 1).copied().flatten()
+    }
+}
+
 /// Drop a Value in place.
 ///
 /// # Safety
@@ -72,8 +106,13 @@ pub struct JitCompiler {
     builder_ctx: FunctionBuilderContext,
     codegen_ctx: cranelift_codegen::Context,
     helpers: JitHelperIds,
-    /// Cache of compiled rules: rule_idx -> compiled (None = not eligible).
+    #[cfg(feature = "specialized")]
+    packed_helpers: PackedJitHelperIds,
+    /// Cache of trampoline-compiled rules: rule_idx -> compiled (None = not eligible).
     pub(crate) cache: FxHashMap<usize, Option<JitCompiledRule>>,
+    /// Cache of packed-compiled rules: rule_idx -> compiled (None = not eligible).
+    #[cfg(feature = "specialized")]
+    pub(crate) packed_cache: FxHashMap<usize, Option<PackedJitCompiledRule>>,
 }
 
 impl JitCompiler {
@@ -112,16 +151,181 @@ impl JitCompiler {
         );
         jit_builder.symbol("jit_drop_value", jit_drop_value as *const u8);
 
+        // Packed JIT helpers (only when specialized storage is available)
+        #[cfg(feature = "specialized")]
+        {
+            jit_builder.symbol("packed_count", packed_helpers::packed_count as *const u8);
+            jit_builder.symbol(
+                "packed_data_ptr",
+                packed_helpers::packed_data_ptr as *const u8,
+            );
+            jit_builder.symbol(
+                "packed_recent_idx",
+                packed_helpers::packed_recent_idx as *const u8,
+            );
+            jit_builder.symbol("packed_lookup", packed_helpers::packed_lookup as *const u8);
+            jit_builder.symbol(
+                "packed_push_result",
+                packed_helpers::packed_push_result as *const u8,
+            );
+        }
+
         let mut module = JITModule::new(jit_builder);
         let helpers = declare_helpers(&mut module)?;
+        #[cfg(feature = "specialized")]
+        let packed_helpers = declare_packed_helpers(&mut module)?;
 
         Ok(JitCompiler {
             module,
             builder_ctx: FunctionBuilderContext::new(),
             codegen_ctx: cranelift_codegen::Context::new(),
             helpers,
+            #[cfg(feature = "specialized")]
+            packed_helpers,
             cache: FxHashMap::default(),
+            #[cfg(feature = "specialized")]
+            packed_cache: FxHashMap::default(),
         })
+    }
+
+    /// Check if a rule is eligible for the typed packed JIT.
+    ///
+    /// Stricter than `is_eligible`: requires Clause-only body (no Conditions),
+    /// Var-only head args (for inlined emission), and Var-only clause args.
+    #[cfg(feature = "specialized")]
+    pub fn is_packed_eligible(rule: &CRule) -> bool {
+        let clause_count = rule
+            .body
+            .iter()
+            .filter(|item| matches!(item, CBodyItem::Clause(_)))
+            .count();
+        if clause_count == 0 || clause_count > 4 {
+            return false;
+        }
+        // All body items must be Clause (no Condition/Generator/Aggregation)
+        for item in &rule.body {
+            match item {
+                CBodyItem::Clause(clause) => {
+                    for arg in &clause.args {
+                        if matches!(arg, crate::compiled::CClauseArg::Expr(_)) {
+                            return false;
+                        }
+                    }
+                    if !clause.conditions.is_empty() {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        // All head args must be pure Var references
+        for head in &rule.heads {
+            for arg in &head.args {
+                if !matches!(arg, CExpr::Var(_)) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Get or compile the packed JIT variant. Returns None if not eligible.
+    #[cfg(feature = "specialized")]
+    pub fn get_or_compile_packed(
+        &mut self,
+        rule_idx: usize,
+        rule: &CRule,
+    ) -> Option<&PackedJitCompiledRule> {
+        if self.packed_cache.contains_key(&rule_idx) {
+            return self.packed_cache[&rule_idx].as_ref();
+        }
+        if !Self::is_packed_eligible(rule) {
+            self.packed_cache.insert(rule_idx, None);
+            return None;
+        }
+        match self.compile_packed_rule(rule_idx, rule) {
+            Ok(compiled) => {
+                self.packed_cache.insert(rule_idx, Some(compiled));
+                self.packed_cache[&rule_idx].as_ref()
+            }
+            Err(_) => {
+                self.packed_cache.insert(rule_idx, None);
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "specialized")]
+    fn compile_packed_rule(
+        &mut self,
+        rule_idx: usize,
+        rule: &CRule,
+    ) -> Result<PackedJitCompiledRule, String> {
+        let clause_count = rule
+            .body
+            .iter()
+            .filter(|item| matches!(item, CBodyItem::Clause(_)))
+            .count();
+
+        let mut variants = Vec::with_capacity(clause_count + 1);
+
+        let fn_ptr = self.compile_packed_variant(rule_idx, rule, None)?;
+        variants.push(Some(fn_ptr));
+
+        for (body_idx, item) in rule.body.iter().enumerate() {
+            if matches!(item, CBodyItem::Clause(_)) {
+                let fn_ptr = self.compile_packed_variant(rule_idx, rule, Some(body_idx))?;
+                variants.push(Some(fn_ptr));
+            }
+        }
+
+        Ok(PackedJitCompiledRule { variants })
+    }
+
+    #[cfg(feature = "specialized")]
+    fn compile_packed_variant(
+        &mut self,
+        rule_idx: usize,
+        rule: &CRule,
+        recent_clause_idx: Option<usize>,
+    ) -> Result<packed_helpers::PackedJitFn, String> {
+        let suffix = match recent_clause_idx {
+            None => "packed_full".to_string(),
+            Some(idx) => format!("packed_recent_{idx}"),
+        };
+        let name = format!("rule_{rule_idx}_{suffix}");
+
+        self.codegen_ctx.clear();
+        self.codegen_ctx.func = cranelift_codegen::ir::Function::new();
+
+        let ptr_type = self.module.target_config().pointer_type();
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_type));
+
+        let func_id = self
+            .module
+            .declare_function(&name, Linkage::Local, &sig)
+            .map_err(|e| format!("declare_function: {e}"))?;
+
+        self.codegen_ctx.func.signature = sig;
+
+        packed_codegen::codegen_packed_rule_body(
+            rule,
+            recent_clause_idx,
+            func_id,
+            &mut self.module,
+            &mut self.builder_ctx,
+            &mut self.codegen_ctx,
+            &self.packed_helpers,
+        )?;
+
+        self.module
+            .finalize_definitions()
+            .map_err(|e| format!("finalize: {e}"))?;
+
+        let code_ptr = self.module.get_finalized_function(func_id);
+        let fn_ptr: packed_helpers::PackedJitFn = unsafe { std::mem::transmute(code_ptr) };
+        Ok(fn_ptr)
     }
 
     /// Check if a rule is eligible for JIT compilation.
@@ -397,6 +601,71 @@ fn declare_helpers(module: &mut JITModule) -> Result<JitHelperIds, String> {
         eval_condition,
         emit_all_heads,
         drop_value,
+    })
+}
+
+/// Declare packed helper function signatures in the JIT module.
+#[cfg(feature = "specialized")]
+fn declare_packed_helpers(module: &mut JITModule) -> Result<PackedJitHelperIds, String> {
+    let ptr = module.target_config().pointer_type();
+    let cc = module.target_config().default_call_conv;
+    let map_err = |e: cranelift_module::ModuleError| format!("declare packed helper: {e}");
+
+    // packed_count(rel: ptr, use_recent: i32) -> ptr (usize)
+    let mut sig = Signature::new(cc);
+    sig.params = vec![AbiParam::new(ptr), AbiParam::new(I32)];
+    sig.returns = vec![AbiParam::new(ptr)];
+    let packed_count = module
+        .declare_function("packed_count", Linkage::Import, &sig)
+        .map_err(map_err)?;
+
+    // packed_data_ptr(rel: ptr) -> ptr (*const u32)
+    let mut sig = Signature::new(cc);
+    sig.params = vec![AbiParam::new(ptr)];
+    sig.returns = vec![AbiParam::new(ptr)];
+    let packed_data_ptr = module
+        .declare_function("packed_data_ptr", Linkage::Import, &sig)
+        .map_err(map_err)?;
+
+    // packed_recent_idx(rel: ptr, seq_idx: ptr) -> ptr (usize)
+    let mut sig = Signature::new(cc);
+    sig.params = vec![AbiParam::new(ptr), AbiParam::new(ptr)];
+    sig.returns = vec![AbiParam::new(ptr)];
+    let packed_recent_idx = module
+        .declare_function("packed_recent_idx", Linkage::Import, &sig)
+        .map_err(map_err)?;
+
+    // packed_lookup(rel: ptr, col: i32, key: i32, use_recent: i32) -> (ptr, ptr)
+    let mut sig = Signature::new(cc);
+    sig.params = vec![
+        AbiParam::new(ptr),
+        AbiParam::new(I32),
+        AbiParam::new(I32),
+        AbiParam::new(I32),
+    ];
+    sig.returns = vec![AbiParam::new(ptr), AbiParam::new(ptr)];
+    let packed_lookup = module
+        .declare_function("packed_lookup", Linkage::Import, &sig)
+        .map_err(map_err)?;
+
+    // packed_push_result(results: ptr, head_idx: ptr, tuple: ptr, arity: i32)
+    let mut sig = Signature::new(cc);
+    sig.params = vec![
+        AbiParam::new(ptr),
+        AbiParam::new(ptr),
+        AbiParam::new(ptr),
+        AbiParam::new(I32),
+    ];
+    let packed_push_result = module
+        .declare_function("packed_push_result", Linkage::Import, &sig)
+        .map_err(map_err)?;
+
+    Ok(PackedJitHelperIds {
+        packed_count,
+        packed_data_ptr,
+        packed_recent_idx,
+        packed_lookup,
+        packed_push_result,
     })
 }
 
