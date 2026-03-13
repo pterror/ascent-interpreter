@@ -319,3 +319,69 @@ fn test_packed_jit_multi_bound_columns() {
         "s",
     );
 }
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_condition_comparison() {
+    // Rule with if x > y condition on packed i32 columns
+    assert_packed_jit_equivalence(
+        r#"
+            relation r(i32, i32);
+            relation s(i32, i32);
+            s(x, y) <-- r(x, y), if x > y;
+        "#,
+        &[(
+            "r",
+            vec![
+                vec![Value::I32(5), Value::I32(3)],  // 5 > 3: included
+                vec![Value::I32(1), Value::I32(2)],  // 1 > 2: excluded
+                vec![Value::I32(4), Value::I32(4)],  // 4 > 4: excluded
+            ],
+        )],
+        "s",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_literal_clause_arg() {
+    // Rule with literal constant in clause arg: edge(0, y)
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation reachable(i32);
+            reachable(y) <-- edge(0, y);
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(0), Value::I32(10)],  // matches literal 0
+                vec![Value::I32(1), Value::I32(20)],  // doesn't match
+                vec![Value::I32(0), Value::I32(30)],  // matches literal 0
+            ],
+        )],
+        "reachable",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_arithmetic_condition() {
+    // Rule with arithmetic condition: if x + 1 == y
+    assert_packed_jit_equivalence(
+        r#"
+            relation r(i32, i32);
+            relation s(i32, i32);
+            s(x, y) <-- r(x, y), if x + 1 == y;
+        "#,
+        &[(
+            "r",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],  // 1+1==2: included
+                vec![Value::I32(3), Value::I32(4)],  // 3+1==4: included
+                vec![Value::I32(5), Value::I32(7)],  // 5+1!=7: excluded
+            ],
+        )],
+        "s",
+    );
+}

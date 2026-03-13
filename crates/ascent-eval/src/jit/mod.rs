@@ -23,7 +23,7 @@ use cranelift_module::{FuncId, Linkage, Module};
 use rustc_hash::FxHashMap;
 
 #[cfg(feature = "specialized")]
-use crate::compiled::CExpr;
+use crate::compiled::{CBinOp, CClauseArg, CExpr, CUnOp};
 use crate::compiled::{CBodyItem, CCondition, CRule};
 
 pub(crate) use self::helpers::JitContext;
@@ -190,8 +190,8 @@ impl JitCompiler {
 
     /// Check if a rule is eligible for the typed packed JIT.
     ///
-    /// Stricter than `is_eligible`: requires Clause-only body (no Conditions),
-    /// Var-only head args (for inlined emission), and Var-only clause args.
+    /// Accepts Clause and Condition(If(expr)) body items where expr uses only
+    /// supported packed ops. Literal I32/Bool clause args are also accepted.
     #[cfg(feature = "specialized")]
     pub fn is_packed_eligible(rule: &CRule) -> bool {
         let clause_count = rule
@@ -202,16 +202,23 @@ impl JitCompiler {
         if clause_count == 0 || clause_count > 4 {
             return false;
         }
-        // All body items must be Clause (no Condition/Generator/Aggregation)
         for item in &rule.body {
             match item {
                 CBodyItem::Clause(clause) => {
                     for arg in &clause.args {
-                        if matches!(arg, crate::compiled::CClauseArg::Expr(_)) {
-                            return false;
+                        match arg {
+                            CClauseArg::Var(_) => {}
+                            CClauseArg::Expr(CExpr::Literal(crate::value::Value::I32(_)))
+                            | CClauseArg::Expr(CExpr::Literal(crate::value::Value::Bool(_))) => {}
+                            CClauseArg::Expr(_) => return false,
                         }
                     }
                     if !clause.conditions.is_empty() {
+                        return false;
+                    }
+                }
+                CBodyItem::Condition(CCondition::If(expr)) => {
+                    if !is_supported_packed_expr(expr) {
                         return false;
                     }
                 }
@@ -468,6 +475,45 @@ impl JitCompiler {
         let fn_ptr: JitFn = unsafe { std::mem::transmute(code_ptr) };
         Ok(fn_ptr)
     }
+}
+
+/// Check whether a CExpr can be compiled by the packed JIT condition emitter.
+#[cfg(feature = "specialized")]
+fn is_supported_packed_expr(expr: &CExpr) -> bool {
+    match expr {
+        CExpr::Var(_) => true,
+        CExpr::Literal(crate::value::Value::I32(_)) | CExpr::Literal(crate::value::Value::Bool(_)) => true,
+        CExpr::VarBinVar(op, _, _) => is_supported_packed_binop(*op),
+        CExpr::VarBinLit(op, _, crate::value::Value::I32(_))
+        | CExpr::VarBinLit(op, _, crate::value::Value::Bool(_)) => is_supported_packed_binop(*op),
+        CExpr::LitBinVar(op, crate::value::Value::I32(_), _)
+        | CExpr::LitBinVar(op, crate::value::Value::Bool(_), _) => is_supported_packed_binop(*op),
+        CExpr::Binary(op, a, b) => {
+            is_supported_packed_binop(*op)
+                && is_supported_packed_expr(a)
+                && is_supported_packed_expr(b)
+        }
+        CExpr::Unary(CUnOp::Not, inner) | CExpr::Unary(CUnOp::Neg, inner) => {
+            is_supported_packed_expr(inner)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "specialized")]
+fn is_supported_packed_binop(op: CBinOp) -> bool {
+    matches!(
+        op,
+        CBinOp::Eq
+            | CBinOp::Ne
+            | CBinOp::Lt
+            | CBinOp::Le
+            | CBinOp::Gt
+            | CBinOp::Ge
+            | CBinOp::Add
+            | CBinOp::Sub
+            | CBinOp::Mul
+    )
 }
 
 /// Declare all helper function signatures in the JIT module.

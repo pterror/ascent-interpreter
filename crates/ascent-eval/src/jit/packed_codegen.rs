@@ -25,8 +25,9 @@ use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags, StackSlotData, Stac
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Module};
 
-use crate::compiled::{CBodyItem, CClause, CExpr, CHeadClause, CRule};
+use crate::compiled::{CBodyItem, CBinOp, CClause, CClauseArg, CExpr, CHeadClause, CRule, CUnOp};
 use crate::jit::PackedJitHelperIds;
+use crate::value::Value;
 
 /// Pre-declared function references used during code generation.
 struct FuncRefs {
@@ -100,6 +101,16 @@ pub fn codegen_packed_rule_body(
         })
         .collect();
 
+    // Collect all If-conditions from body items
+    let conditions: Vec<&CExpr> = rule
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            CBodyItem::Condition(crate::compiled::CCondition::If(expr)) => Some(expr),
+            _ => None,
+        })
+        .collect();
+
     let mut next_var = 0usize;
 
     gen_clauses(
@@ -112,6 +123,7 @@ pub fn codegen_packed_rule_body(
         &rule.heads,
         ptr_type,
         &mut next_var,
+        &conditions,
     );
 
     builder.ins().return_(&[]);
@@ -136,9 +148,26 @@ fn gen_clauses(
     heads: &[CHeadClause],
     ptr_type: cranelift_codegen::ir::Type,
     next_var: &mut usize,
+    conditions: &[&CExpr],
 ) {
     if clause_offset >= clauses.len() {
-        gen_emit_heads(builder, heads, fields, func_refs, ptr_type);
+        if !conditions.is_empty() {
+            let done_block = builder.create_block();
+            for &expr in conditions {
+                let cond_val = compile_packed_expr(builder, expr, fields.bindings)
+                    .expect("compile_packed_expr: should succeed for eligible exprs");
+                let pass_block = builder.create_block();
+                builder.ins().brif(cond_val, pass_block, &[], done_block, &[]);
+                builder.switch_to_block(pass_block);
+                builder.seal_block(pass_block);
+            }
+            gen_emit_heads(builder, heads, fields, func_refs, ptr_type);
+            builder.ins().jump(done_block, &[]);
+            builder.switch_to_block(done_block);
+            builder.seal_block(done_block);
+        } else {
+            gen_emit_heads(builder, heads, fields, func_refs, ptr_type);
+        }
         return;
     }
 
@@ -177,6 +206,7 @@ fn gen_clauses(
             heads,
             ptr_type,
             next_var,
+            conditions,
         );
     } else {
         gen_index_scan(
@@ -194,6 +224,7 @@ fn gen_clauses(
             heads,
             ptr_type,
             next_var,
+            conditions,
         );
     }
 }
@@ -216,6 +247,7 @@ fn gen_full_scan(
     heads: &[CHeadClause],
     ptr_type: cranelift_codegen::ir::Type,
     next_var: &mut usize,
+    conditions: &[&CExpr],
 ) {
     // count = packed_count(rel, use_recent)
     let call = builder
@@ -259,6 +291,33 @@ fn gen_full_scan(
     // tuple_ptr = packed_buf + tuple_idx * arity * 4
     let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
 
+    // Literal arg checks: for each literal clause arg, compare against packed value.
+    // On mismatch, jump to continue_block (increment i and loop again).
+    let continue_block = builder.create_block();
+    for (col, arg) in clause.args.iter().enumerate() {
+        match arg {
+            CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+                let actual = load_packed_col(builder, tuple_ptr, col);
+                let expected = builder.ins().iconst(I32, *n as i64);
+                let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let pass_block = builder.create_block();
+                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                builder.switch_to_block(pass_block);
+                builder.seal_block(pass_block);
+            }
+            CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
+                let actual = load_packed_col(builder, tuple_ptr, col);
+                let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
+                let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let pass_block = builder.create_block();
+                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                builder.switch_to_block(pass_block);
+                builder.seal_block(pass_block);
+            }
+            _ => {}
+        }
+    }
+
     // Bind fresh vars: store packed_data[col] into bindings[var_id]
     for &(col, var_id) in &clause.fresh_cols {
         let val = load_packed_col(builder, tuple_ptr, col);
@@ -276,7 +335,12 @@ fn gen_full_scan(
         heads,
         ptr_type,
         next_var,
+        conditions,
     );
+
+    builder.ins().jump(continue_block, &[]);
+    builder.switch_to_block(continue_block);
+    builder.seal_block(continue_block);
 
     // i += 1
     let i = builder.use_var(var_i);
@@ -308,13 +372,13 @@ fn gen_index_scan(
     heads: &[CHeadClause],
     ptr_type: cranelift_codegen::ir::Type,
     next_var: &mut usize,
+    conditions: &[&CExpr],
 ) {
     // Primary bound column: use for index lookup
     let primary_col = clause.bound_cols[0];
-    let primary_var_id = bound_var_id(clause, primary_col);
 
-    // key = bindings[primary_var_id] (u32 loaded as I32)
-    let key_i32 = load_binding(builder, fields.bindings, primary_var_id);
+    // key = bound value (from bindings for Var, or iconst for Literal)
+    let key_i32 = load_bound_val(builder, clause, primary_col, fields.bindings);
 
     // (indices_ptr, indices_len) = packed_lookup(rel, col, key, use_recent)
     let col_val = builder.ins().iconst(I32, primary_col as i64);
@@ -365,10 +429,34 @@ fn gen_index_scan(
     let continue_block = builder.create_block();
     let mut inner_blocks_to_seal = Vec::new();
 
+    // Literal arg checks (before secondary bound col checks)
+    for (col, arg) in clause.args.iter().enumerate() {
+        match arg {
+            CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+                let actual = load_packed_col(builder, tuple_ptr, col);
+                let expected = builder.ins().iconst(I32, *n as i64);
+                let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let pass_block = builder.create_block();
+                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                inner_blocks_to_seal.push(pass_block);
+                builder.switch_to_block(pass_block);
+            }
+            CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
+                let actual = load_packed_col(builder, tuple_ptr, col);
+                let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
+                let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let pass_block = builder.create_block();
+                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                inner_blocks_to_seal.push(pass_block);
+                builder.switch_to_block(pass_block);
+            }
+            _ => {}
+        }
+    }
+
     for &col in &clause.bound_cols[1..] {
-        let var_id = bound_var_id(clause, col);
         let actual = load_packed_col(builder, tuple_ptr, col);
-        let expected = load_binding(builder, fields.bindings, var_id);
+        let expected = load_bound_val(builder, clause, col, fields.bindings);
         // Compare as I32 (u32 equality — intern IDs, bit-cast i32s, etc.)
         let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
         let pass_block = builder.create_block();
@@ -393,6 +481,7 @@ fn gen_index_scan(
         heads,
         ptr_type,
         next_var,
+        conditions,
     );
 
     builder.ins().jump(continue_block, &[]);
@@ -499,12 +588,109 @@ fn store_binding(builder: &mut FunctionBuilder, bindings_ptr: CValue, var_id: u3
     builder.ins().store(MemFlags::trusted(), val, addr, 0);
 }
 
-/// Get the VarId for a bound column in a clause.
-fn bound_var_id(clause: &CClause, col: usize) -> u32 {
+/// Load the I32 key value for a bound column: from bindings for Var args, or iconst for literals.
+fn load_bound_val(
+    builder: &mut FunctionBuilder,
+    clause: &CClause,
+    col: usize,
+    bindings_ptr: CValue,
+) -> CValue {
     match &clause.args[col] {
-        crate::compiled::CClauseArg::Var(id) => *id,
-        crate::compiled::CClauseArg::Expr(_) => {
-            panic!("packed JIT: Expr arg in bound column (should be caught by eligibility)")
+        CClauseArg::Var(id) => load_binding(builder, bindings_ptr, *id),
+        CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+            builder.ins().iconst(I32, *n as i64)
         }
+        CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
+            builder.ins().iconst(I32, if *b { 1 } else { 0 })
+        }
+        CClauseArg::Expr(_) => {
+            panic!("packed JIT: non-literal Expr arg in bound column (should be caught by eligibility)")
+        }
+    }
+}
+
+// ─── Condition compilation ───────────────────────────────────────────
+
+/// Compile a CExpr to a Cranelift I32 value for use in conditions.
+/// Comparison results are extended to I32 via `select`.
+fn compile_packed_expr(
+    builder: &mut FunctionBuilder,
+    expr: &CExpr,
+    bindings: CValue,
+) -> Result<CValue, String> {
+    match expr {
+        CExpr::Var(id) => Ok(load_binding(builder, bindings, *id)),
+        CExpr::Literal(Value::I32(n)) => Ok(builder.ins().iconst(I32, *n as i64)),
+        CExpr::Literal(Value::Bool(b)) => Ok(builder.ins().iconst(I32, if *b { 1 } else { 0 })),
+        CExpr::VarBinVar(op, a, b) => {
+            let av = load_binding(builder, bindings, *a);
+            let bv = load_binding(builder, bindings, *b);
+            compile_packed_binop(builder, *op, av, bv)
+        }
+        CExpr::VarBinLit(op, a, Value::I32(n)) => {
+            let av = load_binding(builder, bindings, *a);
+            let bv = builder.ins().iconst(I32, *n as i64);
+            compile_packed_binop(builder, *op, av, bv)
+        }
+        CExpr::LitBinVar(op, Value::I32(n), b) => {
+            let av = builder.ins().iconst(I32, *n as i64);
+            let bv = load_binding(builder, bindings, *b);
+            compile_packed_binop(builder, *op, av, bv)
+        }
+        CExpr::Binary(op, a, b) => {
+            let av = compile_packed_expr(builder, a, bindings)?;
+            let bv = compile_packed_expr(builder, b, bindings)?;
+            compile_packed_binop(builder, *op, av, bv)
+        }
+        CExpr::Unary(CUnOp::Not, inner) => {
+            let v = compile_packed_expr(builder, inner, bindings)?;
+            let one = builder.ins().iconst(I32, 1);
+            Ok(builder.ins().bxor(v, one))
+        }
+        CExpr::Unary(CUnOp::Neg, inner) => {
+            let v = compile_packed_expr(builder, inner, bindings)?;
+            Ok(builder.ins().ineg(v))
+        }
+        _ => Err(format!("packed JIT: unsupported expr in condition: {expr:?}")),
+    }
+}
+
+fn compile_packed_binop(
+    builder: &mut FunctionBuilder,
+    op: CBinOp,
+    a: CValue,
+    b: CValue,
+) -> Result<CValue, String> {
+    let one = builder.ins().iconst(I32, 1);
+    let zero = builder.ins().iconst(I32, 0);
+    match op {
+        CBinOp::Add => Ok(builder.ins().iadd(a, b)),
+        CBinOp::Sub => Ok(builder.ins().isub(a, b)),
+        CBinOp::Mul => Ok(builder.ins().imul(a, b)),
+        CBinOp::Eq => {
+            let cmp = builder.ins().icmp(IntCC::Equal, a, b);
+            Ok(builder.ins().select(cmp, one, zero))
+        }
+        CBinOp::Ne => {
+            let cmp = builder.ins().icmp(IntCC::NotEqual, a, b);
+            Ok(builder.ins().select(cmp, one, zero))
+        }
+        CBinOp::Lt => {
+            let cmp = builder.ins().icmp(IntCC::SignedLessThan, a, b);
+            Ok(builder.ins().select(cmp, one, zero))
+        }
+        CBinOp::Le => {
+            let cmp = builder.ins().icmp(IntCC::SignedLessThanOrEqual, a, b);
+            Ok(builder.ins().select(cmp, one, zero))
+        }
+        CBinOp::Gt => {
+            let cmp = builder.ins().icmp(IntCC::SignedGreaterThan, a, b);
+            Ok(builder.ins().select(cmp, one, zero))
+        }
+        CBinOp::Ge => {
+            let cmp = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, a, b);
+            Ok(builder.ins().select(cmp, one, zero))
+        }
+        _ => Err(format!("packed JIT: unsupported binop in condition: {op:?}")),
     }
 }
