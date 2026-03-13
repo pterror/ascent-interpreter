@@ -137,8 +137,8 @@ Current JIT architecture (context for what needs to change):
 - Eliminated: per-head-tuple Vec<u32> allocation, global results-buffer flush pass.
 - Remaining: true inlining (no `call_indirect` for rule dispatch) — defer to Stage 4.
 
-**Stage 4 — True inlining (no `call_indirect`)**
-- [ ] Inline all rule bodies directly into the stratum Cranelift function — one function per stratum with full visibility across all rules. Enables cross-rule instruction scheduling, shared register allocation, dead-code elimination. Estimated 20-40% gain on multi-rule strata (e.g., transitive closure, triangles). Reuse `packed_codegen` per rule but emit all into one function; pass `PackedJitContextV3` (relation ptrs, bindings ptr) via registers instead of function params.
+**Stage 4 — True inlining (no `call_indirect`)** ✅ DONE
+- [x] Inline all rule bodies directly into the stratum Cranelift function — one function per stratum with full visibility across all rules. `gen_clauses_v3` called directly from stratum codegen with shared `next_var` counter to avoid Cranelift Variable ID collisions. Stage 4 runs before Stage 3; Stage 3 remains as fallback.
 
 ### Relation storage optimizations
 
