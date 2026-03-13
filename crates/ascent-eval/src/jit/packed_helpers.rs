@@ -289,6 +289,40 @@ const _: () = {
     assert!(std::mem::offset_of!(StratumStage3Ctx, n_all_rels) == 48);
 };
 
+/// Context for Stage 4 stratum function: rule bodies inlined, no fn-ptr arrays.
+///
+/// Layout (repr C, 64-bit):
+///   offset  0: rule_ctxs   *const *mut PackedJitContextV3 (8 bytes)
+///   offset  8: num_rules   u32                            (4 bytes)
+///   offset 12: _pad        u32                            (4 bytes)
+///   offset 16: all_rels    *const *mut PackedStorage       (8 bytes)
+///   offset 24: n_all_rels  u32                            (4 bytes)
+///   offset 28: _pad2       u32                            (4 bytes)
+#[repr(C)]
+pub struct StratumStage4Ctx {
+    /// Pointer to array of *mut PackedJitContextV3, one per rule.
+    pub rule_ctxs: *const *mut PackedJitContextV3,
+    pub num_rules: u32,
+    pub _pad: u32,
+    /// All packed relations for advance().
+    pub all_rels: *const *mut PackedStorage,
+    pub n_all_rels: u32,
+    pub _pad2: u32,
+}
+
+unsafe impl Send for StratumStage4Ctx {}
+unsafe impl Sync for StratumStage4Ctx {}
+
+pub type StratumStage4Fn = unsafe extern "C" fn(*mut StratumStage4Ctx);
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::offset_of!(StratumStage4Ctx, rule_ctxs) == 0);
+    assert!(std::mem::offset_of!(StratumStage4Ctx, num_rules) == 8);
+    assert!(std::mem::offset_of!(StratumStage4Ctx, all_rels) == 16);
+    assert!(std::mem::offset_of!(StratumStage4Ctx, n_all_rels) == 24);
+};
+
 /// Insert a packed u32 tuple directly into a relation.
 ///
 /// Returns 1 if new, 0 if duplicate. Equivalent to `insert_packed_raw` but

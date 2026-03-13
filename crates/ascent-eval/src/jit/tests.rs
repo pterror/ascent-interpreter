@@ -549,3 +549,114 @@ fn test_stratum_meta_single_rule_fixpoint() {
         "path",
     );
 }
+
+// ─── Stage 4 inlined-body tests ─────────────────────────────────────
+
+/// These tests specifically exercise the Stage 4 (inlined rule bodies) path,
+/// which compiles all rule bodies directly into a single Cranelift function,
+/// eliminating call_indirect overhead.
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stage4_transitive_closure() {
+    // Classic TC — same as test_stratum_meta_tc; Stage 4 must produce identical results.
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- path(x, y), edge(y, z);
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(4)],
+                vec![Value::I32(4), Value::I32(5)],
+            ],
+        )],
+        "path",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stage4_triangle() {
+    // Triangle detection: 3-clause body rule.
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation tri(i32, i32, i32);
+            tri(x, y, z) <-- edge(x, y), edge(y, z), edge(z, x);
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(1)],
+                vec![Value::I32(4), Value::I32(5)], // not in a triangle
+            ],
+        )],
+        "tri",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stage4_multi_rule() {
+    // Multiple rules writing to the same relation — exercises inlining of N rules.
+    assert_packed_jit_equivalence(
+        r#"
+            relation a(i32, i32);
+            relation b(i32, i32);
+            relation reach(i32, i32);
+            reach(x, y) <-- a(x, y);
+            reach(x, y) <-- b(x, y);
+            reach(x, z) <-- reach(x, y), a(y, z);
+            reach(x, z) <-- reach(x, y), b(y, z);
+        "#,
+        &[
+            (
+                "a",
+                vec![
+                    vec![Value::I32(1), Value::I32(2)],
+                    vec![Value::I32(3), Value::I32(4)],
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    vec![Value::I32(2), Value::I32(3)],
+                    vec![Value::I32(4), Value::I32(5)],
+                ],
+            ),
+        ],
+        "reach",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stage4_conditional_recursive() {
+    // Recursive rule with an `if` condition — verifies conditions are handled inline.
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y), if x < y;
+            path(x, z) <-- path(x, y), edge(y, z), if x < z;
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(2)], // back edge — filtered by condition
+                vec![Value::I32(3), Value::I32(4)],
+            ],
+        )],
+        "path",
+    );
+}

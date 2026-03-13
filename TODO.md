@@ -137,6 +137,15 @@ Current JIT architecture (context for what needs to change):
 - Eliminated: per-head-tuple Vec<u32> allocation, global results-buffer flush pass.
 - Remaining: true inlining (no `call_indirect` for rule dispatch) — defer to Stage 4.
 
+**Stage 4 — True inlining (no `call_indirect`)**
+- [ ] Inline all rule bodies directly into the stratum Cranelift function — one function per stratum with full visibility across all rules. Enables cross-rule instruction scheduling, shared register allocation, dead-code elimination. Estimated 20-40% gain on multi-rule strata (e.g., transitive closure, triangles). Reuse `packed_codegen` per rule but emit all into one function; pass `PackedJitContextV3` (relation ptrs, bindings ptr) via registers instead of function params.
+
+### Relation storage optimizations
+
+- [ ] **Lazy `recent_col_indices` rebuild** — `advance()` in both `PackedStorage` (`specialized.rs`) and `RelationStorage` (`relation.rs`) unconditionally rebuilds recent indices even for sink relations (head-only, never body clauses). The right implementation is a new `ensure_recent_indices(&mut self)` called at eval-loop level only for relations that are body clauses in the current stratum — avoids the `&self`/`RefCell` tangle. Impact limited to programs with head-only output relations; benchmarks (TC, triangles) don't benefit.
+
+- [ ] **Sparse delta evaluation (LSP path)** — for incremental workloads where deltas are large relative to full relations, build selective delta indices only on columns actually used in downstream join clauses (determined at rule compile time). Avoids scanning delta tuples whose relevant columns don't match any current binding, reducing O(|delta|) inner loop iterations for non-matching tuples.
+
 ### Not planned
 
 - ~Parallel SCC evaluation~ — strata are sequential by definition; intra-stratum parallelism is a research problem

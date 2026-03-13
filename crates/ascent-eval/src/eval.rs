@@ -302,6 +302,27 @@ impl std::fmt::Debug for StratumStage3Runtime {
     }
 }
 
+/// Pinned runtime data for a Stage 4 stratum function (inlined rule bodies).
+/// All raw pointers in `stage4_ctx` point into the boxes below.
+#[cfg(all(feature = "jit", feature = "specialized"))]
+#[allow(dead_code)]
+struct StratumStage4Runtime {
+    stage4_ctx: Box<crate::jit::packed_helpers::StratumStage4Ctx>,
+    _per_rule_bindings: Vec<Box<[u32]>>,
+    _per_rule_clause_rels: Vec<Box<[*const crate::specialized::PackedStorage]>>,
+    _per_rule_head_rels: Vec<Box<[*mut crate::specialized::PackedStorage]>>,
+    _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContextV3>>,
+    _rule_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContextV3]>,
+    _all_rels: Box<[*mut crate::specialized::PackedStorage]>,
+}
+
+#[cfg(all(feature = "jit", feature = "specialized"))]
+impl std::fmt::Debug for StratumStage4Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StratumStage4Runtime").finish_non_exhaustive()
+    }
+}
+
 /// The evaluation engine state.
 #[derive(Debug)]
 pub struct Engine {
@@ -333,6 +354,9 @@ pub struct Engine {
     /// Cache of Stage 3 stratum runtime contexts.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     stratum_stage3_cache: FxHashMap<usize, StratumStage3Runtime>,
+    /// Cache of Stage 4 stratum runtime contexts (inlined rule bodies).
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    stratum_stage4_cache: FxHashMap<usize, StratumStage4Runtime>,
 }
 
 impl Engine {
@@ -377,6 +401,8 @@ impl Engine {
             stratum_meta_cache: FxHashMap::default(),
             #[cfg(all(feature = "jit", feature = "specialized"))]
             stratum_stage3_cache: FxHashMap::default(),
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            stratum_stage4_cache: FxHashMap::default(),
         }
     }
 
@@ -703,6 +729,12 @@ impl Engine {
             return;
         }
 
+        // Fast path: Stage 4 stratum (inlined rule bodies, no call_indirect)
+        #[cfg(all(feature = "jit", feature = "specialized"))]
+        if self.try_run_stratum_stage4(rules) {
+            return;
+        }
+
         // Fast path: Stage 3 stratum (direct-insert, no results buffer)
         #[cfg(all(feature = "jit", feature = "specialized"))]
         if self.try_run_stratum_stage3(rules) {
@@ -795,6 +827,157 @@ impl Engine {
         let runtime = self.stratum_meta_cache.get_mut(&stratum_key).unwrap();
         unsafe { meta_fn(&raw mut *runtime.meta_ctx) };
         true
+    }
+
+    /// Try to run the stratum via the Stage 4 compiled function (inlined rule bodies).
+    ///
+    /// Returns `true` if successful, `false` to fall back to Stage 3 or interpreted.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    fn try_run_stratum_stage4(&mut self, rules: &[&CRule]) -> bool {
+        if rules.is_empty() {
+            return false;
+        }
+
+        let stratum_key = rules[0] as *const CRule as usize;
+
+        // Step 1: compile the Stage 4 stratum function (eligibility checked inside)
+        let stage4_fn = {
+            let Some(jit_cell) = self.jit.as_ref() else {
+                return false;
+            };
+            let mut jit = jit_cell.borrow_mut();
+            match jit.compile_stratum_stage4(stratum_key, rules) {
+                Some(f) => f,
+                None => return false,
+            }
+        };
+
+        // Step 2: build the runtime context if not yet cached
+        if !self.stratum_stage4_cache.contains_key(&stratum_key) {
+            let runtime = match self.build_stratum_stage4_runtime(rules) {
+                Some(r) => r,
+                None => return false,
+            };
+            self.stratum_stage4_cache.insert(stratum_key, runtime);
+        }
+
+        // Step 3: call the Stage 4 stratum function
+        let runtime = self.stratum_stage4_cache.get_mut(&stratum_key).unwrap();
+        unsafe { stage4_fn(&raw mut *runtime.stage4_ctx) };
+        true
+    }
+
+    /// Build the runtime context for Stage 4 stratum execution.
+    ///
+    /// Returns `None` if any rule doesn't have all-packed clause or head relations.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    fn build_stratum_stage4_runtime(&self, rules: &[&CRule]) -> Option<StratumStage4Runtime> {
+        use crate::jit::packed_helpers::{PackedJitContextV3, StratumStage4Ctx};
+        use crate::relation::Relation;
+        use crate::specialized::PackedStorage;
+
+        let mut per_rule_bindings: Vec<Box<[u32]>> = Vec::new();
+        let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
+        let mut per_rule_head_rels: Vec<Box<[*mut PackedStorage]>> = Vec::new();
+        let mut per_rule_ctxs: Vec<Box<PackedJitContextV3>> = Vec::new();
+        let mut rule_ctx_ptrs_vec: Vec<*mut PackedJitContextV3> = Vec::new();
+
+        for rule in rules {
+            // Clause rel pointers
+            let clause_rels: Vec<*const PackedStorage> = rule
+                .body
+                .iter()
+                .filter_map(|item| match item {
+                    CBodyItem::Clause(c) => match self.relations.get(&c.relation)? {
+                        Relation::Packed(p) => Some(p as *const PackedStorage),
+                        Relation::Generic(_) => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+
+            let clause_count = rule
+                .body
+                .iter()
+                .filter(|i| matches!(i, CBodyItem::Clause(_)))
+                .count();
+
+            if clause_rels.len() != clause_count {
+                return None;
+            }
+
+            // Head rel pointers
+            let head_rels: Vec<*mut PackedStorage> = rule
+                .heads
+                .iter()
+                .filter_map(|head| match self.relations.get(&head.relation)? {
+                    Relation::Packed(p) => {
+                        Some(p as *const PackedStorage as *mut PackedStorage)
+                    }
+                    Relation::Generic(_) => None,
+                })
+                .collect();
+
+            if head_rels.len() != rule.heads.len() {
+                return None;
+            }
+
+            let clause_rels_box: Box<[*const PackedStorage]> = clause_rels.into_boxed_slice();
+            let head_rels_box: Box<[*mut PackedStorage]> = head_rels.into_boxed_slice();
+            let bindings_box: Box<[u32]> = vec![0u32; self.var_count].into_boxed_slice();
+
+            let bindings_ptr: *mut u32 = bindings_box.as_ptr() as *mut u32;
+            let head_rels_ptr: *const *mut PackedStorage = head_rels_box.as_ptr();
+
+            let ctx = Box::new(PackedJitContextV3 {
+                rels: clause_rels_box.as_ptr(),
+                rels_len: clause_rels_box.len() as u32,
+                _pad: 0,
+                bindings: bindings_ptr,
+                head_rels: head_rels_ptr,
+            });
+
+            rule_ctx_ptrs_vec
+                .push(&*ctx as *const PackedJitContextV3 as *mut PackedJitContextV3);
+
+            per_rule_bindings.push(bindings_box);
+            per_rule_clause_rels.push(clause_rels_box);
+            per_rule_head_rels.push(head_rels_box);
+            per_rule_ctxs.push(ctx);
+        }
+
+        // All packed rels for advance()
+        let all_rels: Vec<*mut PackedStorage> = self
+            .relations
+            .values()
+            .filter_map(|rel| match rel {
+                Relation::Packed(p) => Some(p as *const PackedStorage as *mut PackedStorage),
+                Relation::Generic(_) => None,
+            })
+            .collect();
+
+        let all_rels_box: Box<[*mut PackedStorage]> = all_rels.into_boxed_slice();
+        let rule_ctx_ptrs_box: Box<[*mut PackedJitContextV3]> =
+            rule_ctx_ptrs_vec.into_boxed_slice();
+
+        let stage4_ctx = Box::new(StratumStage4Ctx {
+            rule_ctxs: rule_ctx_ptrs_box.as_ptr() as *const *mut PackedJitContextV3,
+            num_rules: per_rule_ctxs.len() as u32,
+            _pad: 0,
+            all_rels: all_rels_box.as_ptr(),
+            n_all_rels: all_rels_box.len() as u32,
+            _pad2: 0,
+        });
+
+        Some(StratumStage4Runtime {
+            stage4_ctx,
+            _per_rule_bindings: per_rule_bindings,
+            _per_rule_clause_rels: per_rule_clause_rels,
+            _per_rule_head_rels: per_rule_head_rels,
+            _per_rule_ctxs: per_rule_ctxs,
+            _rule_ctx_ptrs: rule_ctx_ptrs_box,
+            _all_rels: all_rels_box,
+        })
     }
 
     /// Try to run the stratum via the Stage 3 compiled function (direct-insert, no buffer).

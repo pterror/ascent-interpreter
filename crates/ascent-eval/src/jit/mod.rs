@@ -146,6 +146,9 @@ pub struct JitCompiler {
     /// Cache of Stage 3 stratum functions.
     #[cfg(feature = "specialized")]
     pub(crate) stratum_stage3_fn_cache: FxHashMap<usize, Option<packed_helpers::StratumStage3Fn>>,
+    /// Cache of Stage 4 stratum functions (inlined rule bodies).
+    #[cfg(feature = "specialized")]
+    pub(crate) stratum_stage4_fn_cache: FxHashMap<usize, Option<packed_helpers::StratumStage4Fn>>,
 }
 
 impl JitCompiler {
@@ -236,6 +239,8 @@ impl JitCompiler {
             packed_cache_v3: FxHashMap::default(),
             #[cfg(feature = "specialized")]
             stratum_stage3_fn_cache: FxHashMap::default(),
+            #[cfg(feature = "specialized")]
+            stratum_stage4_fn_cache: FxHashMap::default(),
         })
     }
 
@@ -554,6 +559,116 @@ impl JitCompiler {
 
         let code_ptr = self.module.get_finalized_function(func_id);
         let fn_ptr: packed_helpers::StratumStage3Fn = unsafe { std::mem::transmute(code_ptr) };
+        Ok(fn_ptr)
+    }
+
+    /// Compile or retrieve a Stage 4 stratum function for the given rules.
+    ///
+    /// Stage 4 inlines all rule bodies directly into one Cranelift function,
+    /// eliminating `call_indirect` overhead.
+    ///
+    /// Returns `None` if any rule is not packed-JIT eligible.
+    #[cfg(feature = "specialized")]
+    pub fn compile_stratum_stage4(
+        &mut self,
+        stratum_key: usize,
+        rules: &[&CRule],
+    ) -> Option<packed_helpers::StratumStage4Fn> {
+        if let Some(cached) = self.stratum_stage4_fn_cache.get(&stratum_key) {
+            return *cached;
+        }
+
+        // All rules must be packed-JIT eligible
+        for rule in rules {
+            if !Self::is_packed_eligible(rule) {
+                self.stratum_stage4_fn_cache.insert(stratum_key, None);
+                return None;
+            }
+        }
+
+        match self.compile_stratum_stage4_inner(stratum_key, rules) {
+            Ok(fn_ptr) => {
+                self.stratum_stage4_fn_cache.insert(stratum_key, Some(fn_ptr));
+                Some(fn_ptr)
+            }
+            Err(_) => {
+                self.stratum_stage4_fn_cache.insert(stratum_key, None);
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "specialized")]
+    fn compile_stratum_stage4_inner(
+        &mut self,
+        stratum_key: usize,
+        rules: &[&CRule],
+    ) -> Result<packed_helpers::StratumStage4Fn, String> {
+        let name = format!("stratum_stage4_{stratum_key}");
+        let ptr_type = self.module.target_config().pointer_type();
+
+        self.codegen_ctx.clear();
+        self.codegen_ctx.func = cranelift_codegen::ir::Function::new();
+
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_type));
+
+        let func_id = self
+            .module
+            .declare_function(&name, Linkage::Local, &sig)
+            .map_err(|e| format!("declare stratum_stage4: {e}"))?;
+
+        self.codegen_ctx.func.signature = sig;
+
+        // Pre-extract clauses, heads, and conditions per rule.
+        // We need owned data since we can't hold borrows into `rules` across the
+        // mutable `module` calls.
+        let rule_data: Vec<(Vec<crate::compiled::CClause>, Vec<crate::compiled::CHeadClause>, Vec<crate::compiled::CExpr>)> = rules
+            .iter()
+            .map(|rule| {
+                let clauses: Vec<crate::compiled::CClause> = rule
+                    .body
+                    .iter()
+                    .filter_map(|item| match item {
+                        CBodyItem::Clause(c) => Some(c.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let conditions: Vec<crate::compiled::CExpr> = rule
+                    .body
+                    .iter()
+                    .filter_map(|item| match item {
+                        CBodyItem::Condition(CCondition::If(expr)) => Some(expr.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                (clauses, rule.heads.clone(), conditions)
+            })
+            .collect();
+
+        let rules_refs: Vec<(&[crate::compiled::CClause], &[crate::compiled::CHeadClause], &[crate::compiled::CExpr])> = rule_data
+            .iter()
+            .map(|(clauses, heads, conditions)| {
+                (clauses.as_slice(), heads.as_slice(), conditions.as_slice())
+            })
+            .collect();
+
+        stratum_codegen::codegen_stratum_stage4_fn(
+            self.packed_helpers.stratum_advance,
+            &rules_refs,
+            func_id,
+            &mut self.module,
+            &mut self.builder_ctx,
+            &mut self.codegen_ctx,
+            &self.packed_helpers,
+        )?;
+
+        self.module
+            .finalize_definitions()
+            .map_err(|e| format!("finalize stratum_stage4: {e}"))?;
+
+        let code_ptr = self.module.get_finalized_function(func_id);
+        let fn_ptr: packed_helpers::StratumStage4Fn = unsafe { std::mem::transmute(code_ptr) };
         Ok(fn_ptr)
     }
 
