@@ -562,10 +562,8 @@ impl Relation {
     /// or relations with non-packable column types.
     pub fn new_auto(arity: usize, is_lattice: bool, _col_types: &[Option<String>]) -> Self {
         #[cfg(feature = "specialized")]
-        if !is_lattice {
-            if let Some(packed_types) = try_packed_col_types(_col_types) {
-                return Relation::Packed(PackedStorage::new(packed_types));
-            }
+        if !is_lattice && let Some(packed_types) = try_packed_col_types(_col_types) {
+            return Relation::Packed(PackedStorage::new(packed_types));
         }
         Relation::Generic(RelationStorage::with_lattice(arity, is_lattice))
     }
@@ -615,7 +613,7 @@ impl Relation {
                 Ok(inserted) => inserted,
                 Err(tuple) => {
                     // Type mismatch: downgrade to generic storage
-                    let packed = match std::mem::replace(self, Relation::default()) {
+                    let packed = match std::mem::take(self) {
                         Relation::Packed(p) => p,
                         _ => unreachable!(),
                     };

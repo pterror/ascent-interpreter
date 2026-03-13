@@ -74,7 +74,11 @@ fn bench_transitive_closure(c: &mut Criterion) {
             });
         });
 
-        // JIT runtime only (pre-parsed, facts via insert)
+        // JIT runtime only (pre-parsed, facts via insert).
+        // NOTE: includes JIT compilation cost on every iteration — JIT cache
+        // is per-Engine and each iter creates a fresh one. Numbers reflect
+        // "first-run" latency. For a hot-cache benchmark, a shareable JitCache
+        // API is needed (tracked in TODO.md).
         #[cfg(feature = "jit")]
         group.bench_with_input(BenchmarkId::new("jit_run_only", n), &n, |b, &n| {
             let source = tc_source_no_facts();
@@ -155,6 +159,7 @@ fn bench_triangle(c: &mut Criterion) {
             });
         });
 
+        // NOTE: includes JIT compilation cost on every iteration (see TC comment).
         #[cfg(feature = "jit")]
         group.bench_with_input(BenchmarkId::new("jit_run_only", n), &n, |b, &n| {
             let source = triangle_source_no_facts();

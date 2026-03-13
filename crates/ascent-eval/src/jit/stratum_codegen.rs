@@ -524,7 +524,7 @@ fn emit_rule_bodies(
         // Build the (body_idx, &CClause) pairs as gen_clauses_v3 expects.
         // body_idx is the sequential clause index (0-based within the clauses slice).
         let indexed_clauses: Vec<(usize, &CClause)> =
-            clauses.iter().enumerate().map(|(i, c)| (i, c)).collect();
+            clauses.iter().enumerate().collect();
 
         let cond_refs: Vec<&CExpr> = conditions.iter().collect();
 
@@ -577,7 +577,7 @@ fn emit_recent_rule_bodies(
         let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
 
         let indexed_clauses: Vec<(usize, &CClause)> =
-            clauses.iter().enumerate().map(|(i, c)| (i, c)).collect();
+            clauses.iter().enumerate().collect();
 
         let cond_refs: Vec<&CExpr> = conditions.iter().collect();
 

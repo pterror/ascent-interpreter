@@ -26,12 +26,14 @@ use crate::value::{InternTable, Tuple, Value};
 /// custom types). The `filter` predicate gates which `Value` variants are
 /// accepted; non-matching variants return `None` so packed storage can
 /// downgrade gracefully.
+#[allow(dead_code)]
 pub struct HashInternTable {
     filter: fn(&Value) -> bool,
     to_id: RefCell<FxHashMap<Value, u32>>,
     to_val: RefCell<Vec<Value>>,
 }
 
+#[allow(dead_code)]
 impl HashInternTable {
     /// Create a new intern table that accepts values matching `filter`.
     pub fn new(filter: fn(&Value) -> bool) -> Self {
@@ -227,6 +229,7 @@ impl PackedStorage {
         &self.value_data[idx * self.arity..(idx + 1) * self.arity]
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn packed_slice(&self, idx: usize) -> &[u32] {
         &self.packed_data[idx * self.arity..(idx + 1) * self.arity]

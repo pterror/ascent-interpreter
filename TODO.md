@@ -142,6 +142,8 @@ Current JIT architecture (context for what needs to change):
 
 ### JIT tuning
 
+- [ ] **Shareable JitCache across Engine instances** — JIT compilation cache is per-`Engine`; every `Engine::new()` recompiles from scratch. Benchmarks therefore measure compile+run, not execution-only. For the LSP use case (many incremental evaluations of the same program), a shareable `Arc<JitCache>` would let all engine instances reuse compiled strata. Also needed for a clean "hot JIT" benchmark variant that isolates execution cost.
+
 - [ ] **Stage 4 benefit limited to recursive strata** — JIT matches interpreter for single-pass queries (triangle: ±3% vs interp_run_only); wins only on recursive fixpoints where compilation cost is amortized (TC n=200: -11%). Root cause: single-pass rules run one iteration so there's no fixpoint loop to optimize across. No regression vs Stage 3 (both near-parity for triangle). Worth investigating whether Stage 4 should skip compilation for strata with no recursive rules.
 
 - [ ] **Cache `packed_data_ptr` for non-recursive rules** — `gen_full_scan_v3` calls `packed_data_ptr` inside the scan loop on every iteration to handle the case where head relation == clause relation (recursive insert can reallocate). For non-recursive rules (head ∉ clause relations), the pointer is stable. Pass a `is_recursive: bool` flag through codegen; only re-fetch inside the loop when true. Applies to Stage 3 and Stage 4. Would reduce inner loop body size by one runtime call.

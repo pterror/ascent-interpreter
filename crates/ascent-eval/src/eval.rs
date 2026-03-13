@@ -250,18 +250,23 @@ impl Stratification {
     }
 }
 
+/// Buffer type for per-rule JIT results: (head_rel_idx, packed_tuple).
+#[cfg(all(feature = "jit", feature = "specialized"))]
+type RuleResultsBuf = Vec<(usize, Vec<u32>)>;
+
 /// Pinned heap allocations backing a stratum meta-function's context.
 ///
 /// Raw pointers inside `StratumMetaCtx` point into these allocations, so they
 /// must all outlive the `StratumMetaCtx` they support.  The struct is intentionally
 /// not `Send`/`Sync`; Engine is single-threaded.
 #[cfg(all(feature = "jit", feature = "specialized"))]
-#[allow(dead_code)]
+// Box<Vec<T>> is intentional: stable heap address for raw-pointer aliasing.
+#[allow(dead_code, clippy::vec_box)]
 struct StratumMetaRuntime {
     meta_ctx: Box<crate::jit::packed_helpers::StratumMetaCtx>,
     // Fields prefixed with `_` are kept alive for their raw pointers; not read directly.
     _per_rule_bindings: Vec<Box<[u32]>>,
-    _per_rule_results: Vec<Box<Vec<(usize, Vec<u32>)>>>,
+    _per_rule_results: Vec<Box<RuleResultsBuf>>,
     _per_rule_clause_rels: Vec<Box<[*const crate::specialized::PackedStorage]>>,
     _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContext>>,
     _full_fns: Box<[crate::jit::packed_helpers::PackedJitFn]>,
@@ -281,7 +286,7 @@ impl std::fmt::Debug for StratumMetaRuntime {
 /// Pinned runtime data for a Stage 3 stratum function (direct-insert, no results buffer).
 /// All raw pointers in `stage3_ctx` point into the boxes below.
 #[cfg(all(feature = "jit", feature = "specialized"))]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::vec_box)]
 struct StratumStage3Runtime {
     stage3_ctx: Box<crate::jit::packed_helpers::StratumStage3Ctx>,
     _per_rule_bindings: Vec<Box<[u32]>>,
@@ -305,7 +310,7 @@ impl std::fmt::Debug for StratumStage3Runtime {
 /// Pinned runtime data for a Stage 4 stratum function (inlined rule bodies).
 /// All raw pointers in `stage4_ctx` point into the boxes below.
 #[cfg(all(feature = "jit", feature = "specialized"))]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::vec_box)]
 struct StratumStage4Runtime {
     stage4_ctx: Box<crate::jit::packed_helpers::StratumStage4Ctx>,
     _per_rule_bindings: Vec<Box<[u32]>>,
@@ -961,7 +966,7 @@ impl Engine {
             rule_ctx_ptrs_vec.into_boxed_slice();
 
         let stage4_ctx = Box::new(StratumStage4Ctx {
-            rule_ctxs: rule_ctx_ptrs_box.as_ptr() as *const *mut PackedJitContextV3,
+            rule_ctxs: rule_ctx_ptrs_box.as_ptr(),
             num_rules: per_rule_ctxs.len() as u32,
             _pad: 0,
             all_rels: all_rels_box.as_ptr(),
@@ -1155,11 +1160,11 @@ impl Engine {
 
         let stage3_ctx = Box::new(StratumStage3Ctx {
             full_fns: full_fns_box.as_ptr(),
-            full_ctxs: full_ctx_ptrs_box.as_ptr() as *const *mut PackedJitContextV3,
+            full_ctxs: full_ctx_ptrs_box.as_ptr(),
             num_full: full_fns_box.len() as u32,
             num_recent: recent_fns_box.len() as u32,
             recent_fns: recent_fns_box.as_ptr(),
-            recent_ctxs: recent_ctx_ptrs_box.as_ptr() as *const *mut PackedJitContextV3,
+            recent_ctxs: recent_ctx_ptrs_box.as_ptr(),
             all_rels: all_rels_box.as_ptr(),
             n_all_rels: all_rels_box.len() as u32,
             _pad: 0,
@@ -1192,8 +1197,10 @@ impl Engine {
 
         let jit_ref = self.jit.as_ref()?.borrow();
 
+        // Box<RuleResultsBuf>: stable heap address so the raw *mut pointer remains valid.
+        #[allow(clippy::vec_box)]
+        let mut per_rule_results: Vec<Box<RuleResultsBuf>> = Vec::new();
         let mut per_rule_bindings: Vec<Box<[u32]>> = Vec::new();
-        let mut per_rule_results: Vec<Box<Vec<(usize, Vec<u32>)>>> = Vec::new();
         let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
         let mut per_rule_ctxs: Vec<Box<PackedJitContext>> = Vec::new();
 
@@ -1254,7 +1261,8 @@ impl Engine {
 
             let clause_rels_box: Box<[*const PackedStorage]> = clause_rels.into_boxed_slice();
             let bindings_box: Box<[u32]> = vec![0u32; self.var_count].into_boxed_slice();
-            let results_box: Box<Vec<(usize, Vec<u32>)>> = Box::new(Vec::new());
+            #[allow(clippy::vec_box)]
+            let results_box: Box<RuleResultsBuf> = Box::default();
 
             let bindings_ptr: *mut u32 = bindings_box.as_ptr() as *mut u32;
             let results_ptr: *mut Vec<(usize, Vec<u32>)> =
@@ -1324,11 +1332,11 @@ impl Engine {
 
         let meta_ctx = Box::new(StratumMetaCtx {
             full_fns: full_fns_box.as_ptr(),
-            full_ctxs: full_ctx_ptrs_box.as_ptr() as *const *mut PackedJitContext,
+            full_ctxs: full_ctx_ptrs_box.as_ptr(),
             num_full: full_fns_box.len() as u32,
             num_recent: recent_fns_box.len() as u32,
             recent_fns: recent_fns_box.as_ptr(),
-            recent_ctxs: recent_ctx_ptrs_box.as_ptr() as *const *mut PackedJitContext,
+            recent_ctxs: recent_ctx_ptrs_box.as_ptr(),
             flusher: &*flusher as *const StratumFlusher as *mut StratumFlusher,
         });
 
@@ -1454,11 +1462,11 @@ impl Engine {
                     let mut jit = jit_cell.borrow_mut();
                     jit.get_or_compile_packed(rule_idx, rule).is_some()
                 };
-                if packed_compiled {
-                    if let Some(results) = self.derive_tuples_packed_jit(rule, use_recent, rule_idx)
-                    {
-                        return results;
-                    }
+                if packed_compiled
+                    && let Some(results) =
+                        self.derive_tuples_packed_jit(rule, use_recent, rule_idx)
+                {
+                    return results;
                 }
             }
 

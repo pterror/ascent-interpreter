@@ -506,7 +506,7 @@ impl JitCompiler {
         // All rules must have V3 compiled variants
         for rule in rules {
             let rule_idx = *rule as *const CRule as usize;
-            if !self.packed_cache_v3.get(&rule_idx).map_or(false, |v| v.is_some()) {
+            if !self.packed_cache_v3.get(&rule_idx).is_some_and(|v| v.is_some()) {
                 self.stratum_stage3_fn_cache.insert(stratum_key, None);
                 return None;
             }
@@ -688,7 +688,7 @@ impl JitCompiler {
         // All rules must be packed-JIT compiled
         for rule in rules {
             let rule_idx = *rule as *const CRule as usize;
-            if !self.packed_cache.get(&rule_idx).map_or(false, |v| v.is_some()) {
+            if !self.packed_cache.get(&rule_idx).is_some_and(|v| v.is_some()) {
                 self.stratum_fn_cache.insert(stratum_key, None);
                 return None;
             }
