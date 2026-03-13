@@ -202,12 +202,15 @@ pub struct PackedStorage {
     recent_col_indices: Vec<FxHashMap<u32, Vec<usize>>>,
     /// Source tag per tuple.
     pub(crate) source_tags: Vec<SourceId>,
-    /// Per-column JIT hash index (full data). Rebuilt on every advance().
+    /// Per-column JIT hash index (full data). Updated incrementally.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) jit_indices: Vec<crate::jit_index::JitHashIndex>,
-    /// Per-column JIT hash index (recent data). Rebuilt on every advance().
+    /// Per-column JIT hash index (recent data). Rebuilt from scratch each iteration.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) jit_recent_indices: Vec<crate::jit_index::JitHashIndex>,
+    /// Number of tuples already indexed into jit_indices (for incremental update).
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) jit_full_indexed_count: usize,
 }
 
 impl PackedStorage {
@@ -231,6 +234,8 @@ impl PackedStorage {
             jit_indices: Vec::new(),
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_recent_indices: Vec::new(),
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_full_indexed_count: 0,
         }
     }
 
@@ -462,7 +467,7 @@ impl PackedStorage {
             }
         }
         #[cfg(all(feature = "jit", feature = "specialized"))]
-        self.rebuild_jit_indices();
+        self.update_jit_indices();
         had_delta
     }
 
@@ -481,34 +486,48 @@ impl PackedStorage {
             }
         }
         #[cfg(all(feature = "jit", feature = "specialized"))]
-        self.rebuild_jit_indices();
+        self.update_jit_indices();
         had_delta
     }
 
-    /// Rebuild `jit_indices` and `jit_recent_indices` from current packed data.
+    /// Update `jit_indices` incrementally and rebuild `jit_recent_indices` from scratch.
+    ///
+    /// Full index: only insert newly added tuples (jit_full_indexed_count..count) — O(delta).
+    /// Recent index: rebuild from the current recent set — always small.
     ///
     /// Must be called after `advance()` / `advance_peek()` to keep JIT handles fresh.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) fn rebuild_jit_indices(&mut self) {
-        use crate::jit_index::JitHashIndex;
-        self.jit_indices = (0..self.arity)
-            .map(|col| {
-                let pairs: Vec<(u32, u32)> = (0..self.count)
-                    .map(|idx| (self.packed_data[idx * self.arity + col], idx as u32))
-                    .collect();
-                JitHashIndex::build(&pairs)
-            })
-            .collect();
-        self.jit_recent_indices = (0..self.arity)
-            .map(|col| {
-                let pairs: Vec<(u32, u32)> = self
-                    .recent
-                    .iter()
-                    .map(|&idx| (self.packed_data[idx * self.arity + col], idx as u32))
-                    .collect();
-                JitHashIndex::build(&pairs)
-            })
-            .collect();
+    pub(crate) fn update_jit_indices(&mut self) {
+        // Initialize full index if needed (first call).
+        if self.jit_indices.is_empty() {
+            self.jit_indices = (0..self.arity)
+                .map(|_| crate::jit_index::JitHashIndex::empty())
+                .collect();
+        }
+        // Insert only the new tuples since last call.
+        for idx in self.jit_full_indexed_count..self.count {
+            let base = idx * self.arity;
+            for col in 0..self.arity {
+                self.jit_indices[col].insert(self.packed_data[base + col], idx as u32);
+            }
+        }
+        self.jit_full_indexed_count = self.count;
+
+        // Rebuild recent index from scratch (always small — just the delta).
+        if self.jit_recent_indices.is_empty() {
+            self.jit_recent_indices = (0..self.arity)
+                .map(|_| crate::jit_index::JitHashIndex::empty())
+                .collect();
+        }
+        for col in 0..self.arity {
+            self.jit_recent_indices[col].clear_for_rebuild();
+        }
+        for &idx in &self.recent {
+            let base = idx * self.arity;
+            for col in 0..self.arity {
+                self.jit_recent_indices[col].insert(self.packed_data[base + col], idx as u32);
+            }
+        }
     }
 
     pub fn set_delta_range(&mut self, start: usize) {
