@@ -451,6 +451,83 @@ fn test_stratum_meta_multi_rule_stratum() {
 }
 
 #[cfg(feature = "specialized")]
+// ─── Stage 3 direct-insert tests ────────────────────────────────────
+
+/// These tests specifically exercise the Stage 3 (direct-insert) path and verify
+/// correctness across recursive, multi-rule, and conditional scenarios.
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stage3_recursive_triangle() {
+    // Recursive rule where head relation appears in body — exercises the
+    // re-fetch-packed_data_ptr fix for reallocation safety.
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- path(x, y), path(y, z);
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(1)],
+            ],
+        )],
+        "path",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stage3_multi_hop_tc() {
+    // 5-node chain — verifies correct multi-iteration convergence with direct inserts.
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- path(x, y), edge(y, z);
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(4)],
+                vec![Value::I32(4), Value::I32(5)],
+            ],
+        )],
+        "path",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stage3_condition_in_recursive_rule() {
+    // Recursive rule with condition — verifies conditions work under direct insert.
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y), if x < y;
+            path(x, z) <-- path(x, y), edge(y, z), if x < z;
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(2)], // back edge — filtered by condition
+                vec![Value::I32(3), Value::I32(4)],
+            ],
+        )],
+        "path",
+    );
+}
+
 #[test]
 fn test_stratum_meta_single_rule_fixpoint() {
     // Single rule with self-join — exercises fixpoint convergence.

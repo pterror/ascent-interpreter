@@ -126,9 +126,16 @@ Current JIT architecture (context for what needs to change):
 - Advance/recent state machine stays in Rust helpers; only loop control is in native code.
 - True cross-rule inlining (inline rule bodies into stratum function, direct buffer writes) — defer to stage 3.
 
-**Stage 3 — Fully typed stratum** (closes the gap to `ascent!`)
-- [ ] For strata where all relations are fully packed: inline rule bodies into the stratum function (no `call` between rules), expose `PackedStorage.packed_data` pointer directly in JIT, emit head insertions as direct buffer writes. No Value enum, no Rust re-entry in the hot path.
-- Payoff: matches or exceeds `ascent!` macro performance for pure packed programs.
+**Stage 3 — Direct-insert stratum** ✅ DONE
+- [x] `PackedJitContextV3`: head_rels array replaces results buffer — rule variants write directly to head relations.
+- [x] `PackedJitFnV3`: new rule variant signature using direct-insert context.
+- [x] `StratumStage3Ctx` + `StratumStage3Fn`: parallel stratum loop using V3 variants + `jit_stratum_advance`.
+- [x] `packed_try_insert` helper: thin wrapper around `insert_packed_raw`, callable from JIT.
+- [x] `jit_stratum_advance` helper: advance-only (no flush step needed).
+- [x] Correctness: re-fetch `packed_data_ptr` inside scan loops to handle reallocation when head == clause relation (recursive rules). Stage 3 is now the primary fast path; Stage 2 (buffered) remains as fallback.
+- [x] Tests: recursive triangle, multi-hop TC (5-node), conditional recursive rule.
+- Eliminated: per-head-tuple Vec<u32> allocation, global results-buffer flush pass.
+- Remaining: true inlining (no `call_indirect` for rule dispatch) — defer to Stage 4.
 
 ### Not planned
 

@@ -215,3 +215,112 @@ const _: () = {
 
 /// Type alias for the stratum meta-function pointer.
 pub type StratumMetaFn = unsafe extern "C" fn(*mut StratumMetaCtx);
+
+// ─── Stage 3: direct-insert rule variants ───────────────────────────
+
+/// Runtime context for Stage 3 packed JIT rule variants.
+///
+/// Head relations are written to directly — no results buffer needed.
+///
+/// repr(C) layout on 64-bit:
+///   rels      (ptr)  @ offset  0
+///   rels_len  (u32)  @ offset  8
+///   _pad      (u32)  @ offset 12
+///   bindings  (ptr)  @ offset 16
+///   head_rels (ptr)  @ offset 24
+#[repr(C)]
+pub struct PackedJitContextV3 {
+    /// Array of PackedStorage pointers, one per clause relation.
+    pub rels: *const *const PackedStorage,
+    pub rels_len: u32,
+    pub _pad: u32,
+    /// Flat u32 binding scratch: `bindings[var_id]` = current packed value.
+    pub bindings: *mut u32,
+    /// Array of *mut PackedStorage, one per head relation (direct insert target).
+    pub head_rels: *const *mut PackedStorage,
+}
+
+pub type PackedJitFnV3 = unsafe extern "C" fn(*mut PackedJitContextV3);
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::offset_of!(PackedJitContextV3, rels) == 0);
+    assert!(std::mem::offset_of!(PackedJitContextV3, rels_len) == 8);
+    assert!(std::mem::offset_of!(PackedJitContextV3, bindings) == 16);
+    assert!(std::mem::offset_of!(PackedJitContextV3, head_rels) == 24);
+};
+
+/// Context for Stage 3 stratum meta-function (direct-insert variant).
+///
+/// Layout (repr C, 64-bit):
+///   offset  0: full_fns    *const PackedJitFnV3           (8 bytes)
+///   offset  8: full_ctxs   *const *mut PackedJitContextV3 (8 bytes)
+///   offset 16: num_full    u32                            (4 bytes)
+///   offset 20: num_recent  u32                            (4 bytes)
+///   offset 24: recent_fns  *const PackedJitFnV3           (8 bytes)
+///   offset 32: recent_ctxs *const *mut PackedJitContextV3 (8 bytes)
+///   offset 40: all_rels    *const *mut PackedStorage       (8 bytes)
+///   offset 48: n_all_rels  u32                            (4 bytes)
+///   offset 52: _pad        u32                            (4 bytes)
+#[repr(C)]
+pub struct StratumStage3Ctx {
+    pub full_fns: *const PackedJitFnV3,
+    pub full_ctxs: *const *mut PackedJitContextV3,
+    pub num_full: u32,
+    pub num_recent: u32,
+    pub recent_fns: *const PackedJitFnV3,
+    pub recent_ctxs: *const *mut PackedJitContextV3,
+    pub all_rels: *const *mut PackedStorage,
+    pub n_all_rels: u32,
+    pub _pad: u32,
+}
+
+pub type StratumStage3Fn = unsafe extern "C" fn(*mut StratumStage3Ctx);
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::offset_of!(StratumStage3Ctx, full_fns) == 0);
+    assert!(std::mem::offset_of!(StratumStage3Ctx, full_ctxs) == 8);
+    assert!(std::mem::offset_of!(StratumStage3Ctx, num_full) == 16);
+    assert!(std::mem::offset_of!(StratumStage3Ctx, num_recent) == 20);
+    assert!(std::mem::offset_of!(StratumStage3Ctx, recent_fns) == 24);
+    assert!(std::mem::offset_of!(StratumStage3Ctx, recent_ctxs) == 32);
+    assert!(std::mem::offset_of!(StratumStage3Ctx, all_rels) == 40);
+    assert!(std::mem::offset_of!(StratumStage3Ctx, n_all_rels) == 48);
+};
+
+/// Insert a packed u32 tuple directly into a relation.
+///
+/// Returns 1 if new, 0 if duplicate. Equivalent to `insert_packed_raw` but
+/// callable from JIT-generated code.
+///
+/// # Safety
+/// `rel` must point to a valid `PackedStorage`. `tuple` must point to `arity` valid u32s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn packed_try_insert(
+    rel: *mut PackedStorage,
+    tuple: *const u32,
+    arity: u32,
+) -> u8 {
+    let rel = unsafe { &mut *rel };
+    let slice = unsafe { std::slice::from_raw_parts(tuple, arity as usize) };
+    rel.insert_packed_raw(slice) as u8
+}
+
+/// Advance all packed relations and return 1 if any gained new tuples.
+///
+/// Called once per semi-naive iteration in Stage 3 (no flush step needed).
+///
+/// # Safety
+/// `rels` must point to `n_rels` valid `*mut PackedStorage` pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_stratum_advance(rels: *const *mut PackedStorage, n_rels: u32) -> u8 {
+    let mut changed = false;
+    for i in 0..n_rels as usize {
+        let rel = unsafe { &mut **rels.add(i) };
+        if rel.advance() {
+            changed = true;
+        }
+    }
+    changed as u8
+}

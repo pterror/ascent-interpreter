@@ -66,6 +66,9 @@ pub(crate) struct PackedJitHelperIds {
     pub(crate) packed_lookup: FuncId,
     pub(crate) packed_push_result: FuncId,
     pub(crate) stratum_flush_advance: FuncId,
+    // Stage 3 helpers
+    pub(crate) packed_try_insert: FuncId,
+    pub(crate) stratum_advance: FuncId,
 }
 
 /// A packed-JIT compiled rule with semi-naive variants.
@@ -73,6 +76,24 @@ pub(crate) struct PackedJitHelperIds {
 pub struct PackedJitCompiledRule {
     /// `variants[0]` = no-recent. `variants[i+1]` = recent for clause i.
     variants: Vec<Option<packed_helpers::PackedJitFn>>,
+}
+
+/// A Stage 3 packed-JIT compiled rule: direct-insert variants.
+#[cfg(feature = "specialized")]
+pub struct PackedJitCompiledRuleV3 {
+    /// `variants[0]` = no-recent. `variants[i+1]` = recent for clause i.
+    variants: Vec<Option<packed_helpers::PackedJitFnV3>>,
+}
+
+#[cfg(feature = "specialized")]
+impl PackedJitCompiledRuleV3 {
+    pub fn full_variant(&self) -> Option<packed_helpers::PackedJitFnV3> {
+        self.variants.first().copied().flatten()
+    }
+
+    pub fn recent_variant(&self, clause_seq_idx: usize) -> Option<packed_helpers::PackedJitFnV3> {
+        self.variants.get(clause_seq_idx + 1).copied().flatten()
+    }
 }
 
 #[cfg(feature = "specialized")]
@@ -119,6 +140,12 @@ pub struct JitCompiler {
     /// Cache of stratum meta-functions: stratum_key -> fn_ptr (None = not eligible).
     #[cfg(feature = "specialized")]
     pub(crate) stratum_fn_cache: FxHashMap<usize, Option<packed_helpers::StratumMetaFn>>,
+    /// Cache of Stage 3 packed compiled rules.
+    #[cfg(feature = "specialized")]
+    pub(crate) packed_cache_v3: FxHashMap<usize, Option<PackedJitCompiledRuleV3>>,
+    /// Cache of Stage 3 stratum functions.
+    #[cfg(feature = "specialized")]
+    pub(crate) stratum_stage3_fn_cache: FxHashMap<usize, Option<packed_helpers::StratumStage3Fn>>,
 }
 
 impl JitCompiler {
@@ -178,6 +205,14 @@ impl JitCompiler {
                 "jit_stratum_flush_advance",
                 packed_helpers::jit_stratum_flush_advance as *const u8,
             );
+            jit_builder.symbol(
+                "packed_try_insert",
+                packed_helpers::packed_try_insert as *const u8,
+            );
+            jit_builder.symbol(
+                "jit_stratum_advance",
+                packed_helpers::jit_stratum_advance as *const u8,
+            );
         }
 
         let mut module = JITModule::new(jit_builder);
@@ -197,6 +232,10 @@ impl JitCompiler {
             packed_cache: FxHashMap::default(),
             #[cfg(feature = "specialized")]
             stratum_fn_cache: FxHashMap::default(),
+            #[cfg(feature = "specialized")]
+            packed_cache_v3: FxHashMap::default(),
+            #[cfg(feature = "specialized")]
+            stratum_stage3_fn_cache: FxHashMap::default(),
         })
     }
 
@@ -344,6 +383,177 @@ impl JitCompiler {
 
         let code_ptr = self.module.get_finalized_function(func_id);
         let fn_ptr: packed_helpers::PackedJitFn = unsafe { std::mem::transmute(code_ptr) };
+        Ok(fn_ptr)
+    }
+
+    /// Get or compile the Stage 3 (direct-insert) packed JIT variant.
+    #[cfg(feature = "specialized")]
+    pub fn get_or_compile_packed_v3(
+        &mut self,
+        rule_idx: usize,
+        rule: &CRule,
+    ) -> Option<&PackedJitCompiledRuleV3> {
+        if self.packed_cache_v3.contains_key(&rule_idx) {
+            return self.packed_cache_v3[&rule_idx].as_ref();
+        }
+        if !Self::is_packed_eligible(rule) {
+            self.packed_cache_v3.insert(rule_idx, None);
+            return None;
+        }
+        match self.compile_packed_rule_v3(rule_idx, rule) {
+            Ok(compiled) => {
+                self.packed_cache_v3.insert(rule_idx, Some(compiled));
+                self.packed_cache_v3[&rule_idx].as_ref()
+            }
+            Err(_) => {
+                self.packed_cache_v3.insert(rule_idx, None);
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "specialized")]
+    fn compile_packed_rule_v3(
+        &mut self,
+        rule_idx: usize,
+        rule: &CRule,
+    ) -> Result<PackedJitCompiledRuleV3, String> {
+        let clause_count = rule
+            .body
+            .iter()
+            .filter(|item| matches!(item, CBodyItem::Clause(_)))
+            .count();
+
+        let mut variants = Vec::with_capacity(clause_count + 1);
+
+        let fn_ptr = self.compile_packed_variant_v3(rule_idx, rule, None)?;
+        variants.push(Some(fn_ptr));
+
+        for (body_idx, item) in rule.body.iter().enumerate() {
+            if matches!(item, CBodyItem::Clause(_)) {
+                let fn_ptr = self.compile_packed_variant_v3(rule_idx, rule, Some(body_idx))?;
+                variants.push(Some(fn_ptr));
+            }
+        }
+
+        Ok(PackedJitCompiledRuleV3 { variants })
+    }
+
+    #[cfg(feature = "specialized")]
+    fn compile_packed_variant_v3(
+        &mut self,
+        rule_idx: usize,
+        rule: &CRule,
+        recent_clause_idx: Option<usize>,
+    ) -> Result<packed_helpers::PackedJitFnV3, String> {
+        let suffix = match recent_clause_idx {
+            None => "v3_full".to_string(),
+            Some(idx) => format!("v3_recent_{idx}"),
+        };
+        let name = format!("rule_{rule_idx}_{suffix}");
+
+        self.codegen_ctx.clear();
+        self.codegen_ctx.func = cranelift_codegen::ir::Function::new();
+
+        let ptr_type = self.module.target_config().pointer_type();
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_type));
+
+        let func_id = self
+            .module
+            .declare_function(&name, Linkage::Local, &sig)
+            .map_err(|e| format!("declare_function v3: {e}"))?;
+
+        self.codegen_ctx.func.signature = sig;
+
+        packed_codegen::codegen_packed_rule_body_v3(
+            rule,
+            recent_clause_idx,
+            func_id,
+            &mut self.module,
+            &mut self.builder_ctx,
+            &mut self.codegen_ctx,
+            &self.packed_helpers,
+        )?;
+
+        self.module
+            .finalize_definitions()
+            .map_err(|e| format!("finalize v3: {e}"))?;
+
+        let code_ptr = self.module.get_finalized_function(func_id);
+        let fn_ptr: packed_helpers::PackedJitFnV3 = unsafe { std::mem::transmute(code_ptr) };
+        Ok(fn_ptr)
+    }
+
+    /// Compile or retrieve a Stage 3 stratum function for the given rules.
+    ///
+    /// Returns `None` if any rule is not packed-JIT eligible.
+    #[cfg(feature = "specialized")]
+    pub fn compile_stratum_stage3(
+        &mut self,
+        stratum_key: usize,
+        rules: &[&CRule],
+    ) -> Option<packed_helpers::StratumStage3Fn> {
+        if let Some(cached) = self.stratum_stage3_fn_cache.get(&stratum_key) {
+            return *cached;
+        }
+
+        // All rules must have V3 compiled variants
+        for rule in rules {
+            let rule_idx = *rule as *const CRule as usize;
+            if !self.packed_cache_v3.get(&rule_idx).map_or(false, |v| v.is_some()) {
+                self.stratum_stage3_fn_cache.insert(stratum_key, None);
+                return None;
+            }
+        }
+
+        match self.compile_stratum_stage3_inner(stratum_key) {
+            Ok(fn_ptr) => {
+                self.stratum_stage3_fn_cache.insert(stratum_key, Some(fn_ptr));
+                Some(fn_ptr)
+            }
+            Err(_) => {
+                self.stratum_stage3_fn_cache.insert(stratum_key, None);
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "specialized")]
+    fn compile_stratum_stage3_inner(
+        &mut self,
+        stratum_key: usize,
+    ) -> Result<packed_helpers::StratumStage3Fn, String> {
+        let name = format!("stratum_stage3_{stratum_key}");
+        let ptr_type = self.module.target_config().pointer_type();
+
+        self.codegen_ctx.clear();
+        self.codegen_ctx.func = cranelift_codegen::ir::Function::new();
+
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_type));
+
+        let func_id = self
+            .module
+            .declare_function(&name, Linkage::Local, &sig)
+            .map_err(|e| format!("declare stratum_stage3: {e}"))?;
+
+        self.codegen_ctx.func.signature = sig;
+
+        stratum_codegen::codegen_stratum_stage3_fn(
+            self.packed_helpers.stratum_advance,
+            func_id,
+            &mut self.module,
+            &mut self.builder_ctx,
+            &mut self.codegen_ctx,
+        )?;
+
+        self.module
+            .finalize_definitions()
+            .map_err(|e| format!("finalize stratum_stage3: {e}"))?;
+
+        let code_ptr = self.module.get_finalized_function(func_id);
+        let fn_ptr: packed_helpers::StratumStage3Fn = unsafe { std::mem::transmute(code_ptr) };
         Ok(fn_ptr)
     }
 
@@ -798,6 +1008,22 @@ fn declare_packed_helpers(module: &mut JITModule) -> Result<PackedJitHelperIds, 
         .declare_function("jit_stratum_flush_advance", Linkage::Import, &sig)
         .map_err(map_err)?;
 
+    // packed_try_insert(rel: ptr, tuple: ptr, arity: i32) -> i8
+    let mut sig = Signature::new(cc);
+    sig.params = vec![AbiParam::new(ptr), AbiParam::new(ptr), AbiParam::new(I32)];
+    sig.returns = vec![AbiParam::new(I8)];
+    let packed_try_insert = module
+        .declare_function("packed_try_insert", Linkage::Import, &sig)
+        .map_err(map_err)?;
+
+    // jit_stratum_advance(rels: ptr, n_rels: i32) -> i8
+    let mut sig = Signature::new(cc);
+    sig.params = vec![AbiParam::new(ptr), AbiParam::new(I32)];
+    sig.returns = vec![AbiParam::new(I8)];
+    let stratum_advance = module
+        .declare_function("jit_stratum_advance", Linkage::Import, &sig)
+        .map_err(map_err)?;
+
     Ok(PackedJitHelperIds {
         packed_count,
         packed_data_ptr,
@@ -805,6 +1031,8 @@ fn declare_packed_helpers(module: &mut JITModule) -> Result<PackedJitHelperIds, 
         packed_lookup,
         packed_push_result,
         stratum_flush_advance,
+        packed_try_insert,
+        stratum_advance,
     })
 }
 

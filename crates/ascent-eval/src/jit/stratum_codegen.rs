@@ -11,6 +11,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 
+
 /// Generate the stratum meta-function body.
 ///
 /// The meta-function signature is `fn(*mut StratumMetaCtx)`.
@@ -165,6 +166,152 @@ pub(crate) fn codegen_stratum_meta_fn(
     module
         .define_function(func_id, codegen_ctx)
         .map_err(|e| format!("define stratum_meta_fn: {e}"))?;
+
+    Ok(())
+}
+
+/// Generate the Stage 3 stratum function body.
+///
+/// Identical loop structure to `codegen_stratum_meta_fn` but uses
+/// `PackedJitFnV3` (direct-insert) rule variants and calls
+/// `jit_stratum_advance(all_rels, n_all_rels)` instead of `flush_advance`.
+///
+/// `StratumStage3Ctx` layout (repr C, 64-bit):
+/// ```text
+///   offset  0: full_fns    *const PackedJitFnV3           (ptr_size)
+///   offset  8: full_ctxs   *const *mut PackedJitContextV3 (ptr_size)
+///   offset 16: num_full    u32
+///   offset 20: num_recent  u32
+///   offset 24: recent_fns  *const PackedJitFnV3           (ptr_size)
+///   offset 32: recent_ctxs *const *mut PackedJitContextV3 (ptr_size)
+///   offset 40: all_rels    *const *mut PackedStorage       (ptr_size)
+///   offset 48: n_all_rels  u32
+/// ```
+pub(crate) fn codegen_stratum_stage3_fn(
+    advance_fn: FuncId,
+    func_id: FuncId,
+    module: &mut JITModule,
+    builder_ctx: &mut FunctionBuilderContext,
+    codegen_ctx: &mut cranelift_codegen::Context,
+) -> Result<(), String> {
+    let ptr_t = module.target_config().pointer_type();
+    let ptr_size = ptr_t.bytes() as i32;
+
+    // jit_stratum_advance(rels: ptr, n_rels: i32) -> i8
+    let advance_ref = module.declare_func_in_func(advance_fn, &mut codegen_ctx.func);
+
+    let mut builder = FunctionBuilder::new(&mut codegen_ctx.func, builder_ctx);
+
+    let entry = builder.create_block();
+    let full_hdr = builder.create_block();
+    let full_body = builder.create_block();
+    let post_full = builder.create_block();
+    let inner_hdr = builder.create_block();
+    let inner_body = builder.create_block();
+    let post_inner = builder.create_block();
+    let exit = builder.create_block();
+
+    // Signature for indirect calls to V3 rule variants: fn(*mut PackedJitContextV3)
+    let mut rule_sig = module.make_signature();
+    rule_sig.params.push(AbiParam::new(ptr_t));
+    let rule_sig_ref = builder.import_signature(rule_sig);
+
+    // ─── entry ──────────────────────────────────────────────────────────
+    builder.append_block_params_for_function_params(entry);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+
+    let meta_ctx = builder.block_params(entry)[0];
+
+    let full_fns = builder.ins().load(ptr_t, MemFlags::trusted(), meta_ctx, 0i32);
+    let full_ctxs = builder.ins().load(ptr_t, MemFlags::trusted(), meta_ctx, ptr_size);
+    let num_full_i32 = builder.ins().load(I32, MemFlags::trusted(), meta_ctx, 2 * ptr_size);
+    let num_recent_i32 =
+        builder.ins().load(I32, MemFlags::trusted(), meta_ctx, 2 * ptr_size + 4i32);
+    let recent_fns = builder.ins().load(ptr_t, MemFlags::trusted(), meta_ctx, 3 * ptr_size);
+    let recent_ctxs = builder.ins().load(ptr_t, MemFlags::trusted(), meta_ctx, 4 * ptr_size);
+    // all_rels @ offset 40 = 5 * ptr_size; n_all_rels @ offset 48 = 6 * ptr_size
+    let all_rels = builder.ins().load(ptr_t, MemFlags::trusted(), meta_ctx, 5 * ptr_size);
+    let n_all_rels = builder.ins().load(I32, MemFlags::trusted(), meta_ctx, 6 * ptr_size);
+
+    let num_full = builder.ins().uextend(ptr_t, num_full_i32);
+    let num_recent = builder.ins().uextend(ptr_t, num_recent_i32);
+    let zero = builder.ins().iconst(ptr_t, 0);
+    let one = builder.ins().iconst(ptr_t, 1);
+
+    builder.ins().jump(full_hdr, &[zero]);
+
+    // ─── full_hdr(i) ─────────────────────────────────────────────────
+    builder.append_block_param(full_hdr, ptr_t);
+    builder.switch_to_block(full_hdr);
+
+    let i_full = builder.block_params(full_hdr)[0];
+    let done_full = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, i_full, num_full);
+    builder.ins().brif(done_full, post_full, &[], full_body, &[]);
+
+    // ─── full_body ────────────────────────────────────────────────────
+    builder.switch_to_block(full_body);
+    builder.seal_block(full_body);
+
+    let byte_off_full = builder.ins().imul_imm(i_full, ptr_size as i64);
+    let fn_addr_full = builder.ins().iadd(full_fns, byte_off_full);
+    let fn_ptr_full = builder.ins().load(ptr_t, MemFlags::trusted(), fn_addr_full, 0i32);
+    let ctx_addr_full = builder.ins().iadd(full_ctxs, byte_off_full);
+    let ctx_ptr_full = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_addr_full, 0i32);
+    builder.ins().call_indirect(rule_sig_ref, fn_ptr_full, &[ctx_ptr_full]);
+    let i_full_next = builder.ins().iadd(i_full, one);
+    builder.ins().jump(full_hdr, &[i_full_next]);
+    builder.seal_block(full_hdr);
+
+    // ─── post_full: initial advance ──────────────────────────────────
+    builder.switch_to_block(post_full);
+    builder.seal_block(post_full);
+
+    let call0 = builder.ins().call(advance_ref, &[all_rels, n_all_rels]);
+    let changed0 = builder.inst_results(call0)[0];
+    builder.ins().brif(changed0, inner_hdr, &[zero], exit, &[]);
+
+    // ─── inner_hdr(i) ─────────────────────────────────────────────────
+    builder.append_block_param(inner_hdr, ptr_t);
+    builder.switch_to_block(inner_hdr);
+
+    let i_inner = builder.block_params(inner_hdr)[0];
+    let done_inner =
+        builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, i_inner, num_recent);
+    builder.ins().brif(done_inner, post_inner, &[], inner_body, &[]);
+
+    // ─── inner_body ───────────────────────────────────────────────────
+    builder.switch_to_block(inner_body);
+    builder.seal_block(inner_body);
+
+    let byte_off_inner = builder.ins().imul_imm(i_inner, ptr_size as i64);
+    let fn_addr_inner = builder.ins().iadd(recent_fns, byte_off_inner);
+    let fn_ptr_inner = builder.ins().load(ptr_t, MemFlags::trusted(), fn_addr_inner, 0i32);
+    let ctx_addr_inner = builder.ins().iadd(recent_ctxs, byte_off_inner);
+    let ctx_ptr_inner = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_addr_inner, 0i32);
+    builder.ins().call_indirect(rule_sig_ref, fn_ptr_inner, &[ctx_ptr_inner]);
+    let i_inner_next = builder.ins().iadd(i_inner, one);
+    builder.ins().jump(inner_hdr, &[i_inner_next]);
+
+    // ─── post_inner: advance + loop-back ──────────────────────────────
+    builder.switch_to_block(post_inner);
+    builder.seal_block(post_inner);
+
+    let call1 = builder.ins().call(advance_ref, &[all_rels, n_all_rels]);
+    let changed1 = builder.inst_results(call1)[0];
+    builder.ins().brif(changed1, inner_hdr, &[zero], exit, &[]);
+    builder.seal_block(inner_hdr);
+
+    // ─── exit ─────────────────────────────────────────────────────────
+    builder.switch_to_block(exit);
+    builder.seal_block(exit);
+    builder.ins().return_(&[]);
+
+    builder.finalize();
+
+    module
+        .define_function(func_id, codegen_ctx)
+        .map_err(|e| format!("define stratum_stage3_fn: {e}"))?;
 
     Ok(())
 }

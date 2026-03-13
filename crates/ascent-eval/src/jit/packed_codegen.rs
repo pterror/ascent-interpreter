@@ -38,6 +38,15 @@ struct FuncRefs {
     packed_push_result: cranelift_codegen::ir::FuncRef,
 }
 
+/// Function references for Stage 3 direct-insert code generation.
+pub(crate) struct FuncRefsV3 {
+    pub(crate) packed_count: cranelift_codegen::ir::FuncRef,
+    pub(crate) packed_data_ptr: cranelift_codegen::ir::FuncRef,
+    pub(crate) packed_recent_idx: cranelift_codegen::ir::FuncRef,
+    pub(crate) packed_lookup: cranelift_codegen::ir::FuncRef,
+    pub(crate) packed_try_insert: cranelift_codegen::ir::FuncRef,
+}
+
 /// Fields loaded from PackedJitContext at function entry.
 struct CtxFields {
     rels: CValue,
@@ -692,5 +701,437 @@ fn compile_packed_binop(
             Ok(builder.ins().select(cmp, one, zero))
         }
         _ => Err(format!("packed JIT: unsupported binop in condition: {op:?}")),
+    }
+}
+
+// ─── Stage 3: direct-insert rule codegen ─────────────────────────────
+
+/// Generate a Stage 3 packed JIT function for a rule variant.
+///
+/// Identical to `codegen_packed_rule_body` except head tuples are written
+/// directly to `PackedJitContextV3.head_rels[head_idx]` via `packed_try_insert`
+/// instead of being pushed onto a results buffer.
+pub(crate) fn codegen_packed_rule_body_v3(
+    rule: &CRule,
+    recent_clause_idx: Option<usize>,
+    func_id: cranelift_module::FuncId,
+    module: &mut impl cranelift_module::Module,
+    builder_ctx: &mut cranelift_frontend::FunctionBuilderContext,
+    ctx: &mut cranelift_codegen::Context,
+    helpers: &PackedJitHelperIds,
+) -> Result<(), String> {
+    let ptr_type = module.target_config().pointer_type();
+
+    ctx.func.signature.params.push(AbiParam::new(ptr_type));
+    ctx.func.signature.returns.clear();
+
+    let func_refs = FuncRefsV3 {
+        packed_count: module.declare_func_in_func(helpers.packed_count, &mut ctx.func),
+        packed_data_ptr: module.declare_func_in_func(helpers.packed_data_ptr, &mut ctx.func),
+        packed_recent_idx: module.declare_func_in_func(helpers.packed_recent_idx, &mut ctx.func),
+        packed_lookup: module.declare_func_in_func(helpers.packed_lookup, &mut ctx.func),
+        packed_try_insert: module.declare_func_in_func(helpers.packed_try_insert, &mut ctx.func),
+    };
+
+    let mut builder = FunctionBuilder::new(&mut ctx.func, builder_ctx);
+    let entry_block = builder.create_block();
+    builder.append_block_params_for_function_params(entry_block);
+    builder.switch_to_block(entry_block);
+    builder.seal_block(entry_block);
+
+    let ctx_ptr = builder.block_params(entry_block)[0];
+
+    let flags = MemFlags::trusted();
+    // Load context fields (PackedJitContextV3 layout)
+    let rels = builder.ins().load(ptr_type, flags, ctx_ptr, 0_i32);
+    let bindings = builder.ins().load(ptr_type, flags, ctx_ptr, 16_i32);
+    let head_rels = builder.ins().load(ptr_type, flags, ctx_ptr, 24_i32); // V3: head_rels
+
+    let clauses: Vec<(usize, &CClause)> = rule
+        .body
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| match item {
+            CBodyItem::Clause(c) => Some((i, c)),
+            _ => None,
+        })
+        .collect();
+
+    let conditions: Vec<&CExpr> = rule
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            CBodyItem::Condition(crate::compiled::CCondition::If(expr)) => Some(expr),
+            _ => None,
+        })
+        .collect();
+
+    let mut next_var = 0usize;
+
+    gen_clauses_v3(
+        &mut builder,
+        &clauses,
+        0,
+        recent_clause_idx,
+        rels,
+        bindings,
+        head_rels,
+        &func_refs,
+        &rule.heads,
+        ptr_type,
+        &mut next_var,
+        &conditions,
+    );
+
+    builder.ins().return_(&[]);
+    builder.finalize();
+
+    module
+        .define_function(func_id, ctx)
+        .map_err(|e| format!("define_function v3: {e}"))?;
+
+    Ok(())
+}
+
+/// Recursively generate Stage 3 clause-matching code.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gen_clauses_v3(
+    builder: &mut FunctionBuilder,
+    clauses: &[(usize, &CClause)],
+    clause_offset: usize,
+    recent_clause_idx: Option<usize>,
+    rels: CValue,
+    bindings: CValue,
+    head_rels: CValue,
+    func_refs: &FuncRefsV3,
+    heads: &[CHeadClause],
+    ptr_type: cranelift_codegen::ir::Type,
+    next_var: &mut usize,
+    conditions: &[&CExpr],
+) {
+    if clause_offset >= clauses.len() {
+        if !conditions.is_empty() {
+            let done_block = builder.create_block();
+            for &expr in conditions {
+                let cond_val = compile_packed_expr(builder, expr, bindings)
+                    .expect("compile_packed_expr: should succeed for eligible exprs");
+                let pass_block = builder.create_block();
+                builder.ins().brif(cond_val, pass_block, &[], done_block, &[]);
+                builder.switch_to_block(pass_block);
+                builder.seal_block(pass_block);
+            }
+            gen_emit_heads_v3(builder, heads, head_rels, bindings, func_refs, ptr_type);
+            builder.ins().jump(done_block, &[]);
+            builder.switch_to_block(done_block);
+            builder.seal_block(done_block);
+        } else {
+            gen_emit_heads_v3(builder, heads, head_rels, bindings, func_refs, ptr_type);
+        }
+        return;
+    }
+
+    let (body_idx, clause) = clauses[clause_offset];
+    let use_recent = recent_clause_idx == Some(body_idx);
+    let rel_seq_idx = clause_offset;
+
+    let rel_ptr_offset = builder.ins().iconst(ptr_type, (rel_seq_idx as i64) * 8);
+    let rel_ptr_addr = builder.ins().iadd(rels, rel_ptr_offset);
+    let rel_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), rel_ptr_addr, 0);
+
+    // Note: packed_data_ptr is NOT cached here — it must be re-fetched inside the loop body
+    // in gen_full_scan_v3/gen_index_scan_v3 to handle reallocation from direct head inserts
+    // (which can occur in recursive rules where head == clause relation).
+    let arity = clause.args.len();
+    let use_recent_val = builder.ins().iconst(I32, if use_recent { 1 } else { 0 });
+
+    if clause.bound_cols.is_empty() {
+        gen_full_scan_v3(
+            builder, clause, rel_ptr, arity, use_recent, use_recent_val,
+            clauses, clause_offset, recent_clause_idx, rels, bindings, head_rels,
+            func_refs, heads, ptr_type, next_var, conditions,
+        );
+    } else {
+        gen_index_scan_v3(
+            builder, clause, rel_ptr, arity, use_recent_val,
+            clauses, clause_offset, recent_clause_idx, rels, bindings, head_rels,
+            func_refs, heads, ptr_type, next_var, conditions,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gen_full_scan_v3(
+    builder: &mut FunctionBuilder,
+    clause: &CClause,
+    rel_ptr: CValue,
+    arity: usize,
+    use_recent: bool,
+    use_recent_val: CValue,
+    clauses: &[(usize, &CClause)],
+    clause_offset: usize,
+    recent_clause_idx: Option<usize>,
+    rels: CValue,
+    bindings: CValue,
+    head_rels: CValue,
+    func_refs: &FuncRefsV3,
+    heads: &[CHeadClause],
+    ptr_type: cranelift_codegen::ir::Type,
+    next_var: &mut usize,
+    conditions: &[&CExpr],
+) {
+    let call = builder.ins().call(func_refs.packed_count, &[rel_ptr, use_recent_val]);
+    let count = builder.inst_results(call)[0];
+
+    let loop_header = builder.create_block();
+    let loop_body = builder.create_block();
+    let loop_exit = builder.create_block();
+
+    let var_i = Variable::new(*next_var);
+    *next_var += 1;
+    builder.declare_var(var_i, ptr_type);
+    let zero = builder.ins().iconst(ptr_type, 0);
+    builder.def_var(var_i, zero);
+    builder.ins().jump(loop_header, &[]);
+
+    builder.switch_to_block(loop_header);
+    let i = builder.use_var(var_i);
+    let cmp = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, i, count);
+    builder.ins().brif(cmp, loop_exit, &[], loop_body, &[]);
+
+    builder.switch_to_block(loop_body);
+    let i = builder.use_var(var_i);
+
+    let tuple_idx = if use_recent {
+        let call = builder.ins().call(func_refs.packed_recent_idx, &[rel_ptr, i]);
+        builder.inst_results(call)[0]
+    } else {
+        i
+    };
+
+    // Re-fetch packed_data_ptr each iteration to handle reallocation caused by
+    // direct head inserts (happens when head relation == this clause relation).
+    let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
+    let packed_buf = builder.inst_results(call)[0];
+    let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
+
+    let continue_block = builder.create_block();
+    for (col, arg) in clause.args.iter().enumerate() {
+        match arg {
+            CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+                let actual = load_packed_col(builder, tuple_ptr, col);
+                let expected = builder.ins().iconst(I32, *n as i64);
+                let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let pass_block = builder.create_block();
+                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                builder.switch_to_block(pass_block);
+                builder.seal_block(pass_block);
+            }
+            CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
+                let actual = load_packed_col(builder, tuple_ptr, col);
+                let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
+                let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let pass_block = builder.create_block();
+                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                builder.switch_to_block(pass_block);
+                builder.seal_block(pass_block);
+            }
+            _ => {}
+        }
+    }
+
+    for &(col, var_id) in &clause.fresh_cols {
+        let val = load_packed_col(builder, tuple_ptr, col);
+        store_binding(builder, bindings, var_id, val);
+    }
+
+    gen_clauses_v3(
+        builder, clauses, clause_offset + 1, recent_clause_idx,
+        rels, bindings, head_rels, func_refs, heads, ptr_type, next_var, conditions,
+    );
+
+    builder.ins().jump(continue_block, &[]);
+    builder.switch_to_block(continue_block);
+    builder.seal_block(continue_block);
+
+    let i = builder.use_var(var_i);
+    let one = builder.ins().iconst(ptr_type, 1);
+    let i_next = builder.ins().iadd(i, one);
+    builder.def_var(var_i, i_next);
+    builder.ins().jump(loop_header, &[]);
+
+    builder.switch_to_block(loop_exit);
+    builder.seal_block(loop_header);
+    builder.seal_block(loop_body);
+    builder.seal_block(loop_exit);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gen_index_scan_v3(
+    builder: &mut FunctionBuilder,
+    clause: &CClause,
+    rel_ptr: CValue,
+    arity: usize,
+    use_recent_val: CValue,
+    clauses: &[(usize, &CClause)],
+    clause_offset: usize,
+    recent_clause_idx: Option<usize>,
+    rels: CValue,
+    bindings: CValue,
+    head_rels: CValue,
+    func_refs: &FuncRefsV3,
+    heads: &[CHeadClause],
+    ptr_type: cranelift_codegen::ir::Type,
+    next_var: &mut usize,
+    conditions: &[&CExpr],
+) {
+    let primary_col = clause.bound_cols[0];
+    let key_i32 = load_bound_val(builder, clause, primary_col, bindings);
+    let col_val = builder.ins().iconst(I32, primary_col as i64);
+    let call = builder.ins().call(
+        func_refs.packed_lookup,
+        &[rel_ptr, col_val, key_i32, use_recent_val],
+    );
+    let results = builder.inst_results(call);
+    let indices_ptr = results[0];
+    let indices_len = results[1];
+
+    let loop_header = builder.create_block();
+    let loop_body = builder.create_block();
+    let loop_exit = builder.create_block();
+
+    let var_j = Variable::new(*next_var);
+    *next_var += 1;
+    builder.declare_var(var_j, ptr_type);
+    let zero = builder.ins().iconst(ptr_type, 0);
+    builder.def_var(var_j, zero);
+    builder.ins().jump(loop_header, &[]);
+
+    builder.switch_to_block(loop_header);
+    let j = builder.use_var(var_j);
+    let cmp = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, j, indices_len);
+    builder.ins().brif(cmp, loop_exit, &[], loop_body, &[]);
+
+    builder.switch_to_block(loop_body);
+    let j = builder.use_var(var_j);
+
+    let idx_byte_offset = builder.ins().imul_imm(j, 8_i64);
+    let idx_addr = builder.ins().iadd(indices_ptr, idx_byte_offset);
+    let tuple_idx = builder.ins().load(ptr_type, MemFlags::trusted(), idx_addr, 0);
+
+    // Re-fetch packed_data_ptr each iteration — direct head inserts may reallocate the buffer.
+    let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
+    let packed_buf = builder.inst_results(call)[0];
+    let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
+
+    let continue_block = builder.create_block();
+    let mut inner_blocks_to_seal = Vec::new();
+
+    for (col, arg) in clause.args.iter().enumerate() {
+        match arg {
+            CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+                let actual = load_packed_col(builder, tuple_ptr, col);
+                let expected = builder.ins().iconst(I32, *n as i64);
+                let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let pass_block = builder.create_block();
+                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                inner_blocks_to_seal.push(pass_block);
+                builder.switch_to_block(pass_block);
+            }
+            CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
+                let actual = load_packed_col(builder, tuple_ptr, col);
+                let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
+                let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let pass_block = builder.create_block();
+                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                inner_blocks_to_seal.push(pass_block);
+                builder.switch_to_block(pass_block);
+            }
+            _ => {}
+        }
+    }
+
+    for &col in &clause.bound_cols[1..] {
+        let actual = load_packed_col(builder, tuple_ptr, col);
+        let expected = load_bound_val(builder, clause, col, bindings);
+        let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+        let pass_block = builder.create_block();
+        builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+        inner_blocks_to_seal.push(pass_block);
+        builder.switch_to_block(pass_block);
+    }
+
+    for &(col, var_id) in &clause.fresh_cols {
+        let val = load_packed_col(builder, tuple_ptr, col);
+        store_binding(builder, bindings, var_id, val);
+    }
+
+    gen_clauses_v3(
+        builder, clauses, clause_offset + 1, recent_clause_idx,
+        rels, bindings, head_rels, func_refs, heads, ptr_type, next_var, conditions,
+    );
+
+    builder.ins().jump(continue_block, &[]);
+
+    builder.switch_to_block(continue_block);
+    for blk in inner_blocks_to_seal {
+        builder.seal_block(blk);
+    }
+    builder.seal_block(continue_block);
+
+    let j = builder.use_var(var_j);
+    let one = builder.ins().iconst(ptr_type, 1);
+    let j_next = builder.ins().iadd(j, one);
+    builder.def_var(var_j, j_next);
+    builder.ins().jump(loop_header, &[]);
+
+    builder.switch_to_block(loop_exit);
+    builder.seal_block(loop_header);
+    builder.seal_block(loop_body);
+    builder.seal_block(loop_exit);
+}
+
+/// Emit head tuples directly into head relations via `packed_try_insert`.
+fn gen_emit_heads_v3(
+    builder: &mut FunctionBuilder,
+    heads: &[CHeadClause],
+    head_rels: CValue,
+    bindings: CValue,
+    func_refs: &FuncRefsV3,
+    ptr_type: cranelift_codegen::ir::Type,
+) {
+    for (head_idx, head) in heads.iter().enumerate() {
+        let arity = head.args.len();
+
+        // Load head_rels[head_idx] -> *mut PackedStorage
+        let offset = builder.ins().iconst(ptr_type, (head_idx as i64) * 8);
+        let rel_addr = builder.ins().iadd(head_rels, offset);
+        let head_rel = builder.ins().load(ptr_type, MemFlags::trusted(), rel_addr, 0);
+
+        if arity == 0 {
+            let null = builder.ins().iconst(ptr_type, 0);
+            let arity_val = builder.ins().iconst(I32, 0);
+            builder.ins().call(func_refs.packed_try_insert, &[head_rel, null, arity_val]);
+            continue;
+        }
+
+        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (arity * 4) as u32,
+            2,
+        ));
+
+        for (col, arg) in head.args.iter().enumerate() {
+            let var_id = match arg {
+                CExpr::Var(id) => *id,
+                _ => panic!("packed JIT v3: non-Var head arg"),
+            };
+            let val = load_binding(builder, bindings, var_id);
+            let slot_addr = builder.ins().stack_addr(ptr_type, slot, (col * 4) as i32);
+            builder.ins().store(MemFlags::trusted(), val, slot_addr, 0);
+        }
+
+        let slot_addr = builder.ins().stack_addr(ptr_type, slot, 0);
+        let arity_val = builder.ins().iconst(I32, arity as i64);
+        builder.ins().call(func_refs.packed_try_insert, &[head_rel, slot_addr, arity_val]);
     }
 }
