@@ -589,9 +589,9 @@ impl Engine {
         let compiled: Vec<CRule> = strat.compiled.clone();
 
         self.var_count = self.var_interner.len();
-        for scc_indices in &sccs {
+        for (scc_idx, scc_indices) in sccs.iter().enumerate() {
             let rules: Vec<&CRule> = scc_indices.iter().map(|&i| &compiled[i]).collect();
-            self.run_stratum(&rules);
+            self.run_stratum(&rules, scc_idx, scc_indices);
         }
 
         // Clear recent/delta so stale data doesn't confuse the next run.
@@ -689,7 +689,7 @@ impl Engine {
             let rules: Vec<&CRule> = scc_indices.iter().map(|&i| &compiled[i]).collect();
 
             if needs_full_eval[scc_idx] {
-                self.run_stratum(&rules);
+                self.run_stratum(&rules, scc_idx, scc_indices);
             } else {
                 // Snapshot counts of owned relations before incremental eval
                 let pre_counts: Vec<(String, usize)> = scc_writes[scc_idx]
@@ -756,26 +756,26 @@ impl Engine {
     }
 
     /// Run a set of rules to fixpoint.
-    fn run_stratum(&mut self, rules: &[&CRule]) {
+    fn run_stratum(&mut self, rules: &[&CRule], scc_key: usize, rule_indices: &[usize]) {
         if rules.is_empty() {
             return;
         }
 
         // Fast path: Stage 4 stratum (inlined rule bodies, no call_indirect)
         #[cfg(all(feature = "jit", feature = "specialized"))]
-        if self.try_run_stratum_stage4(rules) {
+        if self.try_run_stratum_stage4(rules, scc_key, rule_indices) {
             return;
         }
 
         // Fast path: Stage 3 stratum (direct-insert, no results buffer)
         #[cfg(all(feature = "jit", feature = "specialized"))]
-        if self.try_run_stratum_stage3(rules) {
+        if self.try_run_stratum_stage3(rules, scc_key, rule_indices) {
             return;
         }
 
         // Fallback: Stage 2 stratum meta-function (buffered JIT loop)
         #[cfg(all(feature = "jit", feature = "specialized"))]
-        if self.try_run_stratum_meta(rules) {
+        if self.try_run_stratum_meta(rules, scc_key, rule_indices) {
             return;
         }
 
@@ -813,12 +813,12 @@ impl Engine {
     /// Returns `true` if successful (all rules are packed-JIT eligible and the
     /// meta-function was compiled), `false` to fall back to the interpreted loop.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn try_run_stratum_meta(&mut self, rules: &[&CRule]) -> bool {
+    fn try_run_stratum_meta(&mut self, rules: &[&CRule], scc_key: usize, rule_indices: &[usize]) -> bool {
         if rules.is_empty() {
             return false;
         }
 
-        let stratum_key = rules[0] as *const CRule as usize;
+        let stratum_key = scc_key;
 
         // Step 1: ensure all packed rules are compiled
         {
@@ -826,8 +826,7 @@ impl Engine {
                 return false;
             };
             let mut jit = jit_cell.lock().unwrap();
-            for rule in rules {
-                let rule_idx = *rule as *const CRule as usize;
+            for (rule, &rule_idx) in rules.iter().zip(rule_indices.iter()) {
                 if jit.get_or_compile_packed(rule_idx, rule).is_none() {
                     return false;
                 }
@@ -836,7 +835,7 @@ impl Engine {
 
         // Step 2: build the runtime context if not yet cached
         if !self.stratum_meta_cache.contains_key(&stratum_key) {
-            let runtime = match self.build_stratum_meta_runtime(rules) {
+            let runtime = match self.build_stratum_meta_runtime(rules, rule_indices) {
                 Some(r) => r,
                 None => return false,
             };
@@ -865,12 +864,12 @@ impl Engine {
     ///
     /// Returns `true` if successful, `false` to fall back to Stage 3 or interpreted.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn try_run_stratum_stage4(&mut self, rules: &[&CRule]) -> bool {
+    fn try_run_stratum_stage4(&mut self, rules: &[&CRule], scc_key: usize, _rule_indices: &[usize]) -> bool {
         if rules.is_empty() {
             return false;
         }
 
-        let stratum_key = rules[0] as *const CRule as usize;
+        let stratum_key = scc_key;
 
         // Step 1: compile the Stage 4 stratum function (eligibility checked inside)
         let stage4_fn = {
@@ -1090,12 +1089,12 @@ impl Engine {
     ///
     /// Returns `true` if successful, `false` to fall back to Stage 2 or interpreted.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn try_run_stratum_stage3(&mut self, rules: &[&CRule]) -> bool {
+    fn try_run_stratum_stage3(&mut self, rules: &[&CRule], scc_key: usize, rule_indices: &[usize]) -> bool {
         if rules.is_empty() {
             return false;
         }
 
-        let stratum_key = rules[0] as *const CRule as usize;
+        let stratum_key = scc_key;
 
         // Step 1: ensure all V3 packed rules are compiled
         {
@@ -1103,8 +1102,7 @@ impl Engine {
                 return false;
             };
             let mut jit = jit_cell.lock().unwrap();
-            for rule in rules {
-                let rule_idx = *rule as *const CRule as usize;
+            for (rule, &rule_idx) in rules.iter().zip(rule_indices.iter()) {
                 if jit.get_or_compile_packed_v3(rule_idx, rule).is_none() {
                     return false;
                 }
@@ -1113,7 +1111,7 @@ impl Engine {
 
         // Step 2: build the runtime context if not yet cached
         if !self.stratum_stage3_cache.contains_key(&stratum_key) {
-            let runtime = match self.build_stratum_stage3_runtime(rules) {
+            let runtime = match self.build_stratum_stage3_runtime(rules, rule_indices) {
                 Some(r) => r,
                 None => return false,
             };
@@ -1142,7 +1140,7 @@ impl Engine {
     ///
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn build_stratum_stage3_runtime(&self, rules: &[&CRule]) -> Option<StratumStage3Runtime> {
+    fn build_stratum_stage3_runtime(&self, rules: &[&CRule], rule_indices: &[usize]) -> Option<StratumStage3Runtime> {
         use crate::jit::packed_helpers::{PackedJitContextV3, StratumStage3Ctx};
         use crate::relation::Relation;
         use crate::specialized::PackedStorage;
@@ -1159,8 +1157,7 @@ impl Engine {
         let mut recent_fns_vec: Vec<crate::jit::packed_helpers::PackedJitFnV3> = Vec::new();
         let mut recent_ctx_ptrs_vec: Vec<*mut PackedJitContextV3> = Vec::new();
 
-        for rule in rules {
-            let rule_idx = *rule as *const CRule as usize;
+        for (rule, &rule_idx) in rules.iter().zip(rule_indices.iter()) {
             let compiled = jit_ref.packed_cache_v3.get(&rule_idx)?.as_ref()?;
 
             let full_fn = compiled.full_variant()?;
@@ -1291,7 +1288,7 @@ impl Engine {
     ///
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn build_stratum_meta_runtime(&self, rules: &[&CRule]) -> Option<StratumMetaRuntime> {
+    fn build_stratum_meta_runtime(&self, rules: &[&CRule], rule_indices: &[usize]) -> Option<StratumMetaRuntime> {
         use crate::jit::packed_helpers::{
             PackedJitContext, RuleFlushInfo, StratumFlusher, StratumMetaCtx,
         };
@@ -1317,8 +1314,7 @@ impl Engine {
         let mut recent_fns_vec: Vec<crate::jit::packed_helpers::PackedJitFn> = Vec::new();
         let mut recent_ctx_ptrs_vec: Vec<*mut PackedJitContext> = Vec::new();
 
-        for rule in rules {
-            let rule_idx = *rule as *const CRule as usize;
+        for (rule, &rule_idx) in rules.iter().zip(rule_indices.iter()) {
             let compiled = jit_ref.packed_cache.get(&rule_idx)?.as_ref()?;
 
             // Require full variant
@@ -4017,5 +4013,63 @@ mod tests {
 
         // Should still have exactly 1 tuple
         assert_eq!(engine.relation("dst").unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(feature = "jit", feature = "specialized"))]
+mod jit_hot_tests {
+    use super::*;
+    use ascent_syntax::AscentProgram;
+    use ascent_ir::Program;
+
+    fn run_shared_jit(source: &str) {
+        let ast: AscentProgram = syn::parse_str(source).unwrap();
+        let program = Program::from_ast(ast);
+        // warmup
+        let mut warmup = Engine::new(&program);
+        warmup.enable_jit();
+        warmup.run(&program);
+        let jit = warmup.share_jit_compiler().unwrap();
+        // hot run
+        let mut engine = Engine::new(&program);
+        engine.with_jit_compiler(jit);
+        engine.run(&program);
+    }
+
+    #[test]
+    fn tc_shared_jit() {
+        let mut source = String::from("relation edge(i32,i32);\nrelation path(i32,i32);\n");
+        for i in 1..10 { source.push_str(&format!("edge({},{});\n", i, i+1)); }
+        source.push_str("path(x,y) <-- edge(x,y);\npath(x,z) <-- edge(x,y),path(y,z);\n");
+        run_shared_jit(&source);
+    }
+
+    #[test]
+    fn tc_shared_jit_external_facts() {
+        // Mirrors the bench: facts inserted via engine.insert() before run()
+        // Uses n=50 to match the bench exactly
+        let source = "relation edge(i32,i32);\nrelation path(i32,i32);\npath(x,y) <-- edge(x,y);\npath(x,z) <-- edge(x,y),path(y,z);\n";
+        let ast: AscentProgram = syn::parse_str(source).unwrap();
+        let program = Program::from_ast(ast);
+        // warmup with external facts
+        let mut warmup = Engine::new(&program);
+        warmup.enable_jit();
+        for i in 1i32..50 {
+            warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+        }
+        warmup.run(&program);
+        let jit = warmup.share_jit_compiler().unwrap();
+        // hot run many times — Criterion runs thousands of iterations during warmup
+        for _ in 0..10000 {
+            let mut engine = Engine::new(&program);
+            engine.with_jit_compiler(jit.clone());
+            for i in 1i32..50 {
+                engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+            }
+            engine.run(&program);
+            let rel = engine.relation("path").unwrap();
+            assert!(rel.len() > 0, "expected path tuples from shared jit run");
+        }
     }
 }
