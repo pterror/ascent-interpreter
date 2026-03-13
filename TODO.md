@@ -94,9 +94,11 @@ Steps 1–2 are representation changes. Step 3 is the highest-value item for LSP
    - [x] Non-monotone strata re-derivation — clear and re-derive strata containing negation/aggregation when inputs change
 4. [x] Bytecode compiler for expressions — compile `CExpr` to a flat bytecode with a tight eval loop (LOAD_VAR, LOAD_CONST, ADD, CMP_EQ, etc.). Replaces tree-walk `eval_expr`. Can be worked in parallel with step 3.
 5. [x] Arity-specialized eval routines (feature-gated: `specialized`) — at rule load time, classify relations by type signature. Relations with all u32-representable columns (i32, u32, String, bool) use `PackedStorage` with dual-buffer layout: u32 flat buffer for fast dedup/index, Value buffer for eval loop reads. Graceful downgrade to generic on type mismatch. Mixed/wide relations fall back to generic `Vec<Value>` path.
-6. [ ] Cranelift JIT (feature-gated: `jit`) — compile rule bodies to native code. Inner join/filter loops become typed loads, index lookups, inserts with no interpretation overhead. Semi-naive loop and stratification stay as-is.
-   - **Attempted**: trampoline JIT (extern "C" helpers for all Value ops) — ~0% speedup, wrong approach
-   - **Correct approach**: for PackedStorage rules (all-u32 columns), JIT reads from u32 flat buffer directly — no Value, no helpers. Bound checks = integer compares. Must bypass the dual-buffer entirely (don't read from Value buffer). Eligible: all-PackedStorage relations + head args are pure variable references.
+6. [x] Cranelift JIT (feature-gated: `jit`) — typed packed JIT implemented. For PackedStorage rules, reads u32 directly from packed_data buffer; bindings are flat Vec<u32>; bound-col checks are inline icmp; no Value cloning in hot loop. Eligible: Clause-only body, Var-only clause/head args, all relations Packed at dispatch time.
+   - **Attempted first**: trampoline JIT (extern "C" helpers for all Value ops) — ~0% speedup, wrong approach (kept for non-packed fallback)
+   - **Correct approach implemented**: typed loads from u32 flat buffer, icmp comparisons, no Value enum in inner loop
+
+7. [ ] Intern arbitrary `Hash + Eq` types to extend PackedStorage beyond the current (i32, u32, bool, String) set. Add `PackedType::Interned` variant backed by a type-erased intern table (e.g. `Arc<dyn Any>` keyed by `TypeId`). This would make PackedStorage applicable to user-defined types and make the packed JIT general-purpose.
 
 ### Not planned
 
