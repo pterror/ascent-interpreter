@@ -839,23 +839,29 @@ pub(crate) fn gen_clauses_v3(
     let rel_ptr_addr = builder.ins().iadd(rels, rel_ptr_offset);
     let rel_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), rel_ptr_addr, 0);
 
-    // Note: packed_data_ptr is NOT cached here — it must be re-fetched inside the loop body
-    // in gen_full_scan_v3/gen_index_scan_v3 to handle reallocation from direct head inserts
-    // (which can occur in recursive rules where head == clause relation).
     let arity = clause.args.len();
     let use_recent_val = builder.ins().iconst(I32, if use_recent { 1 } else { 0 });
+
+    // A rule is recursive w.r.t. this clause if its head writes to the same
+    // relation that this clause reads from.  When recursive, packed_data_ptr
+    // must be re-fetched inside the scan loop because a direct head insert can
+    // reallocate the buffer.  When non-recursive the pointer is stable and can
+    // be cached once before the loop.
+    let is_recursive = heads.iter().any(|h| h.relation == clause.relation);
 
     if clause.bound_cols.is_empty() {
         gen_full_scan_v3(
             builder, clause, rel_ptr, arity, use_recent, use_recent_val,
             clauses, clause_offset, recent_clause_idx, rels, bindings, head_rels,
             lookup_handles, func_refs, heads, ptr_type, next_var, conditions,
+            is_recursive,
         );
     } else {
         gen_index_scan_v3(
             builder, clause, rel_ptr, arity, use_recent,
             clauses, clause_offset, recent_clause_idx, rels, bindings, head_rels,
             lookup_handles, func_refs, heads, ptr_type, next_var, conditions,
+            is_recursive,
         );
     }
 }
@@ -880,9 +886,21 @@ fn gen_full_scan_v3(
     ptr_type: cranelift_codegen::ir::Type,
     next_var: &mut usize,
     conditions: &[&CExpr],
+    is_recursive: bool,
 ) {
     let call = builder.ins().call(func_refs.packed_count, &[rel_ptr, use_recent_val]);
     let count = builder.inst_results(call)[0];
+
+    // For non-recursive rules the packed_data buffer cannot be reallocated during
+    // the scan, so we fetch the pointer once here (before the loop) and reuse it.
+    // For recursive rules (head writes to this clause's relation) we must re-fetch
+    // on every iteration because packed_try_insert may grow the Vec.
+    let cached_packed_buf = if !is_recursive {
+        let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
+        Some(builder.inst_results(call)[0])
+    } else {
+        None
+    };
 
     let loop_header = builder.create_block();
     let loop_body = builder.create_block();
@@ -910,10 +928,13 @@ fn gen_full_scan_v3(
         i
     };
 
-    // Re-fetch packed_data_ptr each iteration to handle reallocation caused by
-    // direct head inserts (happens when head relation == this clause relation).
-    let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
-    let packed_buf = builder.inst_results(call)[0];
+    // Use cached pointer for non-recursive rules; re-fetch for recursive ones.
+    let packed_buf = if let Some(buf) = cached_packed_buf {
+        buf
+    } else {
+        let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
+        builder.inst_results(call)[0]
+    };
     let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
 
     let continue_block = builder.create_block();
@@ -1003,6 +1024,7 @@ fn gen_index_scan_v3(
     ptr_type: cranelift_codegen::ir::Type,
     next_var: &mut usize,
     conditions: &[&CExpr],
+    is_recursive: bool,
 ) {
     let primary_col = clause.bound_cols[0];
     let key_i32 = load_bound_val(builder, clause, primary_col, bindings);
@@ -1055,6 +1077,16 @@ fn gen_index_scan_v3(
 
     // after_probe receives entry_head: I32 (head of linked-list chain, SENTINEL = empty)
     builder.append_block_param(after_probe, I32);
+
+    // Cache packed_data_ptr before entering the probe/value loops.
+    // Non-recursive rules: pointer is stable (no head insert can reallocate it).
+    // Recursive rules: must re-fetch inside the value loop after each potential insert.
+    let cached_packed_buf = if !is_recursive {
+        let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
+        Some(builder.inst_results(call)[0])
+    } else {
+        None
+    };
 
     builder.ins().jump(probe_loop, &[]);
 
@@ -1170,9 +1202,13 @@ fn gen_index_scan_v3(
     builder.declare_var(var_next_ptr, I32);
     builder.def_var(var_next_ptr, next_ptr);
 
-    // Re-fetch packed_data_ptr each iteration — direct head inserts may reallocate the buffer.
-    let call      = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
-    let packed_buf= builder.inst_results(call)[0];
+    // Use pre-fetched pointer for non-recursive rules; re-fetch for recursive ones.
+    let packed_buf = if let Some(buf) = cached_packed_buf {
+        buf
+    } else {
+        let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
+        builder.inst_results(call)[0]
+    };
     let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
 
     let continue_block = builder.create_block();
