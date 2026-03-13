@@ -140,6 +140,12 @@ Current JIT architecture (context for what needs to change):
 **Stage 4 — True inlining (no `call_indirect`)** ✅ DONE
 - [x] Inline all rule bodies directly into the stratum Cranelift function — one function per stratum with full visibility across all rules. `gen_clauses_v3` called directly from stratum codegen with shared `next_var` counter to avoid Cranelift Variable ID collisions. Stage 4 runs before Stage 3; Stage 3 remains as fallback.
 
+### JIT tuning
+
+- [ ] **Stage 4 code-size regression** — for rules with many clauses (e.g., triangle: 3 clauses), Stage 4 inlines 4 copies of a 3-deep loop nest into one Cranelift function, causing I-cache pressure that outweighs the call_indirect savings. Benchmark: triangle n=30 is 45% slower with Stage 4 than interpreter (Stage 3 was baseline). Fix options: (a) heuristic fallback to Stage 3 when total_clauses_across_all_variants > threshold; (b) reduce code duplication by only emitting recent variants for clauses that actually filter on recent data.
+
+- [ ] **Cache `packed_data_ptr` for non-recursive rules** — `gen_full_scan_v3` calls `packed_data_ptr` inside the scan loop on every iteration to handle the case where head relation == clause relation (recursive insert can reallocate). For non-recursive rules (head ∉ clause relations), the pointer is stable. Pass a `is_recursive: bool` flag through codegen; only re-fetch inside the loop when true. Applies to Stage 3 and Stage 4. Would reduce inner loop body size by one runtime call.
+
 ### Relation storage optimizations
 
 - [ ] **Lazy `recent_col_indices` rebuild** — `advance()` in both `PackedStorage` (`specialized.rs`) and `RelationStorage` (`relation.rs`) unconditionally rebuilds recent indices even for sink relations (head-only, never body clauses). The right implementation is a new `ensure_recent_indices(&mut self)` called at eval-loop level only for relations that are body clauses in the current stratum — avoids the `&self`/`RefCell` tangle. Impact limited to programs with head-only output relations; benchmarks (TC, triangles) don't benefit.
