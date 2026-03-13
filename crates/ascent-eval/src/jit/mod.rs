@@ -11,6 +11,8 @@ pub(crate) mod layout;
 mod packed_codegen;
 #[cfg(feature = "specialized")]
 pub(crate) mod packed_helpers;
+#[cfg(feature = "specialized")]
+mod stratum_codegen;
 #[cfg(test)]
 mod tests;
 
@@ -63,6 +65,7 @@ pub(crate) struct PackedJitHelperIds {
     pub(crate) packed_recent_idx: FuncId,
     pub(crate) packed_lookup: FuncId,
     pub(crate) packed_push_result: FuncId,
+    pub(crate) stratum_flush_advance: FuncId,
 }
 
 /// A packed-JIT compiled rule with semi-naive variants.
@@ -113,6 +116,9 @@ pub struct JitCompiler {
     /// Cache of packed-compiled rules: rule_idx -> compiled (None = not eligible).
     #[cfg(feature = "specialized")]
     pub(crate) packed_cache: FxHashMap<usize, Option<PackedJitCompiledRule>>,
+    /// Cache of stratum meta-functions: stratum_key -> fn_ptr (None = not eligible).
+    #[cfg(feature = "specialized")]
+    pub(crate) stratum_fn_cache: FxHashMap<usize, Option<packed_helpers::StratumMetaFn>>,
 }
 
 impl JitCompiler {
@@ -168,6 +174,10 @@ impl JitCompiler {
                 "packed_push_result",
                 packed_helpers::packed_push_result as *const u8,
             );
+            jit_builder.symbol(
+                "jit_stratum_flush_advance",
+                packed_helpers::jit_stratum_flush_advance as *const u8,
+            );
         }
 
         let mut module = JITModule::new(jit_builder);
@@ -185,6 +195,8 @@ impl JitCompiler {
             cache: FxHashMap::default(),
             #[cfg(feature = "specialized")]
             packed_cache: FxHashMap::default(),
+            #[cfg(feature = "specialized")]
+            stratum_fn_cache: FxHashMap::default(),
         })
     }
 
@@ -332,6 +344,78 @@ impl JitCompiler {
 
         let code_ptr = self.module.get_finalized_function(func_id);
         let fn_ptr: packed_helpers::PackedJitFn = unsafe { std::mem::transmute(code_ptr) };
+        Ok(fn_ptr)
+    }
+
+    /// Compile or retrieve a stratum meta-function for the given rules.
+    ///
+    /// Returns `None` if any rule is not packed-JIT eligible.
+    #[cfg(feature = "specialized")]
+    pub fn compile_stratum_meta(
+        &mut self,
+        stratum_key: usize,
+        rules: &[&CRule],
+    ) -> Option<packed_helpers::StratumMetaFn> {
+        if let Some(cached) = self.stratum_fn_cache.get(&stratum_key) {
+            return *cached;
+        }
+
+        // All rules must be packed-JIT compiled
+        for rule in rules {
+            let rule_idx = *rule as *const CRule as usize;
+            if !self.packed_cache.get(&rule_idx).map_or(false, |v| v.is_some()) {
+                self.stratum_fn_cache.insert(stratum_key, None);
+                return None;
+            }
+        }
+
+        match self.compile_stratum_meta_inner(stratum_key) {
+            Ok(fn_ptr) => {
+                self.stratum_fn_cache.insert(stratum_key, Some(fn_ptr));
+                Some(fn_ptr)
+            }
+            Err(_) => {
+                self.stratum_fn_cache.insert(stratum_key, None);
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "specialized")]
+    fn compile_stratum_meta_inner(
+        &mut self,
+        stratum_key: usize,
+    ) -> Result<packed_helpers::StratumMetaFn, String> {
+        let name = format!("stratum_meta_{stratum_key}");
+        let ptr_type = self.module.target_config().pointer_type();
+
+        self.codegen_ctx.clear();
+        self.codegen_ctx.func = cranelift_codegen::ir::Function::new();
+
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_type));
+
+        let func_id = self
+            .module
+            .declare_function(&name, Linkage::Local, &sig)
+            .map_err(|e| format!("declare stratum_meta: {e}"))?;
+
+        self.codegen_ctx.func.signature = sig;
+
+        stratum_codegen::codegen_stratum_meta_fn(
+            self.packed_helpers.stratum_flush_advance,
+            func_id,
+            &mut self.module,
+            &mut self.builder_ctx,
+            &mut self.codegen_ctx,
+        )?;
+
+        self.module
+            .finalize_definitions()
+            .map_err(|e| format!("finalize stratum_meta: {e}"))?;
+
+        let code_ptr = self.module.get_finalized_function(func_id);
+        let fn_ptr: packed_helpers::StratumMetaFn = unsafe { std::mem::transmute(code_ptr) };
         Ok(fn_ptr)
     }
 
@@ -706,12 +790,21 @@ fn declare_packed_helpers(module: &mut JITModule) -> Result<PackedJitHelperIds, 
         .declare_function("packed_push_result", Linkage::Import, &sig)
         .map_err(map_err)?;
 
+    // jit_stratum_flush_advance(flusher: ptr) -> i8
+    let mut sig = Signature::new(cc);
+    sig.params = vec![AbiParam::new(ptr)];
+    sig.returns = vec![AbiParam::new(I8)];
+    let stratum_flush_advance = module
+        .declare_function("jit_stratum_flush_advance", Linkage::Import, &sig)
+        .map_err(map_err)?;
+
     Ok(PackedJitHelperIds {
         packed_count,
         packed_data_ptr,
         packed_recent_idx,
         packed_lookup,
         packed_push_result,
+        stratum_flush_advance,
     })
 }
 

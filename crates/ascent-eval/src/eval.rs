@@ -250,6 +250,34 @@ impl Stratification {
     }
 }
 
+/// Pinned heap allocations backing a stratum meta-function's context.
+///
+/// Raw pointers inside `StratumMetaCtx` point into these allocations, so they
+/// must all outlive the `StratumMetaCtx` they support.  The struct is intentionally
+/// not `Send`/`Sync`; Engine is single-threaded.
+#[cfg(all(feature = "jit", feature = "specialized"))]
+#[allow(dead_code)]
+struct StratumMetaRuntime {
+    meta_ctx: Box<crate::jit::packed_helpers::StratumMetaCtx>,
+    // Fields prefixed with `_` are kept alive for their raw pointers; not read directly.
+    _per_rule_bindings: Vec<Box<[u32]>>,
+    _per_rule_results: Vec<Box<Vec<(usize, Vec<u32>)>>>,
+    _per_rule_clause_rels: Vec<Box<[*const crate::specialized::PackedStorage]>>,
+    _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContext>>,
+    _full_fns: Box<[crate::jit::packed_helpers::PackedJitFn]>,
+    _full_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContext]>,
+    _recent_fns: Box<[crate::jit::packed_helpers::PackedJitFn]>,
+    _recent_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContext]>,
+    _flusher: Box<crate::jit::packed_helpers::StratumFlusher>,
+}
+
+#[cfg(all(feature = "jit", feature = "specialized"))]
+impl std::fmt::Debug for StratumMetaRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StratumMetaRuntime").finish_non_exhaustive()
+    }
+}
+
 /// The evaluation engine state.
 #[derive(Debug)]
 pub struct Engine {
@@ -275,6 +303,9 @@ pub struct Engine {
     /// RefCell allows lazy compilation during derive_tuples (&self).
     #[cfg(feature = "jit")]
     jit: Option<RefCell<crate::jit::JitCompiler>>,
+    /// Cache of stratum meta-function runtime contexts.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    stratum_meta_cache: FxHashMap<usize, StratumMetaRuntime>,
 }
 
 impl Engine {
@@ -315,6 +346,8 @@ impl Engine {
             stratification: None,
             #[cfg(feature = "jit")]
             jit: None,
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            stratum_meta_cache: FxHashMap::default(),
         }
     }
 
@@ -641,6 +674,12 @@ impl Engine {
             return;
         }
 
+        // Fast path: stratum meta-function (all-packed JIT loop)
+        #[cfg(all(feature = "jit", feature = "specialized"))]
+        if self.try_run_stratum_meta(rules) {
+            return;
+        }
+
         // Initial iteration: evaluate all rules once
         for rule in rules {
             self.evaluate_rule(rule, false);
@@ -668,6 +707,226 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Try to run the stratum via the compiled meta-function.
+    ///
+    /// Returns `true` if successful (all rules are packed-JIT eligible and the
+    /// meta-function was compiled), `false` to fall back to the interpreted loop.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    fn try_run_stratum_meta(&mut self, rules: &[&CRule]) -> bool {
+        if rules.is_empty() {
+            return false;
+        }
+
+        let stratum_key = rules[0] as *const CRule as usize;
+
+        // Step 1: ensure all packed rules are compiled
+        {
+            let Some(jit_cell) = self.jit.as_ref() else {
+                return false;
+            };
+            let mut jit = jit_cell.borrow_mut();
+            for rule in rules {
+                let rule_idx = *rule as *const CRule as usize;
+                if jit.get_or_compile_packed(rule_idx, rule).is_none() {
+                    return false;
+                }
+            }
+        }
+
+        // Step 2: build the runtime context if not yet cached
+        if !self.stratum_meta_cache.contains_key(&stratum_key) {
+            let runtime = match self.build_stratum_meta_runtime(rules) {
+                Some(r) => r,
+                None => return false,
+            };
+            self.stratum_meta_cache.insert(stratum_key, runtime);
+        }
+
+        // Step 3: compile or retrieve the stratum meta-function
+        let meta_fn = {
+            let Some(jit_cell) = self.jit.as_ref() else {
+                return false;
+            };
+            let mut jit = jit_cell.borrow_mut();
+            match jit.compile_stratum_meta(stratum_key, rules) {
+                Some(f) => f,
+                None => return false,
+            }
+        };
+
+        // Step 4: call the meta-function
+        let runtime = self.stratum_meta_cache.get_mut(&stratum_key).unwrap();
+        unsafe { meta_fn(&raw mut *runtime.meta_ctx) };
+        true
+    }
+
+    /// Build the runtime context for the stratum meta-function.
+    ///
+    /// Returns `None` if any rule doesn't have all-packed clause or head relations.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    fn build_stratum_meta_runtime(&self, rules: &[&CRule]) -> Option<StratumMetaRuntime> {
+        use crate::jit::packed_helpers::{
+            PackedJitContext, RuleFlushInfo, StratumFlusher, StratumMetaCtx,
+        };
+        use crate::relation::Relation;
+        use crate::specialized::PackedStorage;
+
+        let jit_ref = self.jit.as_ref()?.borrow();
+
+        let mut per_rule_bindings: Vec<Box<[u32]>> = Vec::new();
+        let mut per_rule_results: Vec<Box<Vec<(usize, Vec<u32>)>>> = Vec::new();
+        let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
+        let mut per_rule_ctxs: Vec<Box<PackedJitContext>> = Vec::new();
+
+        let mut flush_rules: Vec<RuleFlushInfo> = Vec::new();
+
+        // full variant: one per rule
+        let mut full_fns_vec: Vec<crate::jit::packed_helpers::PackedJitFn> = Vec::new();
+        let mut full_ctx_ptrs_vec: Vec<*mut PackedJitContext> = Vec::new();
+
+        // recent variants: (rule_idx, clause_seq) pairs — flattened
+        let mut recent_fns_vec: Vec<crate::jit::packed_helpers::PackedJitFn> = Vec::new();
+        let mut recent_ctx_ptrs_vec: Vec<*mut PackedJitContext> = Vec::new();
+
+        for rule in rules {
+            let rule_idx = *rule as *const CRule as usize;
+            let compiled = jit_ref.packed_cache.get(&rule_idx)?.as_ref()?;
+
+            // Require full variant
+            let full_fn = compiled.full_variant()?;
+
+            // Collect clause storage pointers
+            let clause_rels: Vec<*const PackedStorage> = rule
+                .body
+                .iter()
+                .filter_map(|item| match item {
+                    CBodyItem::Clause(c) => match self.relations.get(&c.relation)? {
+                        Relation::Packed(p) => Some(p as *const PackedStorage),
+                        Relation::Generic(_) => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+
+            let clause_count = rule
+                .body
+                .iter()
+                .filter(|i| matches!(i, CBodyItem::Clause(_)))
+                .count();
+
+            // Bail if any clause relation is not packed
+            if clause_rels.len() != clause_count {
+                return None;
+            }
+
+            // Collect head storage pointers
+            let head_rels: Vec<*mut PackedStorage> = rule
+                .heads
+                .iter()
+                .filter_map(|head| match self.relations.get(&head.relation)? {
+                    Relation::Packed(p) => Some(p as *const PackedStorage as *mut PackedStorage),
+                    Relation::Generic(_) => None,
+                })
+                .collect();
+
+            if head_rels.len() != rule.heads.len() {
+                return None;
+            }
+
+            let clause_rels_box: Box<[*const PackedStorage]> = clause_rels.into_boxed_slice();
+            let bindings_box: Box<[u32]> = vec![0u32; self.var_count].into_boxed_slice();
+            let results_box: Box<Vec<(usize, Vec<u32>)>> = Box::new(Vec::new());
+
+            let bindings_ptr: *mut u32 = bindings_box.as_ptr() as *mut u32;
+            let results_ptr: *mut Vec<(usize, Vec<u32>)> =
+                std::ptr::addr_of!(*results_box) as *mut _;
+
+            let ctx = Box::new(PackedJitContext {
+                rels: clause_rels_box.as_ptr(),
+                rels_len: clause_rels_box.len() as u32,
+                _pad: 0,
+                bindings: bindings_ptr,
+                results: results_ptr,
+            });
+
+            // Build recent variants for this rule: one per clause
+            let mut clause_seq = 0usize;
+            for item in rule.body.iter() {
+                if !matches!(item, CBodyItem::Clause(_)) {
+                    continue;
+                }
+                if let Some(recent_fn) = compiled.recent_variant(clause_seq) {
+                    recent_fns_vec.push(recent_fn);
+                    // ctx ptr will be filled after we push to per_rule_ctxs; use placeholder
+                    // We need the ptr to ctx before we move it into the vec — get it first
+                    recent_ctx_ptrs_vec.push(&*ctx as *const PackedJitContext as *mut PackedJitContext);
+                }
+                clause_seq += 1;
+            }
+
+            full_fns_vec.push(full_fn);
+            full_ctx_ptrs_vec.push(&*ctx as *const PackedJitContext as *mut PackedJitContext);
+
+            flush_rules.push(RuleFlushInfo {
+                results: results_ptr,
+                head_rels,
+            });
+
+            per_rule_bindings.push(bindings_box);
+            per_rule_results.push(results_box);
+            per_rule_clause_rels.push(clause_rels_box);
+            per_rule_ctxs.push(ctx);
+        }
+
+        // Collect all packed relations for advance()
+        let all_packed_rels: Vec<*mut PackedStorage> = self
+            .relations
+            .values()
+            .filter_map(|rel| match rel {
+                Relation::Packed(p) => Some(p as *const PackedStorage as *mut PackedStorage),
+                Relation::Generic(_) => None,
+            })
+            .collect();
+
+        // Box all arrays for stable addresses
+        let full_fns_box: Box<[crate::jit::packed_helpers::PackedJitFn]> =
+            full_fns_vec.into_boxed_slice();
+        let full_ctx_ptrs_box: Box<[*mut PackedJitContext]> =
+            full_ctx_ptrs_vec.into_boxed_slice();
+        let recent_fns_box: Box<[crate::jit::packed_helpers::PackedJitFn]> =
+            recent_fns_vec.into_boxed_slice();
+        let recent_ctx_ptrs_box: Box<[*mut PackedJitContext]> =
+            recent_ctx_ptrs_vec.into_boxed_slice();
+
+        let flusher = Box::new(StratumFlusher {
+            rules: flush_rules,
+            all_packed_rels,
+        });
+
+        let meta_ctx = Box::new(StratumMetaCtx {
+            full_fns: full_fns_box.as_ptr(),
+            full_ctxs: full_ctx_ptrs_box.as_ptr() as *const *mut PackedJitContext,
+            num_full: full_fns_box.len() as u32,
+            num_recent: recent_fns_box.len() as u32,
+            recent_fns: recent_fns_box.as_ptr(),
+            recent_ctxs: recent_ctx_ptrs_box.as_ptr() as *const *mut PackedJitContext,
+            flusher: &*flusher as *const StratumFlusher as *mut StratumFlusher,
+        });
+
+        Some(StratumMetaRuntime {
+            meta_ctx,
+            _per_rule_bindings: per_rule_bindings,
+            _per_rule_results: per_rule_results,
+            _per_rule_clause_rels: per_rule_clause_rels,
+            _per_rule_ctxs: per_rule_ctxs,
+            _full_fns: full_fns_box,
+            _full_ctx_ptrs: full_ctx_ptrs_box,
+            _recent_fns: recent_fns_box,
+            _recent_ctx_ptrs: recent_ctx_ptrs_box,
+            _flusher: flusher,
+        })
     }
 
     /// Run a set of rules incrementally (delta-only, no initial full evaluation).

@@ -326,6 +326,55 @@ impl PackedStorage {
         Ok(true)
     }
 
+    /// Insert a pre-packed u32 tuple directly (no Value→u32 packing step).
+    ///
+    /// Used by the stratum meta-function flush helper to avoid the unpack-repack roundtrip.
+    /// Populates both `packed_data` and `value_data` (by unpacking via `col_types`).
+    pub fn insert_packed_raw(&mut self, packed: &[u32]) -> bool {
+        debug_assert_eq!(packed.len(), self.arity, "packed tuple arity mismatch");
+
+        if self.arity == 0 {
+            if self.count > 0 {
+                return false;
+            }
+            self.count = 1;
+            self.source_tags.push(SourceId::ANONYMOUS);
+            self.delta.push(0);
+            return true;
+        }
+
+        let hash = hash_packed(packed);
+        let packed_data = &self.packed_data;
+        let arity = self.arity;
+        if self
+            .dedup
+            .find(hash, |&idx| {
+                &packed_data[idx * arity..(idx + 1) * arity] == packed
+            })
+            .is_some()
+        {
+            return false;
+        }
+
+        let idx = self.count;
+        for (col, &p) in packed.iter().enumerate() {
+            self.indices[col].entry(p).or_default().push(idx);
+        }
+        for (col, &p) in packed.iter().enumerate() {
+            self.value_data.push(self.col_types[col].unpack(p));
+        }
+        self.packed_data.extend_from_slice(packed);
+        self.source_tags.push(SourceId::ANONYMOUS);
+        self.count += 1;
+        self.delta.push(idx);
+
+        let packed_data = &self.packed_data;
+        self.dedup.insert_unique(hash, idx, |&i| {
+            hash_packed(&packed_data[i * arity..(i + 1) * arity])
+        });
+        true
+    }
+
     pub fn contains(&self, tuple: &[Value]) -> bool {
         if self.arity == 0 {
             return self.count > 0;

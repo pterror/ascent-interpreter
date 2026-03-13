@@ -385,3 +385,90 @@ fn test_packed_jit_arithmetic_condition() {
         "s",
     );
 }
+
+// ─── Stratum meta-function tests ────────────────────────────────────
+
+/// These tests exercise the stratum meta-function JIT path, which compiles
+/// a whole fixpoint loop per stratum into a single Cranelift function.
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stratum_meta_tc() {
+    // Classic transitive closure: two rules in the same SCC, exercises the
+    // full+recent loop in the meta-function.
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- path(x, y), edge(y, z);
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(4)],
+                vec![Value::I32(4), Value::I32(5)],
+            ],
+        )],
+        "path",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stratum_meta_multi_rule_stratum() {
+    // Multiple rules writing to the same output relation in the same SCC.
+    assert_packed_jit_equivalence(
+        r#"
+            relation a(i32, i32);
+            relation b(i32, i32);
+            relation reach(i32, i32);
+            reach(x, y) <-- a(x, y);
+            reach(x, y) <-- b(x, y);
+            reach(x, z) <-- reach(x, y), a(y, z);
+            reach(x, z) <-- reach(x, y), b(y, z);
+        "#,
+        &[
+            (
+                "a",
+                vec![
+                    vec![Value::I32(1), Value::I32(2)],
+                    vec![Value::I32(3), Value::I32(4)],
+                ],
+            ),
+            (
+                "b",
+                vec![
+                    vec![Value::I32(2), Value::I32(3)],
+                    vec![Value::I32(4), Value::I32(5)],
+                ],
+            ),
+        ],
+        "reach",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stratum_meta_single_rule_fixpoint() {
+    // Single rule with self-join — exercises fixpoint convergence.
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- edge(x, y), path(y, z);
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(10), Value::I32(20)],
+                vec![Value::I32(20), Value::I32(30)],
+                vec![Value::I32(30), Value::I32(10)], // cycle
+            ],
+        )],
+        "path",
+    );
+}

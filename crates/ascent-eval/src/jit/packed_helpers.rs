@@ -129,3 +129,89 @@ pub unsafe extern "C" fn packed_push_result(
     let slice = unsafe { std::slice::from_raw_parts(tuple, arity as usize) };
     results.push((head_idx, slice.to_vec()));
 }
+
+// ─── Stratum meta-function flush+advance helper ──────────────────────
+
+/// Per-rule info needed to flush JIT results into relations.
+pub struct RuleFlushInfo {
+    /// Pointer to the rule's results buffer (`Vec<(usize, Vec<u32>)>`).
+    pub results: *mut Vec<(usize, Vec<u32>)>,
+    /// Backing storage for head_rels slice.
+    /// head_rels[i] = *mut PackedStorage for rule.heads[i].
+    pub head_rels: Vec<*mut PackedStorage>,
+}
+
+/// Runtime state for the stratum meta-function flush+advance operation.
+pub struct StratumFlusher {
+    /// Per-rule flush info (one entry per rule in the stratum).
+    pub rules: Vec<RuleFlushInfo>,
+    /// All packed relations to advance each iteration.
+    pub all_packed_rels: Vec<*mut PackedStorage>,
+}
+
+/// Flush all pending rule results into their target relations, then advance
+/// all packed relations in the stratum.
+///
+/// Returns 1 if any relation gained new tuples this iteration, 0 otherwise.
+///
+/// # Safety
+/// All pointers in `flusher` must be valid for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_stratum_flush_advance(flusher: *mut StratumFlusher) -> u8 {
+    let flusher = unsafe { &mut *flusher };
+
+    for rule_info in &mut flusher.rules {
+        let results = unsafe { &mut *rule_info.results };
+        for (head_idx, packed_vals) in results.drain(..) {
+            if let Some(&rel_ptr) = rule_info.head_rels.get(head_idx) {
+                let rel = unsafe { &mut *rel_ptr };
+                rel.insert_packed_raw(&packed_vals);
+            }
+        }
+    }
+
+    let mut changed = false;
+    for &rel_ptr in &flusher.all_packed_rels {
+        let rel = unsafe { &mut *rel_ptr };
+        if rel.advance() {
+            changed = true;
+        }
+    }
+
+    changed as u8
+}
+
+/// Context struct passed to the stratum meta-function.
+///
+/// Layout (repr C, 64-bit):
+///   offset  0: full_fns    *const PackedJitFn           (8 bytes)
+///   offset  8: full_ctxs   *const *mut PackedJitContext  (8 bytes)
+///   offset 16: num_full    u32                           (4 bytes)
+///   offset 20: num_recent  u32                           (4 bytes)
+///   offset 24: recent_fns  *const PackedJitFn            (8 bytes)
+///   offset 32: recent_ctxs *const *mut PackedJitContext  (8 bytes)
+///   offset 40: flusher     *mut StratumFlusher            (8 bytes)
+#[repr(C)]
+pub struct StratumMetaCtx {
+    pub full_fns: *const PackedJitFn,
+    pub full_ctxs: *const *mut PackedJitContext,
+    pub num_full: u32,
+    pub num_recent: u32,
+    pub recent_fns: *const PackedJitFn,
+    pub recent_ctxs: *const *mut PackedJitContext,
+    pub flusher: *mut StratumFlusher,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::offset_of!(StratumMetaCtx, full_fns) == 0);
+    assert!(std::mem::offset_of!(StratumMetaCtx, full_ctxs) == 8);
+    assert!(std::mem::offset_of!(StratumMetaCtx, num_full) == 16);
+    assert!(std::mem::offset_of!(StratumMetaCtx, num_recent) == 20);
+    assert!(std::mem::offset_of!(StratumMetaCtx, recent_fns) == 24);
+    assert!(std::mem::offset_of!(StratumMetaCtx, recent_ctxs) == 32);
+    assert!(std::mem::offset_of!(StratumMetaCtx, flusher) == 40);
+};
+
+/// Type alias for the stratum meta-function pointer.
+pub type StratumMetaFn = unsafe extern "C" fn(*mut StratumMetaCtx);
