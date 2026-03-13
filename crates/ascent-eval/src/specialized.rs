@@ -211,6 +211,13 @@ pub struct PackedStorage {
     /// Number of tuples already indexed into jit_indices (for incremental update).
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) jit_full_indexed_count: usize,
+    /// JIT-accessible dedup snapshot — rebuilt incrementally in update_jit_indices().
+    /// Read-only during scans; only mutated between iterations (in advance()).
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) jit_dedup: crate::jit_index::JitDedupTable,
+    /// Number of tuples already reflected in jit_dedup.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) jit_dedup_indexed_count: usize,
 }
 
 impl PackedStorage {
@@ -236,6 +243,10 @@ impl PackedStorage {
             jit_recent_indices: Vec::new(),
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_full_indexed_count: 0,
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_dedup: crate::jit_index::JitDedupTable::new(arity),
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_dedup_indexed_count: 0,
         }
     }
 
@@ -527,6 +538,18 @@ impl PackedStorage {
             for col in 0..self.arity {
                 self.jit_recent_indices[col].insert(self.packed_data[base + col], idx as u32);
             }
+        }
+
+        // Incrementally update the JIT dedup snapshot with newly added tuples.
+        // Only processes [jit_dedup_indexed_count..count]; growth happens here,
+        // not during scans, so the entries pointer cached by JIT code is stable.
+        if self.arity > 0 {
+            for idx in self.jit_dedup_indexed_count..self.count {
+                let packed = &self.packed_data[idx * self.arity..(idx + 1) * self.arity];
+                let hash = crate::jit_index::jit_dedup_hash(packed);
+                self.jit_dedup.insert(hash, packed);
+            }
+            self.jit_dedup_indexed_count = self.count;
         }
     }
 

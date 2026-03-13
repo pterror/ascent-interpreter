@@ -148,6 +148,17 @@ Current JIT architecture (context for what needs to change):
 
 - [x] **Cache `packed_data_ptr` for non-recursive rules** — `gen_full_scan_v3` calls `packed_data_ptr` inside the scan loop on every iteration to handle the case where head relation == clause relation (recursive insert can reallocate). For non-recursive rules (head ∉ clause relations), the pointer is stable. Pass a `is_recursive: bool` flag through codegen; only re-fetch inside the loop when true. Applies to Stage 3 and Stage 4. Would reduce inner loop body size by one runtime call.
 
+#### Remaining inner-loop Rust calls (the real floor)
+
+The true minimum is **zero per-iteration calls + one per rule-invocation for insertion**:
+
+- [x] **Eliminate `packed_recent_idx`** — called once per recent-scan iteration to map `seq_idx → rel.recent[seq_idx]`. Fix: expose `recent.as_ptr()` via a new `packed_recent_ptr` helper (called once before the loop, same pattern as `packed_data_ptr` caching above); replace the per-iteration call with an inline `load ptr_type from (recent_ptr + i * ptr_size)`.
+
+- [ ] **Inline dedup probe for `packed_try_insert`** — at fixpoint, most head tuples are duplicates; `packed_try_insert` is called once per match but returns 0 (duplicate) the vast majority of the time. Fix in two parts:
+  1. Expose the dedup hash table with a `JitHashIndex`-compatible layout so the JIT can probe inline — duplicate path becomes zero Rust calls.
+  2. For the new-tuple path: write to a pre-allocated scratch buffer in the context; flush once per rule invocation via a single Rust call (`packed_bulk_insert`). This amortizes the insertion cost to O(1) Rust calls per rule call regardless of how many new tuples are produced.
+  Net result: zero per-iteration Rust calls; one Rust call per rule invocation (the flush).
+
 ### Relation storage optimizations
 
 - [ ] **Lazy `recent_col_indices` rebuild** — `advance()` in both `PackedStorage` (`specialized.rs`) and `RelationStorage` (`relation.rs`) unconditionally rebuilds recent indices even for sink relations (head-only, never body clauses). The right implementation is a new `ensure_recent_indices(&mut self)` called at eval-loop level only for relations that are body clauses in the current stratum — avoids the `&self`/`RefCell` tangle. Impact limited to programs with head-only output relations; benchmarks (TC, triangles) don't benefit.

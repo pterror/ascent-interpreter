@@ -42,6 +42,16 @@ cd docs && bun dev # Local docs
 
 **Do the work properly.** Don't leave workarounds or hacks undocumented. When asked to analyze X, actually read X — don't synthesize from conversation.
 
+## JIT Design Rule
+
+**Before implementing any JIT stage, trace the full hot-path and count Rust callbacks.**
+
+If the inner loop still calls back into Rust — for any reason (reading tuple data, inserting, counting) — **stop and fix the data access model first**. Do not build control-flow machinery on top of a callback-heavy foundation. Each layer of control-flow improvement (buffer flush → call_indirect → inlining) is wasted if the data ops underneath still round-trip through Rust.
+
+The question to ask before writing any JIT code: *"After this change, what does one iteration of the innermost loop look like, and how many Rust calls does it make?"* If the answer isn't zero (or one for insertion), the architecture is wrong.
+
+This rule exists because four stages of JIT work (Stages 1–4) were built without ever asking this question. The hash probe became inline, but `packed_data_ptr`, `packed_count`, `packed_recent_idx`, and `packed_try_insert` remained callbacks on every inner-loop iteration. The stages kept finding real overhead to eliminate at the control-flow level while leaving the data-access callbacks untouched throughout.
+
 ## Design Principles
 
 **Unify, don't multiply.** One interface for multiple cases > separate interfaces. Plugin systems > hardcoded switches.
@@ -84,11 +94,13 @@ Use plan mode as a handoff mechanism when:
 - The session has drifted from its original purpose
 - Context has accumulated enough that a fresh start would help
 
-**For handoffs:** enter plan mode, write a short plan pointing at TODO.md, and ExitPlanMode. **Do NOT investigate first** — the session is context-heavy and about to be discarded. The fresh session investigates after approval.
+**For handoffs:** enter plan mode, write one or two sentences that are literally just a pointer into TODO.md (e.g. "See TODO.md § JIT tuning — next item is X"), and ExitPlanMode. **Do not summarize, do not re-describe the work.** The fresh session reads TODO.md directly. Do NOT investigate first — the session is context-heavy and about to be discarded.
 
 **For mid-session planning** on a different topic: investigating inside plan mode is fine — context isn't being thrown away.
 
-Before the handoff plan, update TODO.md and memory files with anything worth preserving.
+**TODO.md is the lossless record. Memory files are lossy.** When preserving state across sessions, update TODO.md with the current plan/status and point the handoff there. Do not re-summarize plans or roadmaps into memory files — that introduces drift and the distorted version gets treated as authoritative. Memory files are for user preferences, workflow notes, and cross-cutting lessons — not for re-stating what TODO.md already tracks.
+
+Before the handoff plan, flush any new items to TODO.md. Memory files only need updating if there is genuinely new user/workflow/feedback information that isn't in TODO.md.
 
 ## Commit Convention
 

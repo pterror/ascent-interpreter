@@ -299,6 +299,8 @@ struct StratumStage3Runtime {
     _recent_fns: Box<[crate::jit::packed_helpers::PackedJitFnV3]>,
     _recent_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContextV3]>,
     _all_rels: Box<[*mut crate::specialized::PackedStorage]>,
+    /// Per-rule dedup handle pointer arrays (one *mut JitDedupHandle per head relation per rule).
+    _per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>>,
 }
 
 #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -324,6 +326,8 @@ struct StratumStage4Runtime {
     _handles_buf: Box<[crate::jit_index::JitLookupHandle]>,
     /// Parallel spec array for handle refresh (lookup_specs in ctx).
     _lookup_specs: Box<[crate::jit::packed_helpers::LookupSpec]>,
+    /// Per-rule dedup handle pointer arrays (one *mut JitDedupHandle per head relation per rule).
+    _per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>>,
 }
 
 #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -911,6 +915,8 @@ impl Engine {
         let mut per_rule_bindings: Vec<Box<[u32]>> = Vec::new();
         let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
         let mut per_rule_head_rels: Vec<Box<[*mut PackedStorage]>> = Vec::new();
+        let mut per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>> =
+            Vec::new();
         let mut per_rule_ctxs: Vec<Box<PackedJitContextV3>> = Vec::new();
         let mut rule_ctx_ptrs_vec: Vec<*mut PackedJitContextV3> = Vec::new();
 
@@ -1015,6 +1021,13 @@ impl Engine {
             let bindings_ptr: *mut u32 = bindings_box.as_ptr() as *mut u32;
             let head_rels_ptr: *const *mut PackedStorage = head_rels_box.as_ptr();
 
+            // Build dedup handle pointers (one per head relation).
+            let dedup_handles: Box<[*mut crate::jit_index::JitDedupHandle]> = head_rels_box
+                .iter()
+                .map(|&ps| unsafe { &raw mut (*ps).jit_dedup.handle })
+                .collect();
+            let head_dedup_handles_ptr = dedup_handles.as_ptr();
+
             // lookup_handles pointer will be fixed up after handles_flat is boxed.
             let ctx = Box::new(PackedJitContextV3 {
                 rels: clause_rels_box.as_ptr(),
@@ -1023,6 +1036,7 @@ impl Engine {
                 bindings: bindings_ptr,
                 head_rels: head_rels_ptr,
                 lookup_handles: std::ptr::null(), // fixed up below
+                head_dedup_handles: head_dedup_handles_ptr,
             });
 
             rule_ctx_ptrs_vec
@@ -1031,6 +1045,7 @@ impl Engine {
             per_rule_bindings.push(bindings_box);
             per_rule_clause_rels.push(clause_rels_box);
             per_rule_head_rels.push(head_rels_box);
+            per_rule_dedup_handles.push(dedup_handles);
             per_rule_ctxs.push(ctx);
         }
 
@@ -1082,6 +1097,7 @@ impl Engine {
             _all_rels: all_rels_box,
             _handles_buf: handles_box,
             _lookup_specs: specs_box,
+            _per_rule_dedup_handles: per_rule_dedup_handles,
         })
     }
 
@@ -1150,6 +1166,8 @@ impl Engine {
         let mut per_rule_bindings: Vec<Box<[u32]>> = Vec::new();
         let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
         let mut per_rule_head_rels: Vec<Box<[*mut PackedStorage]>> = Vec::new();
+        let mut per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>> =
+            Vec::new();
         let mut per_rule_ctxs: Vec<Box<PackedJitContextV3>> = Vec::new();
 
         let mut full_fns_vec: Vec<crate::jit::packed_helpers::PackedJitFnV3> = Vec::new();
@@ -1208,14 +1226,21 @@ impl Engine {
             let bindings_ptr: *mut u32 = bindings_box.as_ptr() as *mut u32;
             let head_rels_ptr: *const *mut PackedStorage = head_rels_box.as_ptr();
 
+            // Build dedup handle pointers (one per head relation).
+            let dedup_handles: Box<[*mut crate::jit_index::JitDedupHandle]> = head_rels_box
+                .iter()
+                .map(|&ps| unsafe { &raw mut (*ps).jit_dedup.handle })
+                .collect();
+            let head_dedup_handles_ptr = dedup_handles.as_ptr();
+
             let ctx = Box::new(PackedJitContextV3 {
                 rels: clause_rels_box.as_ptr(),
                 rels_len: clause_rels_box.len() as u32,
                 _pad: 0,
                 bindings: bindings_ptr,
                 head_rels: head_rels_ptr,
-                // Stage 3 uses call-based packed_lookup — no inline handles needed
                 lookup_handles: std::ptr::null(),
+                head_dedup_handles: head_dedup_handles_ptr,
             });
 
             // Build recent variants for this rule
@@ -1239,6 +1264,7 @@ impl Engine {
             per_rule_bindings.push(bindings_box);
             per_rule_clause_rels.push(clause_rels_box);
             per_rule_head_rels.push(head_rels_box);
+            per_rule_dedup_handles.push(dedup_handles);
             per_rule_ctxs.push(ctx);
         }
 
@@ -1281,6 +1307,7 @@ impl Engine {
             _recent_fns: recent_fns_box,
             _recent_ctx_ptrs: recent_ctx_ptrs_box,
             _all_rels: all_rels_box,
+            _per_rule_dedup_handles: per_rule_dedup_handles,
         })
     }
 

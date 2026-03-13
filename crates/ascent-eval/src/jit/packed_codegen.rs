@@ -745,6 +745,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
     let bindings = builder.ins().load(ptr_type, flags, ctx_ptr, 16_i32);
     let head_rels = builder.ins().load(ptr_type, flags, ctx_ptr, 24_i32); // V3: head_rels
     let lookup_handles = builder.ins().load(ptr_type, flags, ctx_ptr, 32_i32); // inline probe handles
+    let head_dedup_handles = builder.ins().load(ptr_type, flags, ctx_ptr, 40_i32); // dedup handles
 
     let clauses: Vec<(usize, &CClause)> = rule
         .body
@@ -776,6 +777,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
         bindings,
         head_rels,
         lookup_handles,
+        head_dedup_handles,
         &func_refs,
         &rule.heads,
         ptr_type,
@@ -804,6 +806,7 @@ pub(crate) fn gen_clauses_v3(
     bindings: CValue,
     head_rels: CValue,
     lookup_handles: CValue,
+    head_dedup_handles: CValue,
     func_refs: &FuncRefsV3,
     heads: &[CHeadClause],
     ptr_type: cranelift_codegen::ir::Type,
@@ -821,12 +824,12 @@ pub(crate) fn gen_clauses_v3(
                 builder.switch_to_block(pass_block);
                 builder.seal_block(pass_block);
             }
-            gen_emit_heads_v3(builder, heads, head_rels, bindings, func_refs, ptr_type);
+            gen_emit_heads_v3(builder, heads, head_rels, head_dedup_handles, bindings, func_refs, ptr_type, next_var);
             builder.ins().jump(done_block, &[]);
             builder.switch_to_block(done_block);
             builder.seal_block(done_block);
         } else {
-            gen_emit_heads_v3(builder, heads, head_rels, bindings, func_refs, ptr_type);
+            gen_emit_heads_v3(builder, heads, head_rels, head_dedup_handles, bindings, func_refs, ptr_type, next_var);
         }
         return;
     }
@@ -853,14 +856,14 @@ pub(crate) fn gen_clauses_v3(
         gen_full_scan_v3(
             builder, clause, rel_ptr, arity, use_recent, use_recent_val,
             clauses, clause_offset, recent_clause_idx, rels, bindings, head_rels,
-            lookup_handles, func_refs, heads, ptr_type, next_var, conditions,
+            lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
             is_recursive,
         );
     } else {
         gen_index_scan_v3(
             builder, clause, rel_ptr, arity, use_recent,
             clauses, clause_offset, recent_clause_idx, rels, bindings, head_rels,
-            lookup_handles, func_refs, heads, ptr_type, next_var, conditions,
+            lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
             is_recursive,
         );
     }
@@ -881,6 +884,7 @@ fn gen_full_scan_v3(
     bindings: CValue,
     head_rels: CValue,
     lookup_handles: CValue,
+    head_dedup_handles: CValue,
     func_refs: &FuncRefsV3,
     heads: &[CHeadClause],
     ptr_type: cranelift_codegen::ir::Type,
@@ -981,7 +985,8 @@ fn gen_full_scan_v3(
 
     gen_clauses_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
-        rels, bindings, head_rels, lookup_handles, func_refs, heads, ptr_type, next_var, conditions,
+        rels, bindings, head_rels, lookup_handles, head_dedup_handles,
+        func_refs, heads, ptr_type, next_var, conditions,
     );
 
     builder.ins().jump(continue_block, &[]);
@@ -1031,6 +1036,7 @@ fn gen_index_scan_v3(
     bindings: CValue,
     head_rels: CValue,
     lookup_handles: CValue,
+    head_dedup_handles: CValue,
     func_refs: &FuncRefsV3,
     heads: &[CHeadClause],
     ptr_type: cranelift_codegen::ir::Type,
@@ -1267,7 +1273,8 @@ fn gen_index_scan_v3(
 
     gen_clauses_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
-        rels, bindings, head_rels, lookup_handles, func_refs, heads, ptr_type, next_var, conditions,
+        rels, bindings, head_rels, lookup_handles, head_dedup_handles,
+        func_refs, heads, ptr_type, next_var, conditions,
     );
 
     builder.ins().jump(continue_block, &[]);
@@ -1289,15 +1296,38 @@ fn gen_index_scan_v3(
     builder.seal_block(loop_exit);
 }
 
-/// Emit head tuples directly into head relations via `packed_try_insert`.
+/// Emit head tuples with an inline JIT dedup probe before falling back to
+/// `packed_try_insert`.
+///
+/// For each head:
+/// 1. Build the candidate tuple in a stack slot.
+/// 2. Load the JIT dedup handle (`JitDedupHandle`) for this head.
+/// 3. If the table is empty (cap == 0, first iteration): call `packed_try_insert` directly.
+/// 4. Otherwise: compute the polynomial hash inline, probe the open-addressed table.
+///    - Empty slot → new tuple → call `packed_try_insert`.
+///    - Occupied slot with matching hash → verify all `arity` fields against the
+///      candidate tuple.  If all match: duplicate → skip entirely (zero Rust calls).
+///      If any field differs (hash collision): continue probing.
+///
+/// The dedup table is a frozen snapshot built by `update_jit_indices()` between
+/// iterations.  Tuples inserted in the *current* iteration are not present in the
+/// snapshot; those fall through to `packed_try_insert` (which finds them in the
+/// authoritative dedup and returns 0 = duplicate without re-inserting).
+#[allow(clippy::too_many_arguments)]
 fn gen_emit_heads_v3(
     builder: &mut FunctionBuilder,
     heads: &[CHeadClause],
     head_rels: CValue,
+    head_dedup_handles: CValue,
     bindings: CValue,
     func_refs: &FuncRefsV3,
     ptr_type: cranelift_codegen::ir::Type,
+    next_var: &mut usize,
 ) {
+    use cranelift_codegen::ir::condcodes::IntCC;
+
+    let sentinel_i32 = builder.ins().iconst(I32, 0xFFFF_FFFFu32 as i64);
+
     for (head_idx, head) in heads.iter().enumerate() {
         let arity = head.args.len();
 
@@ -1313,12 +1343,12 @@ fn gen_emit_heads_v3(
             continue;
         }
 
+        // Build candidate tuple in a stack slot.
         let slot = builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             (arity * 4) as u32,
             2,
         ));
-
         for (col, arg) in head.args.iter().enumerate() {
             let var_id = match arg {
                 CExpr::Var(id) => *id,
@@ -1328,9 +1358,141 @@ fn gen_emit_heads_v3(
             let slot_addr = builder.ins().stack_addr(ptr_type, slot, (col * 4) as i32);
             builder.ins().store(MemFlags::trusted(), val, slot_addr, 0);
         }
-
         let slot_addr = builder.ins().stack_addr(ptr_type, slot, 0);
         let arity_val = builder.ins().iconst(I32, arity as i64);
+
+        // Load dedup handle for this head: head_dedup_handles[head_idx] -> *mut JitDedupHandle
+        let hdl_offset = builder.ins().iconst(ptr_type, (head_idx as i64) * 8);
+        let hdl_addr = builder.ins().iadd(head_dedup_handles, hdl_offset);
+        let hdl_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), hdl_addr, 0);
+        // JitDedupHandle: entries @ offset 0 (ptr), cap @ offset 8 (u32)
+        let entries = builder.ins().load(ptr_type, MemFlags::trusted(), hdl_ptr, 0i32);
+        let cap_i32 = builder.ins().load(I32, MemFlags::trusted(), hdl_ptr, 8i32);
+
+        // If cap == 0 (empty table, first call): skip probe, go directly to insert.
+        let probe_start = builder.create_block();
+        let call_insert = builder.create_block();
+        let after_emit = builder.create_block();
+
+        let zero_i32 = builder.ins().iconst(I32, 0);
+        let is_cap_zero = builder.ins().icmp(IntCC::Equal, cap_i32, zero_i32);
+        builder.ins().brif(is_cap_zero, call_insert, &[], probe_start, &[]);
+
+        // ── probe_start ──────────────────────────────────────────────────────────
+        builder.switch_to_block(probe_start);
+        builder.seal_block(probe_start);
+
+        // Compute polynomial hash of candidate tuple (matches `jit_dedup_hash`):
+        //   h = 0; for each col: h = h * 0x9e3779b9 + val; remap FFFF_FFFF → FFFF_FFFE.
+        let mut hash_val = builder.ins().iconst(I32, 0);
+        for col in 0..arity {
+            let v = builder.ins().stack_load(I32, slot, (col * 4) as i32);
+            let mult = builder.ins().imul_imm(hash_val, 0x9e3779b9u32 as i64);
+            hash_val = builder.ins().iadd(mult, v);
+        }
+        let remapped = builder.ins().iconst(I32, 0xFFFF_FFFEu32 as i64);
+        let is_sentinel = builder.ins().icmp(IntCC::Equal, hash_val, sentinel_i32);
+        hash_val = builder.ins().select(is_sentinel, remapped, hash_val);
+
+        // cap − 1 = mask; slot = hash & mask (both as ptr_type for address arithmetic)
+        let cap = builder.ins().uextend(ptr_type, cap_i32);
+        let mask = builder.ins().iadd_imm(cap, -1i64);
+        let hash_ext = builder.ins().uextend(ptr_type, hash_val);
+        let init_slot = builder.ins().band(hash_ext, mask);
+
+        let var_probe_slot = Variable::new(*next_var);
+        *next_var += 1;
+        builder.declare_var(var_probe_slot, ptr_type);
+        builder.def_var(var_probe_slot, init_slot);
+
+        // Block structure (same pattern as gen_index_scan_v3):
+        //   probe_loop → probe_check_found | call_insert
+        //   probe_check_found → probe_verify | probe_next
+        //   probe_next → probe_loop  (back-edge; seal probe_loop after)
+        //   probe_verify → per-column checks → after_emit (duplicate) | probe_next
+        //   call_insert: packed_try_insert → after_emit
+        let probe_loop        = builder.create_block();
+        let probe_check_found = builder.create_block();
+        let probe_next        = builder.create_block();
+        let probe_verify      = builder.create_block();
+
+        builder.ins().jump(probe_loop, &[]);
+
+        // ── probe_loop ───────────────────────────────────────────────────────────
+        // stride = arity + 1; each slot is stride * 4 bytes wide.
+        let stride = arity as i64 + 1;
+        builder.switch_to_block(probe_loop);
+        // (not sealed yet — probe_next back-edge pending)
+        let ps = builder.use_var(var_probe_slot);
+        let byte_off = builder.ins().imul_imm(ps, stride * 4);
+        let entry_ptr = builder.ins().iadd(entries, byte_off);
+        let entry_hash = builder.ins().load(I32, MemFlags::trusted(), entry_ptr, 0i32);
+        let is_empty_slot = builder.ins().icmp(IntCC::Equal, entry_hash, sentinel_i32);
+        builder.ins().brif(is_empty_slot, call_insert, &[], probe_check_found, &[]);
+
+        // ── probe_check_found ────────────────────────────────────────────────────
+        builder.switch_to_block(probe_check_found);
+        builder.seal_block(probe_check_found);
+        let ps2 = builder.use_var(var_probe_slot);
+        let byte_off2 = builder.ins().imul_imm(ps2, stride * 4);
+        let entry_ptr2 = builder.ins().iadd(entries, byte_off2);
+        let entry_hash2 = builder.ins().load(I32, MemFlags::trusted(), entry_ptr2, 0i32);
+        let hash_matches = builder.ins().icmp(IntCC::Equal, entry_hash2, hash_val);
+        builder.ins().brif(hash_matches, probe_verify, &[], probe_next, &[]);
+
+        // ── probe_next ───────────────────────────────────────────────────────────
+        builder.switch_to_block(probe_next);
+        // (not sealed yet — probe_verify column-mismatch edges pending)
+        let ps_miss = builder.use_var(var_probe_slot);
+        let ps_next = builder.ins().iadd_imm(ps_miss, 1i64);
+        let ps_wrap = builder.ins().band(ps_next, mask);
+        builder.def_var(var_probe_slot, ps_wrap);
+        builder.ins().jump(probe_loop, &[]);
+        builder.seal_block(probe_loop); // both predecessors now known
+
+        // ── probe_verify ─────────────────────────────────────────────────────────
+        // Compare each stored data field against the candidate tuple field.
+        // Any mismatch → probe_next (hash collision).  All match → duplicate → after_emit.
+        builder.switch_to_block(probe_verify);
+        builder.seal_block(probe_verify);
+
+        let ps_v = builder.use_var(var_probe_slot);
+        let byte_off_v = builder.ins().imul_imm(ps_v, stride * 4);
+        let entry_ptr_v = builder.ins().iadd(entries, byte_off_v);
+
+        let mut mismatch_predecessors: usize = 0; // count edges into probe_next from here
+        for col in 0..arity {
+            // stored field is at byte offset (1 + col) * 4 relative to entry_ptr
+            let stored = builder.ins().load(
+                I32, MemFlags::trusted(), entry_ptr_v, ((1 + col) * 4) as i32,
+            );
+            let cand = builder.ins().stack_load(I32, slot, (col * 4) as i32);
+            let not_eq = builder.ins().icmp(IntCC::NotEqual, stored, cand);
+            let pass_block = builder.create_block();
+            builder.ins().brif(not_eq, probe_next, &[], pass_block, &[]);
+            builder.switch_to_block(pass_block);
+            builder.seal_block(pass_block);
+            mismatch_predecessors += 1;
+        }
+        // All fields matched: this is a duplicate — jump past the insert.
+        builder.ins().jump(after_emit, &[]);
+        // Now all probe_next predecessors are known: probe_check_found + arity mismatches.
+        // (probe_check_found → probe_next was already sealed above with seal_block, but
+        //  Cranelift's seal works on predecessor *count*, so we seal after all edges are added.)
+        // Actually probe_next was NOT sealed above — we seal it now.
+        let _ = mismatch_predecessors; // all edges have been emitted
+        builder.seal_block(probe_next);
+
+        // ── call_insert ──────────────────────────────────────────────────────────
+        // Entered when: cap == 0 (initial jump) OR empty slot found during probe.
+        // call_insert has two predecessors: the cap==0 branch and the empty-slot branch.
+        builder.switch_to_block(call_insert);
+        builder.seal_block(call_insert);
         builder.ins().call(func_refs.packed_try_insert, &[head_rel, slot_addr, arity_val]);
+        builder.ins().jump(after_emit, &[]);
+
+        // ── after_emit ───────────────────────────────────────────────────────────
+        builder.switch_to_block(after_emit);
+        builder.seal_block(after_emit);
     }
 }

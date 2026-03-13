@@ -535,3 +535,155 @@ mod tests {
         }
     }
 }
+
+// ─── JIT-accessible dedup hash table ────────────────────────────────────────
+
+/// Sentinel value: a slot whose hash field equals `JITDEDUP_EMPTY` is vacant.
+pub const JITDEDUP_EMPTY: u32 = 0xFFFF_FFFF;
+
+/// Compute the JIT dedup hash for a packed u32 tuple.
+///
+/// Uses a simple multiply-accumulate to keep the JIT-side implementation to a
+/// handful of `imul_imm` + `iadd` instructions — no length prefix, no FxHasher
+/// complexity.  The output `0xFFFF_FFFF` is remapped to `0xFFFF_FFFE` so it
+/// cannot collide with the empty-slot sentinel.
+///
+/// **Must match the hash emitted by the JIT in `gen_emit_heads_v3`.**
+pub fn jit_dedup_hash(packed: &[u32]) -> u32 {
+    let mut h: u32 = 0;
+    for &v in packed {
+        h = h.wrapping_mul(0x9e3779b9).wrapping_add(v);
+    }
+    if h == JITDEDUP_EMPTY { h = JITDEDUP_EMPTY - 1; }
+    h
+}
+
+/// JIT-visible handle for the dedup table (16 bytes, `repr(C)`).
+///
+/// The JIT code reads `entries` and `cap` from this handle.  The handle is
+/// embedded inside `JitDedupTable` and its address is stable for the lifetime
+/// of the owning `PackedStorage`.  After each grow, only the *contents* of
+/// `entries` and `cap` are updated in-place; the handle address itself never
+/// changes.
+///
+/// Flat slot layout: each slot is `stride = arity + 1` consecutive `u32`s:
+///   `slot[0]`          = hash (`JITDEDUP_EMPTY` = vacant)
+///   `slot[1..stride]`  = packed tuple data (`arity` u32s)
+///
+/// The JIT knows `stride` at compile time (it equals `head.args.len() + 1`).
+#[repr(C)]
+pub struct JitDedupHandle {
+    /// Pointer to the flat slot array; `null` when `cap == 0`.
+    pub entries: *mut u32,
+    /// Number of slots (always a power of two; mask = cap − 1).
+    pub cap: u32,
+    pub _pad: u32,
+}
+
+unsafe impl Send for JitDedupHandle {}
+unsafe impl Sync for JitDedupHandle {}
+
+const _: () = {
+    assert!(std::mem::size_of::<JitDedupHandle>() == 16);
+    assert!(std::mem::offset_of!(JitDedupHandle, entries) == 0);
+    assert!(std::mem::offset_of!(JitDedupHandle, cap) == 8);
+};
+
+/// Rust-managed owner of the JIT dedup hash table.
+///
+/// All mutation happens exclusively in `update_jit_indices()` (called from
+/// `advance()`).  JIT-generated code reads the table through the embedded
+/// `handle` field but **never writes to it**, so the `entries` pointer loaded
+/// at rule-variant function entry is stable for the entire duration of that
+/// call.
+pub struct JitDedupTable {
+    /// Flat slot storage; stride = arity + 1 u32s per slot.
+    entries_vec: Vec<u32>,
+    /// Stable handle embedded in this struct — address never changes.
+    pub handle: JitDedupHandle,
+    /// Slot width in u32s: `1` (hash) + `arity` (data words).
+    stride: usize,
+    /// Number of occupied (non-empty) slots.
+    count: usize,
+}
+
+unsafe impl Send for JitDedupTable {}
+unsafe impl Sync for JitDedupTable {}
+
+impl std::fmt::Debug for JitDedupTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitDedupTable")
+            .field("count", &self.count)
+            .field("stride", &self.stride)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for JitDedupTable {
+    fn clone(&self) -> Self {
+        // Rebuild from scratch — the clone starts empty; it will be repopulated
+        // by `update_jit_indices` on the next iteration.
+        Self::new(self.stride.saturating_sub(1))
+    }
+}
+
+impl JitDedupTable {
+    pub fn new(arity: usize) -> Self {
+        Self {
+            entries_vec: Vec::new(),
+            handle: JitDedupHandle { entries: std::ptr::null_mut(), cap: 0, _pad: 0 },
+            stride: arity + 1,
+            count: 0,
+        }
+    }
+
+    /// Insert a packed tuple.  Called only from `update_jit_indices()`.
+    pub fn insert(&mut self, hash: u32, packed: &[u32]) {
+        debug_assert_eq!(packed.len() + 1, self.stride);
+        self.maybe_grow();
+        let cap = self.entries_vec.len() / self.stride;
+        let mask = cap - 1;
+        let mut slot = (hash as usize) & mask;
+        loop {
+            let base = slot * self.stride;
+            if self.entries_vec[base] == JITDEDUP_EMPTY {
+                self.entries_vec[base] = hash;
+                self.entries_vec[base + 1..base + self.stride].copy_from_slice(packed);
+                self.count += 1;
+                return;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    fn maybe_grow(&mut self) {
+        let cur_cap = if self.stride == 0 { 0 } else { self.entries_vec.len() / self.stride };
+        // Grow when load factor > 75 %.
+        if cur_cap == 0 || (self.count + 1) * 4 > cur_cap * 3 {
+            let new_cap = if cur_cap == 0 { 16 } else { cur_cap * 2 };
+            let stride = self.stride;
+            let mut new_entries = vec![JITDEDUP_EMPTY; new_cap * stride];
+            let mask = new_cap - 1;
+            for i in 0..cur_cap {
+                let base = i * stride;
+                let h = self.entries_vec[base];
+                if h != JITDEDUP_EMPTY {
+                    let mut slot = (h as usize) & mask;
+                    loop {
+                        let nb = slot * stride;
+                        if new_entries[nb] == JITDEDUP_EMPTY {
+                            new_entries[nb..nb + stride]
+                                .copy_from_slice(&self.entries_vec[base..base + stride]);
+                            break;
+                        }
+                        slot = (slot + 1) & mask;
+                    }
+                }
+            }
+            self.entries_vec = new_entries;
+            // Update handle in-place so the stable pointer sees fresh data.
+            self.handle.entries = self.entries_vec.as_mut_ptr();
+            self.handle.cap = new_cap as u32;
+        }
+    }
+}

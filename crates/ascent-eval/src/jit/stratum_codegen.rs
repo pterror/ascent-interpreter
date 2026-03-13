@@ -517,11 +517,13 @@ fn emit_rule_bodies(
     for (rule_i, (clauses, heads, conditions)) in rules.iter().enumerate() {
         let ctx_i = rule_ctx_vals[rule_i];
 
-        // Load PackedJitContextV3 fields: rels @ 0, bindings @ 16, head_rels @ 24, lookup_handles @ 32
+        // Load PackedJitContextV3 fields: rels @ 0, bindings @ 16, head_rels @ 24,
+        // lookup_handles @ 32, head_dedup_handles @ 40
         let rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 0i32);
         let bindings_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
         let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
         let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
+        let head_dedup_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 40i32);
 
         // Build the (body_idx, &CClause) pairs as gen_clauses_v3 expects.
         // body_idx is the sequential clause index (0-based within the clauses slice).
@@ -539,6 +541,7 @@ fn emit_rule_bodies(
             bindings_i,
             head_rels_i,
             lookup_handles_i,
+            head_dedup_i,
             func_refs,
             heads,
             ptr_t,
@@ -579,6 +582,7 @@ fn emit_recent_rule_bodies(
         let bindings_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
         let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
         let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
+        let head_dedup_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 40i32);
 
         let indexed_clauses: Vec<(usize, &CClause)> =
             clauses.iter().enumerate().collect();
@@ -596,6 +600,7 @@ fn emit_recent_rule_bodies(
             bindings_i,
             head_rels_i,
             lookup_handles_i,
+            head_dedup_i,
             func_refs,
             heads,
             ptr_t,
