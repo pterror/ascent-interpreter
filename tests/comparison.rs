@@ -731,7 +731,7 @@ fn compare_lattice_shortest_path() {
 
 // ─── JIT Parity ─────────────────────────────────────────────────────
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 fn run_jit(input: &str) -> Engine {
     let ast: AscentAst = syn::parse_str(input).unwrap();
     let program = Program::from_ast(ast);
@@ -741,7 +741,7 @@ fn run_jit(input: &str) -> Engine {
     engine
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 #[test]
 fn compare_jit_transitive_closure() {
     let engine = run_jit("
@@ -765,7 +765,7 @@ fn compare_jit_transitive_closure() {
     assert_eq!(interp2(&engine, "path"), set2(prog.path));
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 #[test]
 fn compare_jit_self_join() {
     let engine = run_jit("
@@ -796,7 +796,7 @@ fn compare_jit_self_join() {
     );
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 #[test]
 fn compare_jit_mutual_recursion() {
     let engine = run_jit("
@@ -823,7 +823,7 @@ fn compare_jit_mutual_recursion() {
     assert_eq!(interp1(&engine, "odd"), set1(prog.odd), "odd");
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 #[test]
 fn compare_jit_factorial() {
     let engine = run_jit("
@@ -843,7 +843,7 @@ fn compare_jit_factorial() {
     assert_eq!(interp2(&engine, "fac"), set2(prog.fac));
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 #[test]
 fn compare_jit_arithmetic() {
     let engine = run_jit("
@@ -872,7 +872,7 @@ fn compare_jit_arithmetic() {
     assert_eq!(interp2(&engine, "big_square"), set2(prog.big_square));
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 #[test]
 fn compare_jit_constant_in_clause() {
     let engine = run_jit("
@@ -896,7 +896,7 @@ fn compare_jit_constant_in_clause() {
     assert_eq!(interp1(&engine, "filtered"), set1(prog.filtered));
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 #[test]
 fn compare_jit_rule_chaining() {
     let engine = run_jit("
@@ -930,7 +930,7 @@ fn compare_jit_rule_chaining() {
     assert_eq!(interp1(&engine, "step3"), set1(prog.step3), "step3");
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 #[test]
 fn compare_jit_generators() {
     let engine = run_jit("
@@ -953,7 +953,7 @@ fn compare_jit_generators() {
     assert_eq!(interp2(&engine, "pairs"), set2(prog.pairs));
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 #[test]
 fn compare_jit_three_way_join() {
     let engine = run_jit("
@@ -998,7 +998,7 @@ fn compare_jit_three_way_join() {
     assert_eq!(interp, macro_result);
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 #[test]
 fn compare_jit_duplicate_elimination() {
     let engine = run_jit("
@@ -1022,7 +1022,7 @@ fn compare_jit_duplicate_elimination() {
     assert_eq!(interp1(&engine, "unique_first"), set1(prog.unique_first));
 }
 
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "specialized"))]
 #[test]
 fn compare_jit_recursive_with_aggregation() {
     let engine = run_jit("
