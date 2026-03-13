@@ -7,6 +7,7 @@
 //! maintains compatibility with the generic evaluation loop.
 
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -15,14 +16,72 @@ use crate::intern::SymbolId;
 use crate::relation::SourceId;
 use crate::value::{Tuple, Value};
 
+/// Intern table for packing/unpacking arbitrary `Hash + Eq` values to u32.
+///
+/// Implementors map domain values ↔ stable u32 identifiers.
+/// `pack` returns `None` on type mismatch (not on missing key — values must
+/// already be interned before packing).
+pub trait InternTable: Send + Sync {
+    fn pack(&self, val: &Value) -> Option<u32>;
+    fn unpack(&self, id: u32) -> Value;
+}
+
+/// `InternTable` for `String` / `&str`: reads `SymbolId.0` directly.
+/// Zero-cost — no hash lookup; the global intern table is accessed only at
+/// string construction time, not here.
+struct StringInternTable;
+
+impl InternTable for StringInternTable {
+    #[inline]
+    fn pack(&self, val: &Value) -> Option<u32> {
+        if let Value::String(sid) = val {
+            Some(sid.0)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn unpack(&self, id: u32) -> Value {
+        Value::String(SymbolId(id))
+    }
+}
+
 /// Column type tag for packing/unpacking Value <-> u32.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum PackedType {
     I32,
     U32,
-    String,
     Bool,
+    /// Any type backed by an intern table. Replaces the old `String` variant;
+    /// `"String" | "&str" | "str"` maps here via `StringInternTable`.
+    Interned(Arc<dyn InternTable>),
 }
+
+impl std::fmt::Debug for PackedType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PackedType::I32 => write!(f, "I32"),
+            PackedType::U32 => write!(f, "U32"),
+            PackedType::Bool => write!(f, "Bool"),
+            PackedType::Interned(_) => write!(f, "Interned(..)"),
+        }
+    }
+}
+
+impl PartialEq for PackedType {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (PackedType::I32, PackedType::I32)
+                | (PackedType::U32, PackedType::U32)
+                | (PackedType::Bool, PackedType::Bool)
+                | (PackedType::Interned(_), PackedType::Interned(_))
+        )
+    }
+}
+
+impl Eq for PackedType {}
 
 impl PackedType {
     /// Try to classify a declared column type name as packable to u32.
@@ -30,7 +89,7 @@ impl PackedType {
         match name {
             "i32" => Some(PackedType::I32),
             "u32" => Some(PackedType::U32),
-            "String" | "&str" | "str" => Some(PackedType::String),
+            "String" | "&str" | "str" => Some(PackedType::Interned(Arc::new(StringInternTable))),
             "bool" => Some(PackedType::Bool),
             _ => None,
         }
@@ -42,8 +101,8 @@ impl PackedType {
         match (self, val) {
             (PackedType::I32, Value::I32(n)) => Some(*n as u32),
             (PackedType::U32, Value::U32(n)) => Some(*n),
-            (PackedType::String, Value::String(sid)) => Some(sid.0),
             (PackedType::Bool, Value::Bool(b)) => Some(*b as u32),
+            (PackedType::Interned(table), _) => table.pack(val),
             _ => None,
         }
     }
@@ -54,8 +113,8 @@ impl PackedType {
         match self {
             PackedType::I32 => Value::I32(raw as i32),
             PackedType::U32 => Value::U32(raw),
-            PackedType::String => Value::String(SymbolId(raw)),
             PackedType::Bool => Value::Bool(raw != 0),
+            PackedType::Interned(table) => table.unpack(raw),
         }
     }
 }
@@ -553,8 +612,9 @@ mod tests {
         use crate::intern;
         let sid = intern::intern("hello");
         let val = Value::String(sid);
-        let packed = PackedType::String.pack(&val).unwrap();
-        let unpacked = PackedType::String.unpack(packed);
+        let pt = PackedType::from_type_name("String").unwrap();
+        let packed = pt.pack(&val).unwrap();
+        let unpacked = pt.unpack(packed);
         assert_eq!(unpacked, val);
     }
 
