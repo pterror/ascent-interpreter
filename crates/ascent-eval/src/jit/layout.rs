@@ -13,9 +13,6 @@ pub const VALUE_ALIGN: usize = mem::align_of::<Value>();
 /// Size of an `Option<Value>` (one binding slot) in bytes.
 pub const SLOT_SIZE: usize = mem::size_of::<Option<Value>>();
 
-/// Alignment of an `Option<Value>` in bytes.
-pub const SLOT_ALIGN: usize = mem::align_of::<Option<Value>>();
-
 /// Size of a `usize` in bytes (pointer-width).
 pub const PTR_SIZE: usize = mem::size_of::<usize>();
 
@@ -38,7 +35,6 @@ mod tests {
         assert_eq!(VALUE_SIZE, mem::size_of::<Value>());
         assert_eq!(SLOT_SIZE, mem::size_of::<Option<Value>>());
         assert_eq!(VALUE_ALIGN, mem::align_of::<Value>());
-        assert_eq!(SLOT_ALIGN, mem::align_of::<Option<Value>>());
     }
 
     #[test]

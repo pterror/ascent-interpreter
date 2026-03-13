@@ -209,12 +209,10 @@ impl JitCompiler {
         variants.push(Some(fn_ptr));
 
         // Variants 1..=N: each clause body item index as recent
-        let mut clause_body_idx = 0;
         for (body_idx, item) in rule.body.iter().enumerate() {
             if matches!(item, CBodyItem::Clause(_)) {
                 let fn_ptr = self.compile_variant(rule_idx, rule, Some(body_idx))?;
                 variants.push(Some(fn_ptr));
-                clause_body_idx += 1;
             }
         }
 
@@ -265,11 +263,6 @@ impl JitCompiler {
         let code_ptr = self.module.get_finalized_function(func_id);
         let fn_ptr: JitFn = unsafe { std::mem::transmute(code_ptr) };
         Ok(fn_ptr)
-    }
-
-    /// Clear the compilation cache (e.g., when rules change).
-    pub fn clear_cache(&mut self) {
-        self.cache.clear();
     }
 }
 

@@ -5,7 +5,7 @@
 //! head emission. This keeps the JIT IR simple and avoids duplicating
 //! complex Rust logic in Cranelift.
 
-use crate::compiled::{CCondition, CExpr, CHeadClause, eval_cexpr};
+use crate::compiled::{CCondition, CHeadClause, eval_cexpr};
 use crate::eval::{Bindings, TypeRegistry, VarInterner};
 use crate::relation::Relation;
 use crate::value::{Tuple, Value};
@@ -15,14 +15,6 @@ use crate::value::{Tuple, Value};
 pub struct LookupResult {
     pub ptr: *const usize,
     pub len: usize,
-}
-
-/// Result of expression evaluation — value pointer + success flag.
-#[repr(C)]
-pub struct EvalResult {
-    /// Pointer to heap-allocated Value (caller must free), or null on failure.
-    pub ptr: *mut Value,
-    pub ok: bool,
 }
 
 /// Runtime context passed from Rust to JIT-generated code.

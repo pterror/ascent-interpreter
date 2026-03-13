@@ -6,7 +6,7 @@
 
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::{I32, I64};
+use cranelift_codegen::ir::types::I32;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags, Value as CValue};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Module};

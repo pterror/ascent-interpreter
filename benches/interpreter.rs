@@ -1,12 +1,14 @@
-//! Performance benchmarks: interpreter vs ascent macro.
+//! Performance benchmarks: interpreter vs ascent macro (vs JIT when available).
 //!
 //! Run with: cargo bench
+//! Run with JIT: cargo bench --features jit
 
 #![allow(clippy::field_reassign_with_default)]
 
 use ascent::aggregators::min;
 use ascent::ascent;
 use ascent_eval::Engine;
+use ascent_eval::value::Value;
 use ascent_ir::Program;
 use ascent_syntax::AscentProgram;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -19,27 +21,76 @@ fn run_interpreter(input: &str) -> Engine {
     engine
 }
 
+/// Pre-parse a program, returning (program, source_with_facts) for benchmarks
+/// that want to separate parse from run.
+fn prepare_program(input: &str) -> (Program, Engine) {
+    let ast: AscentProgram = syn::parse_str(input).unwrap();
+    let program = Program::from_ast(ast);
+    let engine = Engine::new(&program);
+    (program, engine)
+}
+
 // ─── Transitive Closure ─────────────────────────────────────────────
 
-fn transitive_closure_interpreter(n: i32) -> Engine {
+fn tc_source(n: i32) -> String {
     let mut source = String::from("relation edge(i32, i32);\nrelation path(i32, i32);\n");
-    // Linear chain: 1→2→3→...→n
     for i in 1..n {
         source.push_str(&format!("edge({}, {});\n", i, i + 1));
     }
     source.push_str("path(x, y) <-- edge(x, y);\n");
     source.push_str("path(x, z) <-- edge(x, y), path(y, z);\n");
-    run_interpreter(&source)
+    source
+}
+
+fn tc_source_no_facts() -> String {
+    String::from(
+        "relation edge(i32, i32);\n\
+         relation path(i32, i32);\n\
+         path(x, y) <-- edge(x, y);\n\
+         path(x, z) <-- edge(x, y), path(y, z);\n",
+    )
 }
 
 fn bench_transitive_closure(c: &mut Criterion) {
     let mut group = c.benchmark_group("transitive_closure");
 
     for &n in &[50, 100, 200] {
+        // Interpreter (includes parse)
         group.bench_with_input(BenchmarkId::new("interpreter", n), &n, |b, &n| {
-            b.iter(|| transitive_closure_interpreter(n));
+            b.iter(|| run_interpreter(&tc_source(n)));
         });
 
+        // Interpreter runtime only (pre-parsed, facts via insert)
+        group.bench_with_input(BenchmarkId::new("interp_run_only", n), &n, |b, &n| {
+            let source = tc_source_no_facts();
+            let (program, _) = prepare_program(&source);
+            b.iter(|| {
+                let mut engine = Engine::new(&program);
+                for i in 1..n {
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                }
+                engine.run(&program);
+                engine
+            });
+        });
+
+        // JIT runtime only (pre-parsed, facts via insert)
+        #[cfg(feature = "jit")]
+        group.bench_with_input(BenchmarkId::new("jit_run_only", n), &n, |b, &n| {
+            let source = tc_source_no_facts();
+            let (program, _) = prepare_program(&source);
+            b.iter(|| {
+                let mut engine = Engine::new(&program);
+                engine.enable_jit();
+                for i in 1..n {
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                }
+                engine.run(&program);
+                engine
+            });
+        });
+
+        // Native ascent macro
         group.bench_with_input(BenchmarkId::new("ascent_macro", n), &n, |b, &n| {
             b.iter(|| {
                 ascent! {
@@ -60,9 +111,8 @@ fn bench_transitive_closure(c: &mut Criterion) {
 
 // ─── Triangle Detection ─────────────────────────────────────────────
 
-fn triangle_interpreter(n: i32) -> Engine {
+fn triangle_source(n: i32) -> String {
     let mut source = String::from("relation edge(i32, i32);\nrelation triangle(i32, i32, i32);\n");
-    // Complete graph K_n
     for i in 1..=n {
         for j in (i + 1)..=n {
             source.push_str(&format!("edge({i}, {j});\n"));
@@ -71,7 +121,15 @@ fn triangle_interpreter(n: i32) -> Engine {
     source.push_str(
         "triangle(a, b, c) <-- edge(a, b), edge(b, c), edge(a, c), if a < b, if b < c;\n",
     );
-    run_interpreter(&source)
+    source
+}
+
+fn triangle_source_no_facts() -> String {
+    String::from(
+        "relation edge(i32, i32);\n\
+         relation triangle(i32, i32, i32);\n\
+         triangle(a, b, c) <-- edge(a, b), edge(b, c), edge(a, c), if a < b, if b < c;\n",
+    )
 }
 
 fn bench_triangle(c: &mut Criterion) {
@@ -79,7 +137,39 @@ fn bench_triangle(c: &mut Criterion) {
 
     for &n in &[10, 20, 30] {
         group.bench_with_input(BenchmarkId::new("interpreter", n), &n, |b, &n| {
-            b.iter(|| triangle_interpreter(n));
+            b.iter(|| run_interpreter(&triangle_source(n)));
+        });
+
+        group.bench_with_input(BenchmarkId::new("interp_run_only", n), &n, |b, &n| {
+            let source = triangle_source_no_facts();
+            let (program, _) = prepare_program(&source);
+            b.iter(|| {
+                let mut engine = Engine::new(&program);
+                for i in 1..=n {
+                    for j in (i + 1)..=n {
+                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                    }
+                }
+                engine.run(&program);
+                engine
+            });
+        });
+
+        #[cfg(feature = "jit")]
+        group.bench_with_input(BenchmarkId::new("jit_run_only", n), &n, |b, &n| {
+            let source = triangle_source_no_facts();
+            let (program, _) = prepare_program(&source);
+            b.iter(|| {
+                let mut engine = Engine::new(&program);
+                engine.enable_jit();
+                for i in 1..=n {
+                    for j in (i + 1)..=n {
+                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                    }
+                }
+                engine.run(&program);
+                engine
+            });
         });
 
         group.bench_with_input(BenchmarkId::new("ascent_macro", n), &n, |b, &n| {
@@ -108,7 +198,6 @@ fn connected_components_interpreter(n: i32) -> Engine {
     let mut source = String::from(
         "relation edge(i32, i32);\nrelation reach(i32, i32);\nrelation comp(i32, i32);\n",
     );
-    // Two disconnected linear chains: 1→2→...→n/2 and n/2+1→...→n
     let half = n / 2;
     for i in 1..half {
         source.push_str(&format!("edge({}, {});\n", i, i + 1));

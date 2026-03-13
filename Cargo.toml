@@ -38,6 +38,9 @@ ascent-ir.workspace = true
 ascent-eval.workspace = true
 syn.workspace = true
 
+[features]
+jit = ["ascent-eval/jit"]
+
 [dev-dependencies]
 ascent = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }

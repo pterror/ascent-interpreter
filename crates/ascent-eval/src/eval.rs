@@ -775,10 +775,8 @@ impl Engine {
                 let mut jit = jit_cell.borrow_mut();
                 jit.get_or_compile(rule_idx, rule).is_some()
             };
-            if compiled {
-                if let Some(results) = self.derive_tuples_jit(rule, use_recent, rule_idx) {
-                    return results;
-                }
+            if compiled && let Some(results) = self.derive_tuples_jit(rule, use_recent, rule_idx) {
+                return results;
             }
         }
 
@@ -878,17 +876,16 @@ impl Engine {
         } else {
             // Semi-naive: try each clause with recent data
             let mut clause_seq = 0;
-            for (idx, item) in rule.body.iter().enumerate() {
+            for item in rule.body.iter() {
                 let rel_name = match item {
                     CBodyItem::Clause(c) => &c.relation,
                     _ => continue,
                 };
                 if let Some(rel) = self.relations.get(rel_name)
                     && rel.iter_recent().next().is_some()
+                    && let Some(fn_ptr) = compiled.recent_variant(clause_seq)
                 {
-                    if let Some(fn_ptr) = compiled.recent_variant(clause_seq) {
-                        unsafe { fn_ptr(&mut ctx) };
-                    }
+                    unsafe { fn_ptr(&mut ctx) };
                 }
                 clause_seq += 1;
             }
