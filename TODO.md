@@ -154,10 +154,7 @@ The true minimum is **zero per-iteration calls + one per rule-invocation for ins
 
 - [x] **Eliminate `packed_recent_idx`** — called once per recent-scan iteration to map `seq_idx → rel.recent[seq_idx]`. Fix: expose `recent.as_ptr()` via a new `packed_recent_ptr` helper (called once before the loop, same pattern as `packed_data_ptr` caching above); replace the per-iteration call with an inline `load ptr_type from (recent_ptr + i * ptr_size)`.
 
-- [ ] **Inline dedup probe for `packed_try_insert`** — at fixpoint, most head tuples are duplicates; `packed_try_insert` is called once per match but returns 0 (duplicate) the vast majority of the time. Fix in two parts:
-  1. Expose the dedup hash table with a `JitHashIndex`-compatible layout so the JIT can probe inline — duplicate path becomes zero Rust calls.
-  2. For the new-tuple path: write to a pre-allocated scratch buffer in the context; flush once per rule invocation via a single Rust call (`packed_bulk_insert`). This amortizes the insertion cost to O(1) Rust calls per rule call regardless of how many new tuples are produced.
-  Net result: zero per-iteration Rust calls; one Rust call per rule invocation (the flush).
+- [x] **Inline dedup probe for `packed_try_insert`** — at fixpoint, most head tuples are duplicates; `packed_try_insert` is called once per match but returns 0 (duplicate) the vast majority of the time. Implemented: `JitDedupTable` (open-addressed flat u32 hash table, stride = arity+1) embedded in `PackedStorage`, populated incrementally by `update_jit_indices()`. JIT loads `head_dedup_handles` pointer from ctx offset 40 at function entry, computes hash and probes table inline, jumps past `packed_try_insert` on duplicate (zero Rust calls for duplicates; one call for new tuples). Note: bulk-insert scratch buffer not implemented — new tuples still call `packed_try_insert` individually, but this is one call per new tuple (already minimal).
 
 ### Relation storage optimizations
 
