@@ -271,6 +271,10 @@ pub struct Engine {
     current_source: SourceId,
     /// Cached stratification for incremental re-runs.
     stratification: Option<Stratification>,
+    /// JIT compiler for rule bodies (optional, feature-gated).
+    /// RefCell allows lazy compilation during derive_tuples (&self).
+    #[cfg(feature = "jit")]
+    jit: Option<RefCell<crate::jit::JitCompiler>>,
 }
 
 impl Engine {
@@ -309,6 +313,19 @@ impl Engine {
             next_source_id: 1,
             current_source: SourceId::ANONYMOUS,
             stratification: None,
+            #[cfg(feature = "jit")]
+            jit: None,
+        }
+    }
+
+    /// Enable JIT compilation for eligible rules.
+    #[cfg(feature = "jit")]
+    pub fn enable_jit(&mut self) {
+        if self.jit.is_none() {
+            match crate::jit::JitCompiler::new() {
+                Ok(compiler) => self.jit = Some(RefCell::new(compiler)),
+                Err(e) => eprintln!("JIT init failed: {e}"),
+            }
         }
     }
 
@@ -749,6 +766,22 @@ impl Engine {
     /// Uses recursive body processing with undo log to avoid materializing
     /// intermediate `Vec<Bindings>` between body items.
     fn derive_tuples<'a>(&self, rule: &'a CRule, use_recent: bool) -> Vec<(&'a str, Tuple)> {
+        // Try JIT path first
+        #[cfg(feature = "jit")]
+        if let Some(ref jit_cell) = self.jit {
+            // Use a dummy rule_idx based on rule pointer for caching
+            let rule_idx = rule as *const CRule as usize;
+            let compiled = {
+                let mut jit = jit_cell.borrow_mut();
+                jit.get_or_compile(rule_idx, rule).is_some()
+            };
+            if compiled {
+                if let Some(results) = self.derive_tuples_jit(rule, use_recent, rule_idx) {
+                    return results;
+                }
+            }
+        }
+
         let mut results = Vec::new();
         let mut binding = Bindings::new(self.var_count);
         let mut undo = UndoLog::new();
@@ -792,6 +825,82 @@ impl Engine {
         }
 
         results
+    }
+
+    /// JIT-compiled derive_tuples path.
+    #[cfg(feature = "jit")]
+    fn derive_tuples_jit<'a>(
+        &self,
+        rule: &'a CRule,
+        use_recent: bool,
+        rule_idx: usize,
+    ) -> Option<Vec<(&'a str, Tuple)>> {
+        use crate::jit::helpers::JitContext;
+
+        let jit = self.jit.as_ref()?.borrow();
+        let compiled = jit.cache.get(&rule_idx)?.as_ref()?;
+
+        // Resolve relation pointers for clauses in order
+        let clause_rels: Vec<*const Relation> = rule
+            .body
+            .iter()
+            .filter_map(|item| match item {
+                CBodyItem::Clause(c) => self
+                    .relations
+                    .get(&c.relation)
+                    .map(|r| r as *const Relation),
+                _ => None,
+            })
+            .collect();
+
+        // Resolve head clause pointers
+        let head_ptrs: Vec<*const CHeadClause> =
+            rule.heads.iter().map(|h| h as *const CHeadClause).collect();
+
+        let mut bindings = Bindings::new(self.var_count);
+        let mut indexed_results: Vec<(usize, Tuple)> = Vec::new();
+
+        let mut ctx = JitContext {
+            rels: clause_rels.as_ptr(),
+            rels_len: clause_rels.len() as u32,
+            bindings: &mut bindings,
+            results: &mut indexed_results,
+            heads: head_ptrs.as_ptr(),
+            heads_len: head_ptrs.len() as u32,
+            registry: &self.type_registry,
+            interner: &self.var_interner,
+        };
+
+        if !use_recent {
+            if let Some(fn_ptr) = compiled.full_variant() {
+                unsafe { fn_ptr(&mut ctx) };
+            }
+        } else {
+            // Semi-naive: try each clause with recent data
+            let mut clause_seq = 0;
+            for (idx, item) in rule.body.iter().enumerate() {
+                let rel_name = match item {
+                    CBodyItem::Clause(c) => &c.relation,
+                    _ => continue,
+                };
+                if let Some(rel) = self.relations.get(rel_name)
+                    && rel.iter_recent().next().is_some()
+                {
+                    if let Some(fn_ptr) = compiled.recent_variant(clause_seq) {
+                        unsafe { fn_ptr(&mut ctx) };
+                    }
+                }
+                clause_seq += 1;
+            }
+        }
+
+        // Convert indexed results to named results
+        let results: Vec<(&'a str, Tuple)> = indexed_results
+            .into_iter()
+            .map(|(head_idx, tuple)| (rule.heads[head_idx].relation.as_str(), tuple))
+            .collect();
+
+        Some(results)
     }
 
     /// Recursively process body items in streaming fashion.

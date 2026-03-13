@@ -39,6 +39,8 @@ mod compiled;
 mod eval;
 pub mod expr;
 pub mod intern;
+#[cfg(feature = "jit")]
+mod jit;
 mod relation;
 #[cfg(feature = "serde")]
 pub mod serde_bridge;
