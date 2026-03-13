@@ -199,6 +199,18 @@ fn bench_triangle(c: &mut Criterion) {
 
 // ─── Connected Components ───────────────────────────────────────────
 
+fn connected_components_source_no_facts() -> String {
+    String::from(
+        "relation edge(i32, i32);\n\
+         relation reach(i32, i32);\n\
+         relation comp(i32, i32);\n\
+         reach(x, y) <-- edge(x, y);\n\
+         reach(x, y) <-- edge(y, x);\n\
+         reach(x, z) <-- reach(x, y), reach(y, z);\n\
+         comp(x, m) <-- reach(x, _), agg m = min(y) in reach(x, y);\n",
+    )
+}
+
 fn connected_components_interpreter(n: i32) -> Engine {
     let mut source = String::from(
         "relation edge(i32, i32);\nrelation reach(i32, i32);\nrelation comp(i32, i32);\n",
@@ -223,6 +235,43 @@ fn bench_connected_components(c: &mut Criterion) {
     for &n in &[20, 40, 60] {
         group.bench_with_input(BenchmarkId::new("interpreter", n), &n, |b, &n| {
             b.iter(|| connected_components_interpreter(n));
+        });
+
+        group.bench_with_input(BenchmarkId::new("interp_run_only", n), &n, |b, &n| {
+            let source = connected_components_source_no_facts();
+            let (program, _) = prepare_program(&source);
+            b.iter(|| {
+                let half = n / 2;
+                let mut engine = Engine::new(&program);
+                for i in 1..half {
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                }
+                for i in (half + 1)..n {
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                }
+                engine.run(&program);
+                engine
+            });
+        });
+
+        // NOTE: includes JIT compilation cost on every iteration (see TC comment).
+        #[cfg(feature = "jit")]
+        group.bench_with_input(BenchmarkId::new("jit_run_only", n), &n, |b, &n| {
+            let source = connected_components_source_no_facts();
+            let (program, _) = prepare_program(&source);
+            b.iter(|| {
+                let half = n / 2;
+                let mut engine = Engine::new(&program);
+                engine.enable_jit();
+                for i in 1..half {
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                }
+                for i in (half + 1)..n {
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                }
+                engine.run(&program);
+                engine
+            });
         });
 
         group.bench_with_input(BenchmarkId::new("ascent_macro", n), &n, |b, &n| {
@@ -268,6 +317,39 @@ fn bench_fibonacci(c: &mut Criterion) {
     for &limit in &[10, 15, 20] {
         group.bench_with_input(BenchmarkId::new("interpreter", limit), &limit, |b, &n| {
             b.iter(|| fibonacci_interpreter(n));
+        });
+
+        group.bench_with_input(BenchmarkId::new("interp_run_only", limit), &limit, |b, &n| {
+            let source = format!(
+                "relation fib(i32, i32);\n\
+                 fib(0, 0);\n\
+                 fib(1, 1);\n\
+                 fib(nn + 1, a + b) <-- fib(nn, a), fib(nn - 1, b), if *nn < {n};\n"
+            );
+            let (program, _) = prepare_program(&source);
+            b.iter(|| {
+                let mut engine = Engine::new(&program);
+                engine.run(&program);
+                engine
+            });
+        });
+
+        // NOTE: includes JIT compilation cost on every iteration (see TC comment).
+        #[cfg(feature = "jit")]
+        group.bench_with_input(BenchmarkId::new("jit_run_only", limit), &limit, |b, &n| {
+            let source = format!(
+                "relation fib(i32, i32);\n\
+                 fib(0, 0);\n\
+                 fib(1, 1);\n\
+                 fib(nn + 1, a + b) <-- fib(nn, a), fib(nn - 1, b), if *nn < {n};\n"
+            );
+            let (program, _) = prepare_program(&source);
+            b.iter(|| {
+                let mut engine = Engine::new(&program);
+                engine.enable_jit();
+                engine.run(&program);
+                engine
+            });
         });
 
         group.bench_with_input(BenchmarkId::new("ascent_macro", limit), &limit, |b, &n| {
