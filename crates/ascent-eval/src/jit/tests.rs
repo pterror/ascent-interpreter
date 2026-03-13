@@ -528,6 +528,7 @@ fn test_stage3_condition_in_recursive_rule() {
     );
 }
 
+#[cfg(feature = "specialized")]
 #[test]
 fn test_stratum_meta_single_rule_fixpoint() {
     // Single rule with self-join — exercises fixpoint convergence.

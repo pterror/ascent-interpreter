@@ -729,6 +729,339 @@ fn compare_lattice_shortest_path() {
     assert_eq!(interp_sp, macro_sp);
 }
 
+// ─── JIT Parity ─────────────────────────────────────────────────────
+
+#[cfg(feature = "jit")]
+fn run_jit(input: &str) -> Engine {
+    let ast: AscentAst = syn::parse_str(input).unwrap();
+    let program = Program::from_ast(ast);
+    let mut engine = Engine::new(&program);
+    engine.enable_jit();
+    engine.run(&program);
+    engine
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn compare_jit_transitive_closure() {
+    let engine = run_jit("
+        relation edge(i32, i32);
+        relation path(i32, i32);
+        edge(1, 2); edge(2, 3); edge(3, 4);
+        path(x, y) <-- edge(x, y);
+        path(x, z) <-- edge(x, y), path(y, z);
+    ");
+
+    ascent! {
+        relation edge(i32, i32);
+        relation path(i32, i32);
+        edge(1, 2); edge(2, 3); edge(3, 4);
+        path(x, y) <-- edge(x, y);
+        path(x, z) <-- edge(x, y), path(y, z);
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(interp2(&engine, "path"), set2(prog.path));
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn compare_jit_self_join() {
+    let engine = run_jit("
+        relation edge(i32, i32);
+        relation triangle(i32, i32, i32);
+
+        edge(1, 2); edge(2, 3); edge(3, 1);
+        edge(4, 5); edge(5, 6);
+
+        triangle(a, b, c) <-- edge(a, b), edge(b, c), edge(c, a);
+    ");
+
+    ascent! {
+        relation edge(i32, i32);
+        relation triangle(i32, i32, i32);
+
+        edge(1, 2); edge(2, 3); edge(3, 1);
+        edge(4, 5); edge(5, 6);
+
+        triangle(a, b, c) <-- edge(a, b), edge(b, c), edge(c, a);
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(
+        interp3(&engine, "triangle"),
+        prog.triangle.into_iter().collect()
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn compare_jit_mutual_recursion() {
+    let engine = run_jit("
+        relation even(i32);
+        relation odd(i32);
+
+        even(0);
+        odd(y + 1) <-- even(y), if *y < 9;
+        even(y + 1) <-- odd(y), if *y < 9;
+    ");
+
+    ascent! {
+        relation even(i32);
+        relation odd(i32);
+
+        even(0);
+        odd(y + 1) <-- even(y), if *y < 9;
+        even(y + 1) <-- odd(y), if *y < 9;
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(interp1(&engine, "even"), set1(prog.even), "even");
+    assert_eq!(interp1(&engine, "odd"), set1(prog.odd), "odd");
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn compare_jit_factorial() {
+    let engine = run_jit("
+        relation fac(i32, i32);
+        fac(0, 1);
+        fac(n + 1, (n + 1) * f) <-- fac(n, f), if *n < 5;
+    ");
+
+    ascent! {
+        relation fac(i32, i32);
+        fac(0, 1);
+        fac(n + 1, (n + 1) * f) <-- fac(n, f), if *n < 5;
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(interp2(&engine, "fac"), set2(prog.fac));
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn compare_jit_arithmetic() {
+    let engine = run_jit("
+        relation n(i32);
+        relation square(i32, i32);
+        relation big_square(i32, i32);
+
+        n(x) <-- for x in 1..11;
+        square(x, x * x) <-- n(x);
+        big_square(x, s) <-- square(x, s), if *s > 50;
+    ");
+
+    ascent! {
+        relation n(i32);
+        relation square(i32, i32);
+        relation big_square(i32, i32);
+
+        n(x) <-- for x in 1..11;
+        square(x, x * x) <-- n(x);
+        big_square(x, s) <-- square(x, s), if *s > 50;
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(interp2(&engine, "square"), set2(prog.square));
+    assert_eq!(interp2(&engine, "big_square"), set2(prog.big_square));
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn compare_jit_constant_in_clause() {
+    let engine = run_jit("
+        relation data(i32, i32);
+        relation filtered(i32);
+
+        data(1, 100); data(2, 200); data(3, 100); data(4, 300);
+        filtered(x) <-- data(x, 100);
+    ");
+
+    ascent! {
+        relation data(i32, i32);
+        relation filtered(i32);
+
+        data(1, 100); data(2, 200); data(3, 100); data(4, 300);
+        filtered(x) <-- data(x, 100);
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(interp1(&engine, "filtered"), set1(prog.filtered));
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn compare_jit_rule_chaining() {
+    let engine = run_jit("
+        relation base(i32);
+        relation step1(i32);
+        relation step2(i32);
+        relation step3(i32);
+
+        base(x) <-- for x in 1..6;
+        step1(x * 2) <-- base(x);
+        step2(x + 1) <-- step1(x);
+        step3(x) <-- step2(x), if *x > 5;
+    ");
+
+    ascent! {
+        relation base(i32);
+        relation step1(i32);
+        relation step2(i32);
+        relation step3(i32);
+
+        base(x) <-- for x in 1..6;
+        step1(x * 2) <-- base(x);
+        step2(x + 1) <-- step1(x);
+        step3(x) <-- step2(x), if *x > 5;
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(interp1(&engine, "step1"), set1(prog.step1), "step1");
+    assert_eq!(interp1(&engine, "step2"), set1(prog.step2), "step2");
+    assert_eq!(interp1(&engine, "step3"), set1(prog.step3), "step3");
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn compare_jit_generators() {
+    let engine = run_jit("
+        relation nums(i32);
+        relation pairs(i32, i32);
+        nums(x) <-- for x in 0..5;
+        pairs(x, y) <-- nums(x), nums(y), if x < y;
+    ");
+
+    ascent! {
+        relation nums(i32);
+        relation pairs(i32, i32);
+        nums(x) <-- for x in 0..5;
+        pairs(x, y) <-- nums(x), nums(y), if x < y;
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(interp1(&engine, "nums"), set1(prog.nums));
+    assert_eq!(interp2(&engine, "pairs"), set2(prog.pairs));
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn compare_jit_three_way_join() {
+    let engine = run_jit("
+        relation a(i32, i32);
+        relation b(i32, i32);
+        relation c(i32, i32);
+        relation result(i32, i32, i32, i32);
+
+        a(1, 2); a(2, 3);
+        b(2, 10); b(3, 20);
+        c(10, 100); c(20, 200);
+
+        result(x, y, z, w) <-- a(x, y), b(y, z), c(z, w);
+    ");
+
+    ascent! {
+        relation a(i32, i32);
+        relation b(i32, i32);
+        relation c(i32, i32);
+        relation result(i32, i32, i32, i32);
+
+        a(1, 2); a(2, 3);
+        b(2, 10); b(3, 20);
+        c(10, 100); c(20, 200);
+
+        result(x, y, z, w) <-- a(x, y), b(y, z), c(z, w);
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    let interp: BTreeSet<(i32, i32, i32, i32)> = engine
+        .relation("result")
+        .unwrap()
+        .iter()
+        .map(|t| match t {
+            [Value::I32(a), Value::I32(b), Value::I32(c), Value::I32(d)] => (*a, *b, *c, *d),
+            other => panic!("unexpected: {other:?}"),
+        })
+        .collect();
+    let macro_result: BTreeSet<(i32, i32, i32, i32)> = prog.result.into_iter().collect();
+
+    assert_eq!(interp, macro_result);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn compare_jit_duplicate_elimination() {
+    let engine = run_jit("
+        relation input(i32, i32);
+        relation unique_first(i32);
+
+        input(1, 10); input(1, 20); input(2, 30); input(2, 40); input(3, 50);
+        unique_first(x) <-- input(x, _);
+    ");
+
+    ascent! {
+        relation input(i32, i32);
+        relation unique_first(i32);
+
+        input(1, 10); input(1, 20); input(2, 30); input(2, 40); input(3, 50);
+        unique_first(x) <-- input(x, _);
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(interp1(&engine, "unique_first"), set1(prog.unique_first));
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn compare_jit_recursive_with_aggregation() {
+    let engine = run_jit("
+        relation edge(i32, i32);
+        relation path(i32, i32);
+        relation path_count(i32);
+
+        edge(1, 2); edge(2, 3); edge(3, 4); edge(1, 3);
+        path(x, y) <-- edge(x, y);
+        path(x, z) <-- edge(x, y), path(y, z);
+
+        path_count(c) <-- agg c = count() in path(_, _);
+    ");
+
+    // ascent count() returns usize
+    ascent! {
+        relation edge(i32, i32);
+        relation path(i32, i32);
+        relation path_count(usize);
+
+        edge(1, 2); edge(2, 3); edge(3, 4); edge(1, 3);
+        path(x, y) <-- edge(x, y);
+        path(x, z) <-- edge(x, y), path(y, z);
+
+        path_count(c) <-- agg c = count() in path(_, _);
+    }
+    let mut prog = AscentProgram::default();
+    prog.run();
+
+    assert_eq!(interp2(&engine, "path"), set2(prog.path), "path");
+    let interp_cnt = interp1(&engine, "path_count");
+    let macro_cnt: BTreeSet<(i32,)> = prog
+        .path_count
+        .into_iter()
+        .map(|(c,)| (c as i32,))
+        .collect();
+    assert_eq!(interp_cnt, macro_cnt, "path_count");
+}
+
 // ─── Lattice: Recursive Max Propagation ────────────────────────────
 
 #[test]
