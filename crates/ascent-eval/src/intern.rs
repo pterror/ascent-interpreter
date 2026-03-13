@@ -1,61 +1,97 @@
-//! Global string interner for O(1) equality, hashing, and cloning of string values.
+//! String interning via a thread-local `StringTable`.
 //!
-//! All `Value::String` instances store a `SymbolId` (a `u32` index) instead of
-//! heap-allocated string data. The interner is thread-local and leak-based:
-//! interned strings live for the lifetime of the thread, so `resolve()` returns
-//! `&'static str` with no borrow gymnastics.
+//! `Value::Interned(Rc<dyn InternTable>, u32)` is the universal representation
+//! for interned values. Strings use this module's `StringTable`; other types
+//! use `specialized::HashInternTable`.
 
+use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::fmt;
+use std::rc::Rc;
 
 use rustc_hash::FxHashMap;
 
-/// An interned string identifier. Copy-cheap, with O(1) equality and hashing.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SymbolId(pub(crate) u32);
+use crate::value::{InternTable, Value};
 
-impl fmt::Debug for SymbolId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", resolve(*self))
+/// Thread-local intern table for strings.
+///
+/// Uses `Box::leak` for zero-copy `&'static str` resolution, matching the
+/// original `Interner` design. `pack` verifies table identity via pointer
+/// comparison so values from different tables are never confused.
+pub struct StringTable {
+    to_id: RefCell<FxHashMap<&'static str, u32>>,
+    to_val: RefCell<Vec<&'static str>>,
+}
+
+impl StringTable {
+    fn new() -> Self {
+        Self {
+            to_id: RefCell::new(FxHashMap::default()),
+            to_val: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Intern a string and return its u32 id.
+    pub fn intern(&self, s: &str) -> u32 {
+        if let Some(&id) = self.to_id.borrow().get(s) {
+            return id;
+        }
+        let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
+        let id = self.to_val.borrow().len() as u32;
+        self.to_val.borrow_mut().push(leaked);
+        self.to_id.borrow_mut().insert(leaked, id);
+        id
+    }
+
+    /// Resolve a u32 id back to its `&'static str`. Panics on invalid id.
+    pub fn resolve(&self, id: u32) -> &'static str {
+        self.to_val.borrow()[id as usize]
     }
 }
 
-impl fmt::Display for SymbolId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", resolve(*self))
+impl InternTable for StringTable {
+    fn pack(&self, val: &Value) -> Option<u32> {
+        if let Value::Interned(table, id) = val {
+            // Only accept values that belong to this exact table instance.
+            let self_ptr = self as *const StringTable as *const ();
+            let table_ptr = Rc::as_ptr(table) as *const ();
+            if std::ptr::eq(self_ptr, table_ptr) {
+                return Some(*id);
+            }
+        }
+        None
     }
-}
 
-struct Interner {
-    strings: Vec<&'static str>,
-    ids: FxHashMap<&'static str, u32>,
+    fn fmt_display(&self, id: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.resolve(id))
+    }
+
+    fn fmt_debug(&self, id: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.resolve(id))
+    }
+
+    fn cmp_ids(&self, a: u32, b: u32) -> Ordering {
+        self.resolve(a).cmp(self.resolve(b))
+    }
 }
 
 thread_local! {
-    static INTERNER: std::cell::RefCell<Interner> = std::cell::RefCell::new(Interner {
-        strings: Vec::new(),
-        ids: FxHashMap::default(),
-    });
+    static STRING_TABLE: Rc<StringTable> = Rc::new(StringTable::new());
 }
 
-/// Intern a string, returning its `SymbolId`. If the string was already
-/// interned, returns the existing id (O(1) amortized hash lookup).
-pub fn intern(s: &str) -> SymbolId {
-    INTERNER.with(|cell| {
-        let mut inner = cell.borrow_mut();
-        if let Some(&id) = inner.ids.get(s) {
-            return SymbolId(id);
-        }
-        let id = inner.strings.len() as u32;
-        let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-        inner.strings.push(leaked);
-        inner.ids.insert(leaked, id);
-        SymbolId(id)
+/// Return a clone of the thread-local `StringTable` `Rc`.
+/// Cheap — just increments the reference count.
+pub fn string_table() -> Rc<StringTable> {
+    STRING_TABLE.with(Rc::clone)
+}
+
+/// Construct a `Value::Interned` for a string, interning it in the
+/// thread-local `StringTable`.
+pub fn string_value(s: &str) -> Value {
+    STRING_TABLE.with(|table| {
+        let id = table.intern(s);
+        Value::Interned(Rc::clone(table) as Rc<dyn InternTable>, id)
     })
-}
-
-/// Resolve a `SymbolId` back to its string. Panics if the id is invalid.
-pub fn resolve(id: SymbolId) -> &'static str {
-    INTERNER.with(|cell| cell.borrow().strings[id.0 as usize])
 }
 
 #[cfg(test)]
@@ -64,28 +100,40 @@ mod tests {
 
     #[test]
     fn intern_returns_same_id() {
-        let a = intern("hello");
-        let b = intern("hello");
+        let table = StringTable::new();
+        let a = table.intern("hello");
+        let b = table.intern("hello");
         assert_eq!(a, b);
     }
 
     #[test]
     fn different_strings_different_ids() {
-        let a = intern("foo");
-        let b = intern("bar");
+        let table = StringTable::new();
+        let a = table.intern("foo");
+        let b = table.intern("bar");
         assert_ne!(a, b);
     }
 
     #[test]
     fn resolve_round_trips() {
-        let id = intern("world");
-        assert_eq!(resolve(id), "world");
+        let table = StringTable::new();
+        let id = table.intern("world");
+        assert_eq!(table.resolve(id), "world");
     }
 
     #[test]
-    fn display_and_debug() {
-        let id = intern("test");
-        assert_eq!(format!("{id}"), "test");
-        assert_eq!(format!("{id:?}"), "\"test\"");
+    fn string_value_display_and_debug() {
+        let v = Value::string("test");
+        assert_eq!(format!("{v}"), "test");
+        assert_eq!(format!("{v:?}"), "\"test\"");
+    }
+
+    #[test]
+    fn string_value_equality() {
+        let a = Value::string("hello");
+        let b = Value::string("hello");
+        let c = Value::string("world");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

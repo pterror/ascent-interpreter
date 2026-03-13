@@ -7,36 +7,25 @@
 //! maintains compatibility with the generic evaluation loop.
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
-use crate::intern::SymbolId;
+use crate::intern;
 use crate::relation::SourceId;
-use crate::value::{Tuple, Value};
-
-/// Intern table for packing/unpacking arbitrary `Hash + Eq` values to u32.
-///
-/// `pack` assigns a stable u32 id on first sight and returns it on subsequent
-/// calls; it returns `None` only on type mismatch (i.e. the value is the wrong
-/// variant for this table). `unpack` recovers the original value from its id.
-///
-/// The evaluator is single-threaded, so implementations use `RefCell` for
-/// interior mutability rather than locking primitives.
-pub trait InternTable {
-    fn pack(&self, val: &Value) -> Option<u32>;
-    fn unpack(&self, id: u32) -> Value;
-}
+use crate::value::{InternTable, Tuple, Value};
 
 /// General-purpose intern table for arbitrary `Value`s.
 ///
-/// Assigns sequential u32 IDs to distinct values. Use this for any column type
-/// that is `Hash + Eq` but doesn't have a built-in compact representation.
-/// The `filter` predicate selects which `Value` variants this table accepts;
-/// non-matching variants return `None` so packed storage can downgrade
-/// gracefully.
+/// Assigns sequential u32 IDs to distinct values on first pack. Use this for
+/// any column type that is `Hash + Eq` but lacks a built-in compact id (e.g.
+/// custom types). The `filter` predicate gates which `Value` variants are
+/// accepted; non-matching variants return `None` so packed storage can
+/// downgrade gracefully.
 pub struct HashInternTable {
     filter: fn(&Value) -> bool,
     to_id: RefCell<FxHashMap<Value, u32>>,
@@ -68,29 +57,19 @@ impl InternTable for HashInternTable {
         Some(id)
     }
 
-    fn unpack(&self, id: u32) -> Value {
-        self.to_val.borrow()[id as usize].clone()
-    }
-}
-
-/// `InternTable` for `String` / `&str`: reads `SymbolId.0` directly.
-/// Zero-cost — no hash lookup; the global symbol table assigned the id at
-/// string construction time.
-struct StringInternTable;
-
-impl InternTable for StringInternTable {
-    #[inline]
-    fn pack(&self, val: &Value) -> Option<u32> {
-        if let Value::String(sid) = val {
-            Some(sid.0)
-        } else {
-            None
-        }
+    fn fmt_display(&self, id: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", &self.to_val.borrow()[id as usize])
     }
 
-    #[inline]
-    fn unpack(&self, id: u32) -> Value {
-        Value::String(SymbolId(id))
+    fn fmt_debug(&self, id: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", &self.to_val.borrow()[id as usize])
+    }
+
+    fn cmp_ids(&self, a: u32, b: u32) -> Ordering {
+        let vals = self.to_val.borrow();
+        vals[a as usize]
+            .partial_cmp_val(&vals[b as usize])
+            .unwrap_or(Ordering::Equal)
     }
 }
 
@@ -100,8 +79,8 @@ pub enum PackedType {
     I32,
     U32,
     Bool,
-    /// Any type backed by an intern table. Replaces the old `String` variant;
-    /// `"String" | "&str" | "str"` maps here via `StringInternTable`.
+    /// Any type backed by an intern table.
+    /// Strings use `intern::StringTable`; other types use `HashInternTable`.
     Interned(Rc<dyn InternTable>),
 }
 
@@ -136,7 +115,7 @@ impl PackedType {
         match name {
             "i32" => Some(PackedType::I32),
             "u32" => Some(PackedType::U32),
-            "String" | "&str" | "str" => Some(PackedType::Interned(Rc::new(StringInternTable))),
+            "String" | "&str" | "str" => Some(PackedType::Interned(intern::string_table())),
             "bool" => Some(PackedType::Bool),
             _ => None,
         }
@@ -161,7 +140,7 @@ impl PackedType {
             PackedType::I32 => Value::I32(raw as i32),
             PackedType::U32 => Value::U32(raw),
             PackedType::Bool => Value::Bool(raw != 0),
-            PackedType::Interned(table) => table.unpack(raw),
+            PackedType::Interned(table) => Value::Interned(table.clone(), raw),
         }
     }
 }
@@ -656,13 +635,12 @@ mod tests {
 
     #[test]
     fn test_packed_string_roundtrip() {
-        use crate::intern;
-        let sid = intern::intern("hello");
-        let val = Value::String(sid);
+        let val = Value::string("hello");
         let pt = PackedType::from_type_name("String").unwrap();
         let packed = pt.pack(&val).unwrap();
         let unpacked = pt.unpack(packed);
         assert_eq!(unpacked, val);
+        assert_eq!(format!("{unpacked}"), "hello");
     }
 
     /// Helper: unwrap insert result (panics on type mismatch, fine for tests).

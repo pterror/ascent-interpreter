@@ -247,11 +247,10 @@ fn test_packed_jit_triangle_detection() {
 #[cfg(feature = "specialized")]
 #[test]
 fn test_packed_jit_string_relations() {
-    use crate::intern;
-    let hello = Value::String(intern::intern("hello"));
-    let world = Value::String(intern::intern("world"));
-    let foo = Value::String(intern::intern("foo"));
-    let bar = Value::String(intern::intern("bar"));
+    let hello = Value::string("hello");
+    let world = Value::string("world");
+    let foo = Value::string("foo");
+    let bar = Value::string("bar");
     assert_packed_jit_equivalence(
         r#"
             relation src(String, String);

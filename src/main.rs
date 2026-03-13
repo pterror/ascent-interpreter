@@ -399,9 +399,7 @@ fn matches_pattern(value: &Value, pat: &QueryPat) -> bool {
     match pat {
         QueryPat::Wild => true,
         QueryPat::Int(n) => value.as_i64().is_some_and(|v| v == *n as i64),
-        QueryPat::Str(s) => {
-            matches!(value, Value::String(vs) if ascent_eval::intern::resolve(*vs) == s.as_str())
-        }
+        QueryPat::Str(s) => *value == Value::string(s.as_str()),
         QueryPat::Bool(b) => matches!(value, Value::Bool(vb) if vb == b),
     }
 }

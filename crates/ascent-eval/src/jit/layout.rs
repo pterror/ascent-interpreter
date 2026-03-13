@@ -35,6 +35,9 @@ mod tests {
         assert_eq!(VALUE_SIZE, mem::size_of::<Value>());
         assert_eq!(SLOT_SIZE, mem::size_of::<Option<Value>>());
         assert_eq!(VALUE_ALIGN, mem::align_of::<Value>());
+        // Interned variant (Rc<dyn InternTable> + u32 = 20 bytes) must not
+        // have grown the enum beyond its pre-existing 32-byte size.
+        assert_eq!(VALUE_SIZE, 32, "Value size regressed");
     }
 
     #[test]

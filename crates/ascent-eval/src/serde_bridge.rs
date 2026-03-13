@@ -11,7 +11,16 @@ use serde::de::{self, DeserializeSeed, SeqAccess, Visitor};
 use serde::ser::{self, SerializeStruct, SerializeTupleStruct};
 use serde::{Deserialize, Serialize};
 
-use crate::value::{OrderedFloat, Value};
+use crate::value::{InternTable, OrderedFloat, Value};
+
+/// Adapter that implements `Display` for an interned value, for use in serde.
+struct DisplayInterned<'a>(&'a dyn InternTable, u32);
+
+impl fmt::Display for DisplayInterned<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt_display(self.1, f)
+    }
+}
 
 // ─── Error type ─────────────────────────────────────────────────────
 
@@ -469,7 +478,9 @@ impl<'de> de::Deserializer<'de> for FieldDeserializer<'de> {
             Value::F32(OrderedFloat(v)) => visitor.visit_f32(*v),
             Value::F64(OrderedFloat(v)) => visitor.visit_f64(*v),
             Value::Char(v) => visitor.visit_char(*v),
-            Value::String(v) => visitor.visit_str(crate::intern::resolve(*v)),
+            Value::Interned(table, id) => {
+                visitor.visit_str(&format!("{}", DisplayInterned(table.as_ref(), *id)))
+            }
             Value::Option(None) => visitor.visit_none(),
             Value::Option(Some(inner)) => visitor.visit_some(FieldDeserializer { value: inner }),
             _ => Err(BridgeError(format!(
@@ -497,7 +508,9 @@ impl<'de> de::Deserializer<'de> for FieldDeserializer<'de> {
 
     fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, BridgeError> {
         match self.value {
-            Value::String(v) => visitor.visit_string(crate::intern::resolve(*v).to_string()),
+            Value::Interned(table, id) => {
+                visitor.visit_string(format!("{}", DisplayInterned(table.as_ref(), *id)))
+            }
             _ => self.deserialize_any(visitor),
         }
     }
