@@ -98,7 +98,34 @@ Steps 1–2 are representation changes. Step 3 is the highest-value item for LSP
    - **Attempted first**: trampoline JIT (extern "C" helpers for all Value ops) — ~0% speedup, wrong approach (kept for non-packed fallback)
    - **Correct approach implemented**: typed loads from u32 flat buffer, icmp comparisons, no Value enum in inner loop
 
-7. [ ] Intern arbitrary `Hash + Eq` types to extend PackedStorage beyond the current (i32, u32, bool, String) set. Add `PackedType::Interned` variant backed by a type-erased intern table. When doing this, **eliminate `PackedType::String`** — strings are just `Interned` with the global symbol table as the backend (same zero-cost packing via SymbolId, no separate variant needed). This makes PackedStorage applicable to user-defined types and makes the packed JIT general-purpose.
+7. [x] Intern arbitrary `Hash + Eq` types to extend PackedStorage beyond the current (i32, u32, bool, String) set. `PackedType::Interned(Rc<dyn InternTable>)` — strings via `StringTable` (thread-local, zero-copy), custom types via `HashInternTable`. Eliminated `Value::String(SymbolId)` entirely; all interned values are `Value::Interned(Rc<dyn InternTable>, u32)`. Value size held at 32 bytes.
+
+### Full-program stratum JIT (next major perf initiative)
+
+Goal: compile the entire semi-naive loop for a stratum to a single native function,
+matching the performance of the `ascent!` macro. Three stages:
+
+Current JIT architecture (context for what needs to change):
+- The semi-naive fixpoint loop lives entirely in Rust (`eval.rs`) — the JIT only compiles individual rule bodies
+- Packed JIT already does direct u32 array arithmetic (no Value enum in hot loop)
+- Per-rule variants: 1 full + N recent (one per clause); Rust dispatches each variant
+- Packed JIT bails on any conditions; trampoline JIT calls `jit_eval_condition` helper for `CCondition::If`
+
+**Stage 1 — Widen packed JIT coverage** (prerequisite; low risk; changes `packed_codegen.rs`)
+- [ ] Conditions in packed JIT: traverse CExpr and emit Cranelift `icmp`/`iadd` etc. for integer ops on bound u32 vars. Simple guards (`if x > y`, `if x != y`) are a handful of IR instructions — no helper call needed.
+- [ ] Literals in clause args: currently bails out; emit an inline `icmp` against a constant instead.
+- Payoff: most real-world rules become packed-JIT-eligible; interpreter fallback nearly disappears for typed programs.
+
+**Stage 2 — Stratum-level JIT** (the architectural shift; eliminates Rust loop overhead)
+- [ ] Compile a *stratum meta-function*: a single Cranelift function that owns the `while has_delta` fixpoint loop, calls each rule's compiled variants in sequence (via Cranelift `call` instructions), calls `advance()`/changed-check helpers, and returns only when fixpoint is reached.
+- Compile once on first stratum entry; cache and reuse across incremental updates (rules don't change, only facts do).
+- This avoids redesigning the relation state machine (advance/recent stay in Rust helpers; only the loop control moves to native code).
+- Payoff: eliminates per-rule Rust dispatch overhead, fixpoint loop in native code, amortises compilation over thousands of semi-naive iterations.
+- True cross-rule inlining (rule bodies inlined into stratum function) requires making `PackedStorage` internals directly JIT-addressable — defer to stage 3.
+
+**Stage 3 — Fully typed stratum** (closes the gap to `ascent!`)
+- [ ] For strata where all relations are fully packed: inline rule bodies into the stratum function (no `call` between rules), expose `PackedStorage.packed_data` pointer directly in JIT, emit head insertions as direct buffer writes. No Value enum, no Rust re-entry in the hot path.
+- Payoff: matches or exceeds `ascent!` macro performance for pure packed programs.
 
 ### Not planned
 
