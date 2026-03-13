@@ -142,7 +142,7 @@ Current JIT architecture (context for what needs to change):
 
 ### JIT tuning
 
-- [ ] **Stage 4 code-size regression** — for rules with many clauses (e.g., triangle: 3 clauses), Stage 4 inlines 4 copies of a 3-deep loop nest into one Cranelift function, causing I-cache pressure that outweighs the call_indirect savings. Benchmark: triangle n=30 is 45% slower with Stage 4 than interpreter (Stage 3 was baseline). Fix options: (a) heuristic fallback to Stage 3 when total_clauses_across_all_variants > threshold; (b) reduce code duplication by only emitting recent variants for clauses that actually filter on recent data.
+- [ ] **Stage 4 benefit limited to recursive strata** — JIT matches interpreter for single-pass queries (triangle: ±3% vs interp_run_only); wins only on recursive fixpoints where compilation cost is amortized (TC n=200: -11%). Root cause: single-pass rules run one iteration so there's no fixpoint loop to optimize across. No regression vs Stage 3 (both near-parity for triangle). Worth investigating whether Stage 4 should skip compilation for strata with no recursive rules.
 
 - [ ] **Cache `packed_data_ptr` for non-recursive rules** — `gen_full_scan_v3` calls `packed_data_ptr` inside the scan loop on every iteration to handle the case where head relation == clause relation (recursive insert can reallocate). For non-recursive rules (head ∉ clause relations), the pointer is stable. Pass a `is_recursive: bool` flag through codegen; only re-fetch inside the loop when true. Applies to Stage 3 and Stage 4. Would reduce inner loop body size by one runtime call.
 
