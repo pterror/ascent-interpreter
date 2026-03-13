@@ -98,7 +98,7 @@ Steps 1–2 are representation changes. Step 3 is the highest-value item for LSP
    - **Attempted first**: trampoline JIT (extern "C" helpers for all Value ops) — ~0% speedup, wrong approach (kept for non-packed fallback)
    - **Correct approach implemented**: typed loads from u32 flat buffer, icmp comparisons, no Value enum in inner loop
 
-7. [ ] Intern arbitrary `Hash + Eq` types to extend PackedStorage beyond the current (i32, u32, bool, String) set. Add `PackedType::Interned` variant backed by a type-erased intern table (e.g. `Arc<dyn Any>` keyed by `TypeId`). This would make PackedStorage applicable to user-defined types and make the packed JIT general-purpose.
+7. [ ] Intern arbitrary `Hash + Eq` types to extend PackedStorage beyond the current (i32, u32, bool, String) set. Add `PackedType::Interned` variant backed by a type-erased intern table. When doing this, **eliminate `PackedType::String`** — strings are just `Interned` with the global symbol table as the backend (same zero-cost packing via SymbolId, no separate variant needed). This makes PackedStorage applicable to user-defined types and makes the packed JIT general-purpose.
 
 ### Not planned
 
