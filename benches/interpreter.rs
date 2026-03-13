@@ -77,8 +77,7 @@ fn bench_transitive_closure(c: &mut Criterion) {
         // JIT runtime only (pre-parsed, facts via insert).
         // NOTE: includes JIT compilation cost on every iteration — JIT cache
         // is per-Engine and each iter creates a fresh one. Numbers reflect
-        // "first-run" latency. For a hot-cache benchmark, a shareable JitCache
-        // API is needed (tracked in TODO.md).
+        // "first-run" latency.
         #[cfg(feature = "jit")]
         group.bench_with_input(BenchmarkId::new("jit_run_only", n), &n, |b, &n| {
             let source = tc_source_no_facts();
@@ -86,6 +85,31 @@ fn bench_transitive_closure(c: &mut Criterion) {
             b.iter(|| {
                 let mut engine = Engine::new(&program);
                 engine.enable_jit();
+                for i in 1..n {
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                }
+                engine.run(&program);
+                engine
+            });
+        });
+
+        // JIT hot-cache: pre-compile once, share compiled JIT across iterations.
+        #[cfg(feature = "jit")]
+        group.bench_with_input(BenchmarkId::new("jit_hot", n), &n, |b, &n| {
+            let source = tc_source_no_facts();
+            let (program, _) = prepare_program(&source);
+            // Warmup: compile JIT once
+            let mut warmup = Engine::new(&program);
+            warmup.enable_jit();
+            for i in 1..n {
+                warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+            }
+            warmup.run(&program);
+            let compiled = warmup.share_jit_compiler().unwrap();
+            // Hot iterations: reuse compiled JIT
+            b.iter(|| {
+                let mut engine = Engine::new(&program);
+                engine.with_jit_compiler(compiled.clone());
                 for i in 1..n {
                     engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
                 }
@@ -167,6 +191,35 @@ fn bench_triangle(c: &mut Criterion) {
             b.iter(|| {
                 let mut engine = Engine::new(&program);
                 engine.enable_jit();
+                for i in 1..=n {
+                    for j in (i + 1)..=n {
+                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                    }
+                }
+                engine.run(&program);
+                engine
+            });
+        });
+
+        // JIT hot-cache: pre-compile once, share compiled JIT across iterations.
+        #[cfg(feature = "jit")]
+        group.bench_with_input(BenchmarkId::new("jit_hot", n), &n, |b, &n| {
+            let source = triangle_source_no_facts();
+            let (program, _) = prepare_program(&source);
+            // Warmup: compile JIT once
+            let mut warmup = Engine::new(&program);
+            warmup.enable_jit();
+            for i in 1..=n {
+                for j in (i + 1)..=n {
+                    warmup.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                }
+            }
+            warmup.run(&program);
+            let compiled = warmup.share_jit_compiler().unwrap();
+            // Hot iterations: reuse compiled JIT
+            b.iter(|| {
+                let mut engine = Engine::new(&program);
+                engine.with_jit_compiler(compiled.clone());
                 for i in 1..=n {
                     for j in (i + 1)..=n {
                         engine.insert("edge", vec![Value::I32(i), Value::I32(j)]);
@@ -274,6 +327,39 @@ fn bench_connected_components(c: &mut Criterion) {
             });
         });
 
+        // JIT hot-cache: pre-compile once, share compiled JIT across iterations.
+        #[cfg(feature = "jit")]
+        group.bench_with_input(BenchmarkId::new("jit_hot", n), &n, |b, &n| {
+            let source = connected_components_source_no_facts();
+            let (program, _) = prepare_program(&source);
+            // Warmup: compile JIT once
+            let mut warmup = Engine::new(&program);
+            warmup.enable_jit();
+            let half = n / 2;
+            for i in 1..half {
+                warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+            }
+            for i in (half + 1)..n {
+                warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+            }
+            warmup.run(&program);
+            let compiled = warmup.share_jit_compiler().unwrap();
+            // Hot iterations: reuse compiled JIT
+            b.iter(|| {
+                let half = n / 2;
+                let mut engine = Engine::new(&program);
+                engine.with_jit_compiler(compiled.clone());
+                for i in 1..half {
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                }
+                for i in (half + 1)..n {
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                }
+                engine.run(&program);
+                engine
+            });
+        });
+
         group.bench_with_input(BenchmarkId::new("ascent_macro", n), &n, |b, &n| {
             b.iter(|| {
                 ascent! {
@@ -347,6 +433,30 @@ fn bench_fibonacci(c: &mut Criterion) {
             b.iter(|| {
                 let mut engine = Engine::new(&program);
                 engine.enable_jit();
+                engine.run(&program);
+                engine
+            });
+        });
+
+        // JIT hot-cache: pre-compile once, share compiled JIT across iterations.
+        #[cfg(feature = "jit")]
+        group.bench_with_input(BenchmarkId::new("jit_hot", limit), &limit, |b, &n| {
+            let source = format!(
+                "relation fib(i32, i32);\n\
+                 fib(0, 0);\n\
+                 fib(1, 1);\n\
+                 fib(nn + 1, a + b) <-- fib(nn, a), fib(nn - 1, b), if *nn < {n};\n"
+            );
+            let (program, _) = prepare_program(&source);
+            // Warmup: compile JIT once (no facts to insert — seeds are in program text)
+            let mut warmup = Engine::new(&program);
+            warmup.enable_jit();
+            warmup.run(&program);
+            let compiled = warmup.share_jit_compiler().unwrap();
+            // Hot iterations: reuse compiled JIT
+            b.iter(|| {
+                let mut engine = Engine::new(&program);
+                engine.with_jit_compiler(compiled.clone());
                 engine.run(&program);
                 engine
             });

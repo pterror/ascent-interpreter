@@ -51,5 +51,7 @@ mod specialized;
 pub mod value;
 
 pub use eval::{Bindings, Engine, TypeRegistry, ValueDestructor, VarId, VarInterner};
+#[cfg(feature = "jit")]
+pub use eval::SharedJitCompiler;
 pub use relation::{Relation, RelationStorage, SourceId};
 pub use value::{DynValue, Tuple, Value};

@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use ascent_ir::{BodyItem, Program};
 use petgraph::algo::{condensation, toposort};
@@ -354,9 +355,9 @@ pub struct Engine {
     /// Cached stratification for incremental re-runs.
     stratification: Option<Stratification>,
     /// JIT compiler for rule bodies (optional, feature-gated).
-    /// RefCell allows lazy compilation during derive_tuples (&self).
+    /// Arc<Mutex> allows sharing a pre-compiled JIT across Engine instances.
     #[cfg(feature = "jit")]
-    jit: Option<RefCell<crate::jit::JitCompiler>>,
+    jit: Option<Arc<Mutex<crate::jit::JitCompiler>>>,
     /// Cache of stratum meta-function runtime contexts.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     stratum_meta_cache: FxHashMap<usize, StratumMetaRuntime>,
@@ -367,6 +368,14 @@ pub struct Engine {
     #[cfg(all(feature = "jit", feature = "specialized"))]
     stratum_stage4_cache: FxHashMap<usize, StratumStage4Runtime>,
 }
+
+/// An opaque, shareable handle to a pre-compiled JIT compiler.
+///
+/// Obtained from [`Engine::share_jit_compiler`] and passed to
+/// [`Engine::with_jit_compiler`] to avoid recompilation across engine instances.
+#[cfg(feature = "jit")]
+#[derive(Clone)]
+pub struct SharedJitCompiler(Arc<Mutex<crate::jit::JitCompiler>>);
 
 impl Engine {
     /// Create a new engine from a program.
@@ -420,10 +429,24 @@ impl Engine {
     pub fn enable_jit(&mut self) {
         if self.jit.is_none() {
             match crate::jit::JitCompiler::new() {
-                Ok(compiler) => self.jit = Some(RefCell::new(compiler)),
+                Ok(compiler) => self.jit = Some(Arc::new(Mutex::new(compiler))),
                 Err(e) => eprintln!("JIT init failed: {e}"),
             }
         }
+    }
+
+    /// Return a shared handle to the compiled JIT state.
+    /// Multiple engines can share one handle to avoid recompilation.
+    #[cfg(feature = "jit")]
+    pub fn share_jit_compiler(&self) -> Option<SharedJitCompiler> {
+        self.jit.clone().map(SharedJitCompiler)
+    }
+
+    /// Inject a pre-compiled JIT compiler from another engine.
+    /// The injected compiler is shared; compilation results are visible to all sharers.
+    #[cfg(feature = "jit")]
+    pub fn with_jit_compiler(&mut self, jit: SharedJitCompiler) {
+        self.jit = Some(jit.0);
     }
 
     /// Register a custom type with constructor and destructor.
@@ -802,7 +825,7 @@ impl Engine {
             let Some(jit_cell) = self.jit.as_ref() else {
                 return false;
             };
-            let mut jit = jit_cell.borrow_mut();
+            let mut jit = jit_cell.lock().unwrap();
             for rule in rules {
                 let rule_idx = *rule as *const CRule as usize;
                 if jit.get_or_compile_packed(rule_idx, rule).is_none() {
@@ -825,7 +848,7 @@ impl Engine {
             let Some(jit_cell) = self.jit.as_ref() else {
                 return false;
             };
-            let mut jit = jit_cell.borrow_mut();
+            let mut jit = jit_cell.lock().unwrap();
             match jit.compile_stratum_meta(stratum_key, rules) {
                 Some(f) => f,
                 None => return false,
@@ -854,7 +877,7 @@ impl Engine {
             let Some(jit_cell) = self.jit.as_ref() else {
                 return false;
             };
-            let mut jit = jit_cell.borrow_mut();
+            let mut jit = jit_cell.lock().unwrap();
             match jit.compile_stratum_stage4(stratum_key, rules) {
                 Some(f) => f,
                 None => return false,
@@ -1079,7 +1102,7 @@ impl Engine {
             let Some(jit_cell) = self.jit.as_ref() else {
                 return false;
             };
-            let mut jit = jit_cell.borrow_mut();
+            let mut jit = jit_cell.lock().unwrap();
             for rule in rules {
                 let rule_idx = *rule as *const CRule as usize;
                 if jit.get_or_compile_packed_v3(rule_idx, rule).is_none() {
@@ -1102,7 +1125,7 @@ impl Engine {
             let Some(jit_cell) = self.jit.as_ref() else {
                 return false;
             };
-            let mut jit = jit_cell.borrow_mut();
+            let mut jit = jit_cell.lock().unwrap();
             match jit.compile_stratum_stage3(stratum_key, rules) {
                 Some(f) => f,
                 None => return false,
@@ -1124,7 +1147,7 @@ impl Engine {
         use crate::relation::Relation;
         use crate::specialized::PackedStorage;
 
-        let jit_ref = self.jit.as_ref()?.borrow();
+        let jit_ref = self.jit.as_ref()?.lock().unwrap();
 
         let mut per_rule_bindings: Vec<Box<[u32]>> = Vec::new();
         let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
@@ -1275,7 +1298,7 @@ impl Engine {
         use crate::relation::Relation;
         use crate::specialized::PackedStorage;
 
-        let jit_ref = self.jit.as_ref()?.borrow();
+        let jit_ref = self.jit.as_ref()?.lock().unwrap();
 
         // Box<RuleResultsBuf>: stable heap address so the raw *mut pointer remains valid.
         #[allow(clippy::vec_box)]
@@ -1539,7 +1562,7 @@ impl Engine {
             #[cfg(feature = "specialized")]
             {
                 let packed_compiled = {
-                    let mut jit = jit_cell.borrow_mut();
+                    let mut jit = jit_cell.lock().unwrap();
                     jit.get_or_compile_packed(rule_idx, rule).is_some()
                 };
                 if packed_compiled
@@ -1552,7 +1575,7 @@ impl Engine {
 
             // Fall back to trampoline JIT
             let compiled = {
-                let mut jit = jit_cell.borrow_mut();
+                let mut jit = jit_cell.lock().unwrap();
                 jit.get_or_compile(rule_idx, rule).is_some()
             };
             if compiled && let Some(results) = self.derive_tuples_jit(rule, use_recent, rule_idx) {
@@ -1615,7 +1638,7 @@ impl Engine {
     ) -> Option<Vec<(&'a str, Tuple)>> {
         use crate::jit::helpers::JitContext;
 
-        let jit = self.jit.as_ref()?.borrow();
+        let jit = self.jit.as_ref()?.lock().unwrap();
         let compiled = jit.cache.get(&rule_idx)?.as_ref()?;
 
         // Resolve relation pointers for clauses in order
@@ -1718,7 +1741,7 @@ impl Engine {
             return None;
         }
 
-        let jit = self.jit.as_ref()?.borrow();
+        let jit = self.jit.as_ref()?.lock().unwrap();
         let compiled = jit.packed_cache.get(&rule_idx)?.as_ref()?;
 
         // Flat u32 binding scratch (one slot per var_id)

@@ -153,6 +153,11 @@ pub struct JitCompiler {
     pub(crate) stratum_stage4_fn_cache: FxHashMap<usize, Option<packed_helpers::StratumStage4Fn>>,
 }
 
+// Safety: JitCompiler is only accessed from one thread at a time (guarded by Mutex).
+// JITModule contains raw pointers but they are stable heap allocations owned by the compiler.
+unsafe impl Send for JitCompiler {}
+unsafe impl Sync for JitCompiler {}
+
 impl JitCompiler {
     /// Create a new JIT compiler.
     pub fn new() -> Result<Self, String> {

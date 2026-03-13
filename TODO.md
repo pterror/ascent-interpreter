@@ -142,7 +142,7 @@ Current JIT architecture (context for what needs to change):
 
 ### JIT tuning
 
-- [ ] **Shareable JitCache across Engine instances** — JIT compilation cache is per-`Engine`; every `Engine::new()` recompiles from scratch. Benchmarks therefore measure compile+run, not execution-only. For the LSP use case (many incremental evaluations of the same program), a shareable `Arc<JitCache>` would let all engine instances reuse compiled strata. Also needed for a clean "hot JIT" benchmark variant that isolates execution cost.
+- [x] **Shareable JitCache across Engine instances** — JIT compilation cache is per-`Engine`; every `Engine::new()` recompiles from scratch. Benchmarks therefore measure compile+run, not execution-only. For the LSP use case (many incremental evaluations of the same program), a shareable `Arc<JitCache>` would let all engine instances reuse compiled strata. Also needed for a clean "hot JIT" benchmark variant that isolates execution cost.
 
 - [ ] **Stage 4 benefit limited to recursive strata** — JIT matches interpreter for single-pass queries (triangle: ±3% vs interp_run_only); wins only on recursive fixpoints where compilation cost is amortized (TC n=200: -11%). Root cause: single-pass rules run one iteration so there's no fixpoint loop to optimize across. No regression vs Stage 3 (both near-parity for triangle). Worth investigating whether Stage 4 should skip compilation for strata with no recursive rules.
 
