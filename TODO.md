@@ -95,6 +95,8 @@ Steps 1–2 are representation changes. Step 3 is the highest-value item for LSP
 4. [x] Bytecode compiler for expressions — compile `CExpr` to a flat bytecode with a tight eval loop (LOAD_VAR, LOAD_CONST, ADD, CMP_EQ, etc.). Replaces tree-walk `eval_expr`. Can be worked in parallel with step 3.
 5. [x] Arity-specialized eval routines (feature-gated: `specialized`) — at rule load time, classify relations by type signature. Relations with all u32-representable columns (i32, u32, String, bool) use `PackedStorage` with dual-buffer layout: u32 flat buffer for fast dedup/index, Value buffer for eval loop reads. Graceful downgrade to generic on type mismatch. Mixed/wide relations fall back to generic `Vec<Value>` path.
 6. [ ] Cranelift JIT (feature-gated: `jit`) — compile rule bodies to native code. Inner join/filter loops become typed loads, index lookups, inserts with no interpretation overhead. Semi-naive loop and stratification stay as-is.
+   - **Attempted**: trampoline JIT (extern "C" helpers for all Value ops) — ~0% speedup, wrong approach
+   - **Correct approach**: for PackedStorage rules (all-u32 columns), JIT reads from u32 flat buffer directly — no Value, no helpers. Bound checks = integer compares. Must bypass the dual-buffer entirely (don't read from Value buffer). Eligible: all-PackedStorage relations + head args are pure variable references.
 
 ### Not planned
 
