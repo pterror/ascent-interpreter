@@ -334,6 +334,9 @@ pub(crate) fn codegen_stratum_stage3_fn(
 ///   offset 12: _pad        u32                            (4 bytes)
 ///   offset 16: all_rels    *const *mut PackedStorage       (ptr_size)
 ///   offset 24: n_all_rels  u32                            (4 bytes)
+///   offset 32: handles_buf *mut JitLookupHandle           (ptr_size)
+///   offset 40: lookup_specs *const LookupSpec             (ptr_size)
+///   offset 48: total_handles u32                          (4 bytes)
 /// ```
 ///
 /// Loop structure:
@@ -342,18 +345,18 @@ pub(crate) fn codegen_stratum_stage3_fn(
 ///   for each rule i:
 ///     ctx_i = rule_ctxs[i]
 ///     inline full body of rule i
-///   jit_stratum_advance(all_rels, n_all_rels) -> changed
+///   jit_stratum_advance_s4(stage4_ctx) -> changed
 ///   if !changed: return
 /// loop:
 ///   for each rule i, for each clause j:
 ///     ctx_i = rule_ctxs[i]
 ///     inline recent-j body of rule i
-///   jit_stratum_advance(all_rels, n_all_rels) -> changed
+///   jit_stratum_advance_s4(stage4_ctx) -> changed
 ///   if !changed: return
 /// ```
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn codegen_stratum_stage4_fn(
-    advance_fn: FuncId,
+    advance_s4_fn: FuncId,
     rules: &[(&[CClause], &[CHeadClause], &[CExpr])],
     func_id: FuncId,
     module: &mut JITModule,
@@ -363,13 +366,12 @@ pub(crate) fn codegen_stratum_stage4_fn(
 ) -> Result<(), String> {
     let ptr_t = module.target_config().pointer_type();
 
-    let advance_ref = module.declare_func_in_func(advance_fn, &mut codegen_ctx.func);
+    let advance_ref = module.declare_func_in_func(advance_s4_fn, &mut codegen_ctx.func);
 
     let func_refs = FuncRefsV3 {
         packed_count: module.declare_func_in_func(helpers.packed_count, &mut codegen_ctx.func),
         packed_data_ptr: module.declare_func_in_func(helpers.packed_data_ptr, &mut codegen_ctx.func),
         packed_recent_idx: module.declare_func_in_func(helpers.packed_recent_idx, &mut codegen_ctx.func),
-        packed_lookup: module.declare_func_in_func(helpers.packed_lookup, &mut codegen_ctx.func),
         packed_try_insert: module.declare_func_in_func(helpers.packed_try_insert, &mut codegen_ctx.func),
     };
 
@@ -392,8 +394,6 @@ pub(crate) fn codegen_stratum_stage4_fn(
 
     // Load StratumStage4Ctx fields
     let rule_ctxs_val = builder.ins().load(ptr_t, MemFlags::trusted(), stage4_ctx, 0i32);
-    let all_rels_val = builder.ins().load(ptr_t, MemFlags::trusted(), stage4_ctx, 16i32);
-    let n_all_rels_val = builder.ins().load(I32, MemFlags::trusted(), stage4_ctx, 24i32);
 
     // Load per-rule ctx pointers once (they don't change during execution)
     let mut rule_ctx_vals = Vec::with_capacity(rules.len());
@@ -427,7 +427,8 @@ pub(crate) fn codegen_stratum_stage4_fn(
     builder.switch_to_block(post_full);
     builder.seal_block(post_full);
 
-    let call0 = builder.ins().call(advance_ref, &[all_rels_val, n_all_rels_val]);
+    // jit_stratum_advance_s4(stage4_ctx) -> i8
+    let call0 = builder.ins().call(advance_ref, &[stage4_ctx]);
     let changed0 = builder.inst_results(call0)[0];
     builder.ins().brif(changed0, inner_hdr, &[], exit, &[]);
 
@@ -474,7 +475,7 @@ pub(crate) fn codegen_stratum_stage4_fn(
     builder.switch_to_block(post_inner);
     builder.seal_block(post_inner);
 
-    let call1 = builder.ins().call(advance_ref, &[all_rels_val, n_all_rels_val]);
+    let call1 = builder.ins().call(advance_ref, &[stage4_ctx]);
     let changed1 = builder.inst_results(call1)[0];
     builder.ins().brif(changed1, inner_hdr, &[], exit, &[]);
     // inner_hdr is now fully sealed — all predecessors (post_full, post_inner) known.
@@ -516,10 +517,11 @@ fn emit_rule_bodies(
     for (rule_i, (clauses, heads, conditions)) in rules.iter().enumerate() {
         let ctx_i = rule_ctx_vals[rule_i];
 
-        // Load PackedJitContextV3 fields: rels @ 0, bindings @ 16, head_rels @ 24
+        // Load PackedJitContextV3 fields: rels @ 0, bindings @ 16, head_rels @ 24, lookup_handles @ 32
         let rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 0i32);
         let bindings_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
         let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
+        let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
 
         // Build the (body_idx, &CClause) pairs as gen_clauses_v3 expects.
         // body_idx is the sequential clause index (0-based within the clauses slice).
@@ -536,6 +538,7 @@ fn emit_rule_bodies(
             rels_i,
             bindings_i,
             head_rels_i,
+            lookup_handles_i,
             func_refs,
             heads,
             ptr_t,
@@ -575,6 +578,7 @@ fn emit_recent_rule_bodies(
         let rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 0i32);
         let bindings_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
         let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
+        let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
 
         let indexed_clauses: Vec<(usize, &CClause)> =
             clauses.iter().enumerate().collect();
@@ -591,6 +595,7 @@ fn emit_recent_rule_bodies(
             rels_i,
             bindings_i,
             head_rels_i,
+            lookup_handles_i,
             func_refs,
             heads,
             ptr_t,

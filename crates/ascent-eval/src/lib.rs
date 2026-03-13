@@ -41,6 +41,8 @@ pub mod expr;
 pub mod intern;
 #[cfg(feature = "jit")]
 mod jit;
+#[cfg(all(feature = "jit", feature = "specialized"))]
+mod jit_index;
 mod relation;
 #[cfg(feature = "serde")]
 pub mod serde_bridge;

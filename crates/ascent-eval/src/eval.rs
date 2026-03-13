@@ -319,6 +319,10 @@ struct StratumStage4Runtime {
     _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContextV3>>,
     _rule_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContextV3]>,
     _all_rels: Box<[*mut crate::specialized::PackedStorage]>,
+    /// Flat buffer of all JitLookupHandle for all rules (handles_buf in ctx).
+    _handles_buf: Box<[crate::jit_index::JitLookupHandle]>,
+    /// Parallel spec array for handle refresh (lookup_specs in ctx).
+    _lookup_specs: Box<[crate::jit::packed_helpers::LookupSpec]>,
 }
 
 #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -877,7 +881,8 @@ impl Engine {
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     fn build_stratum_stage4_runtime(&self, rules: &[&CRule]) -> Option<StratumStage4Runtime> {
-        use crate::jit::packed_helpers::{PackedJitContextV3, StratumStage4Ctx};
+        use crate::jit::packed_helpers::{LookupSpec, PackedJitContextV3, StratumStage4Ctx};
+        use crate::jit_index::JitLookupHandle;
         use crate::relation::Relation;
         use crate::specialized::PackedStorage;
 
@@ -886,6 +891,12 @@ impl Engine {
         let mut per_rule_head_rels: Vec<Box<[*mut PackedStorage]>> = Vec::new();
         let mut per_rule_ctxs: Vec<Box<PackedJitContextV3>> = Vec::new();
         let mut rule_ctx_ptrs_vec: Vec<*mut PackedJitContextV3> = Vec::new();
+
+        // Flat handles and specs (all rules concatenated).
+        let mut handles_flat: Vec<JitLookupHandle> = Vec::new();
+        let mut specs_flat: Vec<LookupSpec> = Vec::new();
+        // Starting handle index for each rule (for setting lookup_handles ptr later).
+        let mut rule_handle_offsets: Vec<usize> = Vec::new();
 
         for rule in rules {
             // Clause rel pointers
@@ -927,6 +938,54 @@ impl Engine {
                 return None;
             }
 
+            // Build 2 handles per clause (full + recent).
+            // Index: clause_offset * 2 + use_recent
+            let rule_handle_start = handles_flat.len();
+            rule_handle_offsets.push(rule_handle_start);
+
+            // Extract clause body items in order to find the primary bound column.
+            let rule_clauses: Vec<&crate::compiled::CClause> = rule
+                .body
+                .iter()
+                .filter_map(|item| match item {
+                    CBodyItem::Clause(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+
+            for (clause_offset, clause) in rule_clauses.iter().enumerate() {
+                let rel_ptr = clause_rels[clause_offset];
+                for use_recent_flag in [0u32, 1u32] {
+                    if clause.bound_cols.is_empty() {
+                        // Full-scan clause — null handle (never accessed by inline probe)
+                        handles_flat.push(JitLookupHandle::null());
+                        specs_flat.push(LookupSpec {
+                            rel: rel_ptr,
+                            col: 0,
+                            use_recent: use_recent_flag,
+                        });
+                    } else {
+                        let col = clause.bound_cols[0];
+                        let ps = unsafe { &*rel_ptr };
+                        let idx = if use_recent_flag != 0 {
+                            ps.jit_recent_indices.get(col)
+                        } else {
+                            ps.jit_indices.get(col)
+                        };
+                        let handle = match idx {
+                            Some(i) => JitLookupHandle::from_index(i),
+                            None => JitLookupHandle::null(),
+                        };
+                        handles_flat.push(handle);
+                        specs_flat.push(LookupSpec {
+                            rel: rel_ptr,
+                            col: col as u32,
+                            use_recent: use_recent_flag,
+                        });
+                    }
+                }
+            }
+
             let clause_rels_box: Box<[*const PackedStorage]> = clause_rels.into_boxed_slice();
             let head_rels_box: Box<[*mut PackedStorage]> = head_rels.into_boxed_slice();
             let bindings_box: Box<[u32]> = vec![0u32; self.var_count].into_boxed_slice();
@@ -934,12 +993,14 @@ impl Engine {
             let bindings_ptr: *mut u32 = bindings_box.as_ptr() as *mut u32;
             let head_rels_ptr: *const *mut PackedStorage = head_rels_box.as_ptr();
 
+            // lookup_handles pointer will be fixed up after handles_flat is boxed.
             let ctx = Box::new(PackedJitContextV3 {
                 rels: clause_rels_box.as_ptr(),
                 rels_len: clause_rels_box.len() as u32,
                 _pad: 0,
                 bindings: bindings_ptr,
                 head_rels: head_rels_ptr,
+                lookup_handles: std::ptr::null(), // fixed up below
             });
 
             rule_ctx_ptrs_vec
@@ -949,6 +1010,17 @@ impl Engine {
             per_rule_clause_rels.push(clause_rels_box);
             per_rule_head_rels.push(head_rels_box);
             per_rule_ctxs.push(ctx);
+        }
+
+        let total_handles = handles_flat.len() as u32;
+        let mut handles_box: Box<[JitLookupHandle]> = handles_flat.into_boxed_slice();
+        let specs_box: Box<[LookupSpec]> = specs_flat.into_boxed_slice();
+
+        // Fix up per-rule ctx lookup_handles pointers now that handles_box is stable.
+        for (rule_i, ctx) in per_rule_ctxs.iter_mut().enumerate() {
+            let offset = rule_handle_offsets[rule_i];
+            // SAFETY: handles_box is pinned in a Box which won't move.
+            ctx.lookup_handles = unsafe { handles_box.as_mut_ptr().add(offset) };
         }
 
         // All packed rels for advance()
@@ -972,6 +1044,10 @@ impl Engine {
             all_rels: all_rels_box.as_ptr(),
             n_all_rels: all_rels_box.len() as u32,
             _pad2: 0,
+            handles_buf: handles_box.as_mut_ptr(),
+            lookup_specs: specs_box.as_ptr(),
+            total_handles,
+            _pad3: 0,
         });
 
         Some(StratumStage4Runtime {
@@ -982,6 +1058,8 @@ impl Engine {
             _per_rule_ctxs: per_rule_ctxs,
             _rule_ctx_ptrs: rule_ctx_ptrs_box,
             _all_rels: all_rels_box,
+            _handles_buf: handles_box,
+            _lookup_specs: specs_box,
         })
     }
 
@@ -1116,6 +1194,8 @@ impl Engine {
                 _pad: 0,
                 bindings: bindings_ptr,
                 head_rels: head_rels_ptr,
+                // Stage 3 uses call-based packed_lookup — no inline handles needed
+                lookup_handles: std::ptr::null(),
             });
 
             // Build recent variants for this rule

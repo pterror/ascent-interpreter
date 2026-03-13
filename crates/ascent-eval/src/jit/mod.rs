@@ -69,6 +69,8 @@ pub(crate) struct PackedJitHelperIds {
     // Stage 3 helpers
     pub(crate) packed_try_insert: FuncId,
     pub(crate) stratum_advance: FuncId,
+    // Stage 4: advance + handle refresh
+    pub(crate) stratum_advance_s4: FuncId,
 }
 
 /// A packed-JIT compiled rule with semi-naive variants.
@@ -215,6 +217,10 @@ impl JitCompiler {
             jit_builder.symbol(
                 "jit_stratum_advance",
                 packed_helpers::jit_stratum_advance as *const u8,
+            );
+            jit_builder.symbol(
+                "jit_stratum_advance_s4",
+                packed_helpers::jit_stratum_advance_s4 as *const u8,
             );
         }
 
@@ -654,7 +660,7 @@ impl JitCompiler {
             .collect();
 
         stratum_codegen::codegen_stratum_stage4_fn(
-            self.packed_helpers.stratum_advance,
+            self.packed_helpers.stratum_advance_s4,
             &rules_refs,
             func_id,
             &mut self.module,
@@ -1139,6 +1145,14 @@ fn declare_packed_helpers(module: &mut JITModule) -> Result<PackedJitHelperIds, 
         .declare_function("jit_stratum_advance", Linkage::Import, &sig)
         .map_err(map_err)?;
 
+    // jit_stratum_advance_s4(ctx: ptr) -> i8
+    let mut sig = Signature::new(cc);
+    sig.params = vec![AbiParam::new(ptr)];
+    sig.returns = vec![AbiParam::new(I8)];
+    let stratum_advance_s4 = module
+        .declare_function("jit_stratum_advance_s4", Linkage::Import, &sig)
+        .map_err(map_err)?;
+
     Ok(PackedJitHelperIds {
         packed_count,
         packed_data_ptr,
@@ -1148,6 +1162,7 @@ fn declare_packed_helpers(module: &mut JITModule) -> Result<PackedJitHelperIds, 
         stratum_flush_advance,
         packed_try_insert,
         stratum_advance,
+        stratum_advance_s4,
     })
 }
 

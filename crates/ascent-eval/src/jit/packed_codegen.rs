@@ -43,7 +43,6 @@ pub(crate) struct FuncRefsV3 {
     pub(crate) packed_count: cranelift_codegen::ir::FuncRef,
     pub(crate) packed_data_ptr: cranelift_codegen::ir::FuncRef,
     pub(crate) packed_recent_idx: cranelift_codegen::ir::FuncRef,
-    pub(crate) packed_lookup: cranelift_codegen::ir::FuncRef,
     pub(crate) packed_try_insert: cranelift_codegen::ir::FuncRef,
 }
 
@@ -729,7 +728,6 @@ pub(crate) fn codegen_packed_rule_body_v3(
         packed_count: module.declare_func_in_func(helpers.packed_count, &mut ctx.func),
         packed_data_ptr: module.declare_func_in_func(helpers.packed_data_ptr, &mut ctx.func),
         packed_recent_idx: module.declare_func_in_func(helpers.packed_recent_idx, &mut ctx.func),
-        packed_lookup: module.declare_func_in_func(helpers.packed_lookup, &mut ctx.func),
         packed_try_insert: module.declare_func_in_func(helpers.packed_try_insert, &mut ctx.func),
     };
 
@@ -746,6 +744,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
     let rels = builder.ins().load(ptr_type, flags, ctx_ptr, 0_i32);
     let bindings = builder.ins().load(ptr_type, flags, ctx_ptr, 16_i32);
     let head_rels = builder.ins().load(ptr_type, flags, ctx_ptr, 24_i32); // V3: head_rels
+    let lookup_handles = builder.ins().load(ptr_type, flags, ctx_ptr, 32_i32); // inline probe handles
 
     let clauses: Vec<(usize, &CClause)> = rule
         .body
@@ -776,6 +775,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
         rels,
         bindings,
         head_rels,
+        lookup_handles,
         &func_refs,
         &rule.heads,
         ptr_type,
@@ -803,6 +803,7 @@ pub(crate) fn gen_clauses_v3(
     rels: CValue,
     bindings: CValue,
     head_rels: CValue,
+    lookup_handles: CValue,
     func_refs: &FuncRefsV3,
     heads: &[CHeadClause],
     ptr_type: cranelift_codegen::ir::Type,
@@ -848,13 +849,13 @@ pub(crate) fn gen_clauses_v3(
         gen_full_scan_v3(
             builder, clause, rel_ptr, arity, use_recent, use_recent_val,
             clauses, clause_offset, recent_clause_idx, rels, bindings, head_rels,
-            func_refs, heads, ptr_type, next_var, conditions,
+            lookup_handles, func_refs, heads, ptr_type, next_var, conditions,
         );
     } else {
         gen_index_scan_v3(
-            builder, clause, rel_ptr, arity, use_recent_val,
+            builder, clause, rel_ptr, arity, use_recent,
             clauses, clause_offset, recent_clause_idx, rels, bindings, head_rels,
-            func_refs, heads, ptr_type, next_var, conditions,
+            lookup_handles, func_refs, heads, ptr_type, next_var, conditions,
         );
     }
 }
@@ -873,6 +874,7 @@ fn gen_full_scan_v3(
     rels: CValue,
     bindings: CValue,
     head_rels: CValue,
+    lookup_handles: CValue,
     func_refs: &FuncRefsV3,
     heads: &[CHeadClause],
     ptr_type: cranelift_codegen::ir::Type,
@@ -946,7 +948,7 @@ fn gen_full_scan_v3(
 
     gen_clauses_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
-        rels, bindings, head_rels, func_refs, heads, ptr_type, next_var, conditions,
+        rels, bindings, head_rels, lookup_handles, func_refs, heads, ptr_type, next_var, conditions,
     );
 
     builder.ins().jump(continue_block, &[]);
@@ -965,19 +967,34 @@ fn gen_full_scan_v3(
     builder.seal_block(loop_exit);
 }
 
+/// Inline hash-probe index scan (Stage 3 / Stage 4).
+///
+/// Replaces the old `call packed_lookup` with a direct open-addressed probe
+/// into the `JitHashIndex` stored in `lookup_handles[clause_offset * 2 + use_recent]`.
+///
+/// Handle layout (`JitLookupHandle`, 24 bytes):
+/// - offset  0: entries_ptr  *const JitIndexEntry
+/// - offset  8: values_ptr   *const u32
+/// - offset 16: mask         u32   (capacity - 1)
+///
+/// `JitIndexEntry` layout (16 bytes):
+/// - offset  0: key    u32
+/// - offset  4: offset u32  (first index in values array)
+/// - offset  8: len    u32  (count)
 #[allow(clippy::too_many_arguments)]
 fn gen_index_scan_v3(
     builder: &mut FunctionBuilder,
     clause: &CClause,
     rel_ptr: CValue,
     arity: usize,
-    use_recent_val: CValue,
+    use_recent: bool,
     clauses: &[(usize, &CClause)],
     clause_offset: usize,
     recent_clause_idx: Option<usize>,
     rels: CValue,
     bindings: CValue,
     head_rels: CValue,
+    lookup_handles: CValue,
     func_refs: &FuncRefsV3,
     heads: &[CHeadClause],
     ptr_type: cranelift_codegen::ir::Type,
@@ -986,41 +1003,171 @@ fn gen_index_scan_v3(
 ) {
     let primary_col = clause.bound_cols[0];
     let key_i32 = load_bound_val(builder, clause, primary_col, bindings);
-    let col_val = builder.ins().iconst(I32, primary_col as i64);
-    let call = builder.ins().call(
-        func_refs.packed_lookup,
-        &[rel_ptr, col_val, key_i32, use_recent_val],
-    );
-    let results = builder.inst_results(call);
-    let indices_ptr = results[0];
-    let indices_len = results[1];
 
+    // ─── Load handle (compile-time constant byte offset) ────────────────────
+    // handle index = clause_offset * 2 + use_recent
+    let handle_byte_offset = (clause_offset * 2 + use_recent as usize) * 24;
+    let handle_ptr = if handle_byte_offset == 0 {
+        lookup_handles
+    } else {
+        let off = builder.ins().iconst(ptr_type, handle_byte_offset as i64);
+        builder.ins().iadd(lookup_handles, off)
+    };
+
+    let entries_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), handle_ptr, 0i32);
+    let values_ptr  = builder.ins().load(ptr_type, MemFlags::trusted(), handle_ptr, 8i32);
+    let mask_i32    = builder.ins().load(I32,      MemFlags::trusted(), handle_ptr, 16i32);
+    let mask        = builder.ins().uextend(ptr_type, mask_i32);
+
+    // ─── Hash probe ──────────────────────────────────────────────────────────
+    // slot = (key * KNUTH_32) & mask
+    let key_ext  = builder.ins().uextend(ptr_type, key_i32);
+    let golden   = builder.ins().iconst(ptr_type, 2_654_435_761_i64);
+    let hash_ext = builder.ins().imul(key_ext, golden);
+    // Mask to 32 bits then extend back (mirrors the Rust impl using u32 arithmetic)
+    let hash32     = builder.ins().ireduce(I32, hash_ext);
+    let hash32_ext = builder.ins().uextend(ptr_type, hash32);
+    let init_slot  = builder.ins().band(hash32_ext, mask);
+
+    // Use Cranelift variable for mutable probe slot
+    let var_slot = Variable::new(*next_var);
+    *next_var += 1;
+    builder.declare_var(var_slot, ptr_type);
+    builder.def_var(var_slot, init_slot);
+
+    // Probe loop with block params to carry (entry_offset, entry_len) out.
+    // Block structure:
+    //   probe_loop:  check empty → empty_exit; check found → probe_found; else → probe_miss
+    //   probe_miss:  increment slot, back-edge to probe_loop
+    //   probe_found(slot: ptr): load offset/len, jump after_probe
+    //   empty_exit:             zero offset/len, jump after_probe
+    //   after_probe(entry_offset: I32, entry_len: I32):  inner value loop
+
+    let probe_loop       = builder.create_block();
+    let probe_check_found= builder.create_block();
+    let probe_found      = builder.create_block();
+    let probe_miss       = builder.create_block();
+    let empty_exit       = builder.create_block();
+    let after_probe      = builder.create_block();
+
+    // after_probe receives (entry_offset: I32, entry_len: I32)
+    builder.append_block_param(after_probe, I32);
+    builder.append_block_param(after_probe, I32);
+
+    builder.ins().jump(probe_loop, &[]);
+
+    // ─── probe_loop ──────────────────────────────────────────────────────────
+    builder.switch_to_block(probe_loop);
+    // sealed after probe_miss back-edge
+
+    let slot = builder.use_var(var_slot);
+    // entry_ptr = entries_ptr + slot * 16  (sizeof JitIndexEntry = 16)
+    let entry_byte_off = builder.ins().imul_imm(slot, 16_i64);
+    let entry_ptr_probe = builder.ins().iadd(entries_ptr, entry_byte_off);
+    let entry_key_probe = builder.ins().load(I32, MemFlags::trusted(), entry_ptr_probe, 0i32);
+
+    let empty_sentinel = builder.ins().iconst(I32, 0xFFFF_FFFFu32 as i64);
+    let is_empty = builder.ins().icmp(IntCC::Equal, entry_key_probe, empty_sentinel);
+    // brif: empty → empty_exit, else → probe_check_found
+    builder.ins().brif(is_empty, empty_exit, &[], probe_check_found, &[]);
+
+    // ─── probe_check_found ───────────────────────────────────────────────────
+    builder.switch_to_block(probe_check_found);
+    builder.seal_block(probe_check_found);
+
+    // entry_key_probe dominates here (SSA: it was computed in probe_loop which
+    // is the only predecessor of probe_check_found).
+    let is_found = builder.ins().icmp(IntCC::Equal, entry_key_probe, key_i32);
+    builder.ins().brif(is_found, probe_found, &[], probe_miss, &[]);
+
+    // ─── probe_miss ──────────────────────────────────────────────────────────
+    builder.switch_to_block(probe_miss);
+    builder.seal_block(probe_miss);
+
+    let slot_miss = builder.use_var(var_slot);
+    let one_ptr   = builder.ins().iconst(ptr_type, 1);
+    let slot_next = builder.ins().iadd(slot_miss, one_ptr);
+    let slot_wrap = builder.ins().band(slot_next, mask);
+    builder.def_var(var_slot, slot_wrap);
+    builder.ins().jump(probe_loop, &[]);
+    // Now seal probe_loop — both predecessors (initial jump + probe_miss back-edge) known.
+    builder.seal_block(probe_loop);
+
+    // ─── probe_found ─────────────────────────────────────────────────────────
+    builder.switch_to_block(probe_found);
+    builder.seal_block(probe_found);
+
+    // Re-compute entry_ptr from the final slot value (same slot as probe_loop above).
+    // The value of `slot` from probe_loop dominates probe_found through probe_check_found.
+    // We need to re-read it via the variable because it was defined before the loop.
+    let slot_found     = builder.use_var(var_slot);
+    let ebo_found      = builder.ins().imul_imm(slot_found, 16_i64);
+    let entry_ptr_found= builder.ins().iadd(entries_ptr, ebo_found);
+    let found_offset   = builder.ins().load(I32, MemFlags::trusted(), entry_ptr_found, 4i32);
+    let found_len      = builder.ins().load(I32, MemFlags::trusted(), entry_ptr_found, 8i32);
+    builder.ins().jump(after_probe, &[found_offset, found_len]);
+
+    // ─── empty_exit ──────────────────────────────────────────────────────────
+    // Before giving up, check the overflow slot at entries[mask + 1] which
+    // holds any entry for key == EMPTY_KEY (0xFFFFFFFF, i.e. i32 value -1).
+    builder.switch_to_block(empty_exit);
+    builder.seal_block(empty_exit);
+
+    // overflow slot index = mask + 1
+    let mask_plus_one = builder.ins().iadd_imm(mask, 1);
+    let ovf_byte_off  = builder.ins().imul_imm(mask_plus_one, 16_i64);
+    let ovf_entry_ptr = builder.ins().iadd(entries_ptr, ovf_byte_off);
+    let ovf_key       = builder.ins().load(I32, MemFlags::trusted(), ovf_entry_ptr, 0i32);
+    let ovf_match     = builder.ins().icmp(IntCC::Equal, ovf_key, key_i32);
+    let ovf_offset    = builder.ins().load(I32, MemFlags::trusted(), ovf_entry_ptr, 4i32);
+    let ovf_len       = builder.ins().load(I32, MemFlags::trusted(), ovf_entry_ptr, 8i32);
+    let zero32        = builder.ins().iconst(I32, 0);
+    let sel_offset    = builder.ins().select(ovf_match, ovf_offset, zero32);
+    let sel_len       = builder.ins().select(ovf_match, ovf_len, zero32);
+    builder.ins().jump(after_probe, &[sel_offset, sel_len]);
+
+    // ─── after_probe(entry_offset: I32, entry_len: I32) ──────────────────────
+    builder.switch_to_block(after_probe);
+    builder.seal_block(after_probe);
+
+    let entry_offset = builder.block_params(after_probe)[0];
+    let entry_len    = builder.block_params(after_probe)[1];
+
+    // Extend for pointer arithmetic
+    let entry_offset_ext = builder.ins().uextend(ptr_type, entry_offset);
+    let entry_len_ext    = builder.ins().uextend(ptr_type, entry_len);
+
+    // ─── Inner value loop ─────────────────────────────────────────────────────
+    // Iterate j in 0..entry_len, reading values_ptr[(entry_offset + j)] as u32.
     let loop_header = builder.create_block();
-    let loop_body = builder.create_block();
-    let loop_exit = builder.create_block();
+    let loop_body   = builder.create_block();
+    let loop_exit   = builder.create_block();
 
     let var_j = Variable::new(*next_var);
     *next_var += 1;
     builder.declare_var(var_j, ptr_type);
-    let zero = builder.ins().iconst(ptr_type, 0);
-    builder.def_var(var_j, zero);
+    let zero_ptr = builder.ins().iconst(ptr_type, 0);
+    builder.def_var(var_j, zero_ptr);
     builder.ins().jump(loop_header, &[]);
 
     builder.switch_to_block(loop_header);
-    let j = builder.use_var(var_j);
-    let cmp = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, j, indices_len);
+    let j   = builder.use_var(var_j);
+    let cmp = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, j, entry_len_ext);
     builder.ins().brif(cmp, loop_exit, &[], loop_body, &[]);
 
     builder.switch_to_block(loop_body);
     let j = builder.use_var(var_j);
 
-    let idx_byte_offset = builder.ins().imul_imm(j, 8_i64);
-    let idx_addr = builder.ins().iadd(indices_ptr, idx_byte_offset);
-    let tuple_idx = builder.ins().load(ptr_type, MemFlags::trusted(), idx_addr, 0);
+    // tuple_idx = values_ptr[(entry_offset + j)]  — u32 load, stride 4
+    let abs_j     = builder.ins().iadd(entry_offset_ext, j);
+    let byte_off  = builder.ins().imul_imm(abs_j, 4_i64);
+    let idx_addr  = builder.ins().iadd(values_ptr, byte_off);
+    let tuple_idx_u32 = builder.ins().load(I32, MemFlags::trusted(), idx_addr, 0i32);
+    let tuple_idx     = builder.ins().uextend(ptr_type, tuple_idx_u32);
 
     // Re-fetch packed_data_ptr each iteration — direct head inserts may reallocate the buffer.
-    let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
-    let packed_buf = builder.inst_results(call)[0];
+    let call      = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
+    let packed_buf= builder.inst_results(call)[0];
     let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
 
     let continue_block = builder.create_block();
@@ -1029,18 +1176,18 @@ fn gen_index_scan_v3(
     for (col, arg) in clause.args.iter().enumerate() {
         match arg {
             CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
-                let actual = load_packed_col(builder, tuple_ptr, col);
+                let actual   = load_packed_col(builder, tuple_ptr, col);
                 let expected = builder.ins().iconst(I32, *n as i64);
-                let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
                 let pass_block = builder.create_block();
                 builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
                 inner_blocks_to_seal.push(pass_block);
                 builder.switch_to_block(pass_block);
             }
             CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
-                let actual = load_packed_col(builder, tuple_ptr, col);
+                let actual   = load_packed_col(builder, tuple_ptr, col);
                 let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
-                let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
                 let pass_block = builder.create_block();
                 builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
                 inner_blocks_to_seal.push(pass_block);
@@ -1051,9 +1198,9 @@ fn gen_index_scan_v3(
     }
 
     for &col in &clause.bound_cols[1..] {
-        let actual = load_packed_col(builder, tuple_ptr, col);
+        let actual   = load_packed_col(builder, tuple_ptr, col);
         let expected = load_bound_val(builder, clause, col, bindings);
-        let eq = builder.ins().icmp(IntCC::Equal, actual, expected);
+        let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
         let pass_block = builder.create_block();
         builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
         inner_blocks_to_seal.push(pass_block);
@@ -1067,7 +1214,7 @@ fn gen_index_scan_v3(
 
     gen_clauses_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
-        rels, bindings, head_rels, func_refs, heads, ptr_type, next_var, conditions,
+        rels, bindings, head_rels, lookup_handles, func_refs, heads, ptr_type, next_var, conditions,
     );
 
     builder.ins().jump(continue_block, &[]);
@@ -1078,7 +1225,7 @@ fn gen_index_scan_v3(
     }
     builder.seal_block(continue_block);
 
-    let j = builder.use_var(var_j);
+    let j   = builder.use_var(var_j);
     let one = builder.ins().iconst(ptr_type, 1);
     let j_next = builder.ins().iadd(j, one);
     builder.def_var(var_j, j_next);
