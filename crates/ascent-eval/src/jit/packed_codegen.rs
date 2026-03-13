@@ -42,7 +42,7 @@ struct FuncRefs {
 pub(crate) struct FuncRefsV3 {
     pub(crate) packed_count: cranelift_codegen::ir::FuncRef,
     pub(crate) packed_data_ptr: cranelift_codegen::ir::FuncRef,
-    pub(crate) packed_recent_idx: cranelift_codegen::ir::FuncRef,
+    pub(crate) packed_recent_ptr: cranelift_codegen::ir::FuncRef,
     pub(crate) packed_try_insert: cranelift_codegen::ir::FuncRef,
 }
 
@@ -727,7 +727,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
     let func_refs = FuncRefsV3 {
         packed_count: module.declare_func_in_func(helpers.packed_count, &mut ctx.func),
         packed_data_ptr: module.declare_func_in_func(helpers.packed_data_ptr, &mut ctx.func),
-        packed_recent_idx: module.declare_func_in_func(helpers.packed_recent_idx, &mut ctx.func),
+        packed_recent_ptr: module.declare_func_in_func(helpers.packed_recent_ptr, &mut ctx.func),
         packed_try_insert: module.declare_func_in_func(helpers.packed_try_insert, &mut ctx.func),
     };
 
@@ -902,6 +902,16 @@ fn gen_full_scan_v3(
         None
     };
 
+    // For recent scans, fetch the recent-index array pointer once before the loop.
+    // recent[i] is a usize (pointer-sized) stored at recent_ptr + i * ptr_size.
+    // This replaces the per-iteration packed_recent_idx call with an inline load.
+    let cached_recent_ptr = if use_recent {
+        let call = builder.ins().call(func_refs.packed_recent_ptr, &[rel_ptr]);
+        Some(builder.inst_results(call)[0])
+    } else {
+        None
+    };
+
     let loop_header = builder.create_block();
     let loop_body = builder.create_block();
     let loop_exit = builder.create_block();
@@ -922,8 +932,10 @@ fn gen_full_scan_v3(
     let i = builder.use_var(var_i);
 
     let tuple_idx = if use_recent {
-        let call = builder.ins().call(func_refs.packed_recent_idx, &[rel_ptr, i]);
-        builder.inst_results(call)[0]
+        // recent_ptr[i] is a usize (pointer-sized); load it directly.
+        let byte_off = builder.ins().imul_imm(i, std::mem::size_of::<usize>() as i64);
+        let elem_addr = builder.ins().iadd(cached_recent_ptr.unwrap(), byte_off);
+        builder.ins().load(ptr_type, MemFlags::trusted(), elem_addr, 0)
     } else {
         i
     };

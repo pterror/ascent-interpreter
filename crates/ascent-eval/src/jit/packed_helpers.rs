@@ -89,6 +89,21 @@ pub unsafe extern "C" fn packed_recent_idx(rel: *const PackedStorage, seq_idx: u
     rel.recent[seq_idx]
 }
 
+/// Return a pointer to the start of the recent-index array (`rel.recent`).
+///
+/// The array contains `usize` elements (pointer-sized); element `i` is the
+/// tuple index of the i-th recent tuple.  Callers must not mutate through
+/// this pointer.  The pointer is stable for the lifetime of the current
+/// semi-naive iteration (no `advance()` call between fetch and use).
+///
+/// # Safety
+/// `rel` must point to a valid PackedStorage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn packed_recent_ptr(rel: *const PackedStorage) -> *const usize {
+    let rel = unsafe { &*rel };
+    rel.recent.as_ptr()
+}
+
 /// Look up tuples matching `key` in column `col`.
 ///
 /// Returns a pointer+length pair pointing into the relation's index Vec.

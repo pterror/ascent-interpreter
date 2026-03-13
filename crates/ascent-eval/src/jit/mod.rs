@@ -63,6 +63,7 @@ pub(crate) struct PackedJitHelperIds {
     pub(crate) packed_count: FuncId,
     pub(crate) packed_data_ptr: FuncId,
     pub(crate) packed_recent_idx: FuncId,
+    pub(crate) packed_recent_ptr: FuncId,
     pub(crate) packed_lookup: FuncId,
     pub(crate) packed_push_result: FuncId,
     pub(crate) stratum_flush_advance: FuncId,
@@ -205,6 +206,10 @@ impl JitCompiler {
             jit_builder.symbol(
                 "packed_recent_idx",
                 packed_helpers::packed_recent_idx as *const u8,
+            );
+            jit_builder.symbol(
+                "packed_recent_ptr",
+                packed_helpers::packed_recent_ptr as *const u8,
             );
             jit_builder.symbol("packed_lookup", packed_helpers::packed_lookup as *const u8);
             jit_builder.symbol(
@@ -1101,6 +1106,14 @@ fn declare_packed_helpers(module: &mut JITModule) -> Result<PackedJitHelperIds, 
         .declare_function("packed_recent_idx", Linkage::Import, &sig)
         .map_err(map_err)?;
 
+    // packed_recent_ptr(rel: ptr) -> ptr (*const usize)
+    let mut sig = Signature::new(cc);
+    sig.params = vec![AbiParam::new(ptr)];
+    sig.returns = vec![AbiParam::new(ptr)];
+    let packed_recent_ptr = module
+        .declare_function("packed_recent_ptr", Linkage::Import, &sig)
+        .map_err(map_err)?;
+
     // packed_lookup(rel: ptr, col: i32, key: i32, use_recent: i32) -> (ptr, ptr)
     let mut sig = Signature::new(cc);
     sig.params = vec![
@@ -1162,6 +1175,7 @@ fn declare_packed_helpers(module: &mut JITModule) -> Result<PackedJitHelperIds, 
         packed_count,
         packed_data_ptr,
         packed_recent_idx,
+        packed_recent_ptr,
         packed_lookup,
         packed_push_result,
         stratum_flush_advance,
