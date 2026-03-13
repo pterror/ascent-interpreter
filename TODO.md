@@ -111,17 +111,20 @@ Current JIT architecture (context for what needs to change):
 - Per-rule variants: 1 full + N recent (one per clause); Rust dispatches each variant
 - Packed JIT bails on any conditions; trampoline JIT calls `jit_eval_condition` helper for `CCondition::If`
 
-**Stage 1 — Widen packed JIT coverage** (prerequisite; low risk; changes `packed_codegen.rs`)
-- [ ] Conditions in packed JIT: traverse CExpr and emit Cranelift `icmp`/`iadd` etc. for integer ops on bound u32 vars. Simple guards (`if x > y`, `if x != y`) are a handful of IR instructions — no helper call needed.
-- [ ] Literals in clause args: currently bails out; emit an inline `icmp` against a constant instead.
-- Payoff: most real-world rules become packed-JIT-eligible; interpreter fallback nearly disappears for typed programs.
+**Stage 1 — Widen packed JIT coverage** ✅ DONE (`274c380`)
+- [x] Conditions in packed JIT: CExpr compiled to Cranelift icmp/iadd; checked at innermost match point before head emission.
+- [x] Literals in clause args: inline `icmp` against packed constant; full-scan restructured with explicit `continue_block`.
+- [x] Tests: condition comparison, literal clause arg, arithmetic condition.
 
-**Stage 2 — Stratum-level JIT** (the architectural shift; eliminates Rust loop overhead)
-- [ ] Compile a *stratum meta-function*: a single Cranelift function that owns the `while has_delta` fixpoint loop, calls each rule's compiled variants in sequence (via Cranelift `call` instructions), calls `advance()`/changed-check helpers, and returns only when fixpoint is reached.
-- Compile once on first stratum entry; cache and reuse across incremental updates (rules don't change, only facts do).
-- This avoids redesigning the relation state machine (advance/recent stay in Rust helpers; only the loop control moves to native code).
-- Payoff: eliminates per-rule Rust dispatch overhead, fixpoint loop in native code, amortises compilation over thousands of semi-naive iterations.
-- True cross-rule inlining (rule bodies inlined into stratum function) requires making `PackedStorage` internals directly JIT-addressable — defer to stage 3.
+**Stage 2 — Stratum-level JIT** ✅ DONE
+- [x] `jit_stratum_flush_advance` Rust helper: flush all per-rule results into head relations, advance all packed rels, return changed bool.
+- [x] `StratumMetaCtx` (repr C): carries full/recent fn ptr arrays + counts + flusher ptr.
+- [x] `codegen_stratum_meta_fn` (stratum_codegen.rs): Cranelift function that owns the `while has_delta` loop, calls rule variants via `call_indirect`, calls flush+advance helper.
+- [x] `JitCompiler::compile_stratum_meta`: compiles and caches per-stratum key.
+- [x] `Engine::try_run_stratum_meta`: builds pinned runtime context once per stratum, calls meta-fn; hooked as fast path in `run_stratum`.
+- [x] Tests: TC (2-rule SCC), multi-rule stratum, single-rule with self-join cycle.
+- Advance/recent state machine stays in Rust helpers; only loop control is in native code.
+- True cross-rule inlining (inline rule bodies into stratum function, direct buffer writes) — defer to stage 3.
 
 **Stage 3 — Fully typed stratum** (closes the gap to `ascent!`)
 - [ ] For strata where all relations are fully packed: inline rule bodies into the stratum function (no `call` between rules), expose `PackedStorage.packed_data` pointer directly in JIT, emit head insertions as direct buffer writes. No Value enum, no Rust re-entry in the hot path.
