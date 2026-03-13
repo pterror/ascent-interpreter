@@ -6,8 +6,9 @@
 //! faster hashing and comparison, while a parallel `Vec<Value>` buffer
 //! maintains compatibility with the generic evaluation loop.
 
+use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::rc::Rc;
 
 use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -18,17 +19,63 @@ use crate::value::{Tuple, Value};
 
 /// Intern table for packing/unpacking arbitrary `Hash + Eq` values to u32.
 ///
-/// Implementors map domain values ↔ stable u32 identifiers.
-/// `pack` returns `None` on type mismatch (not on missing key — values must
-/// already be interned before packing).
-pub trait InternTable: Send + Sync {
+/// `pack` assigns a stable u32 id on first sight and returns it on subsequent
+/// calls; it returns `None` only on type mismatch (i.e. the value is the wrong
+/// variant for this table). `unpack` recovers the original value from its id.
+///
+/// The evaluator is single-threaded, so implementations use `RefCell` for
+/// interior mutability rather than locking primitives.
+pub trait InternTable {
     fn pack(&self, val: &Value) -> Option<u32>;
     fn unpack(&self, id: u32) -> Value;
 }
 
+/// General-purpose intern table for arbitrary `Value`s.
+///
+/// Assigns sequential u32 IDs to distinct values. Use this for any column type
+/// that is `Hash + Eq` but doesn't have a built-in compact representation.
+/// The `filter` predicate selects which `Value` variants this table accepts;
+/// non-matching variants return `None` so packed storage can downgrade
+/// gracefully.
+pub struct HashInternTable {
+    filter: fn(&Value) -> bool,
+    to_id: RefCell<FxHashMap<Value, u32>>,
+    to_val: RefCell<Vec<Value>>,
+}
+
+impl HashInternTable {
+    /// Create a new intern table that accepts values matching `filter`.
+    pub fn new(filter: fn(&Value) -> bool) -> Self {
+        Self {
+            filter,
+            to_id: RefCell::new(FxHashMap::default()),
+            to_val: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl InternTable for HashInternTable {
+    fn pack(&self, val: &Value) -> Option<u32> {
+        if !(self.filter)(val) {
+            return None;
+        }
+        if let Some(&id) = self.to_id.borrow().get(val) {
+            return Some(id);
+        }
+        let id = self.to_val.borrow().len() as u32;
+        self.to_val.borrow_mut().push(val.clone());
+        self.to_id.borrow_mut().insert(val.clone(), id);
+        Some(id)
+    }
+
+    fn unpack(&self, id: u32) -> Value {
+        self.to_val.borrow()[id as usize].clone()
+    }
+}
+
 /// `InternTable` for `String` / `&str`: reads `SymbolId.0` directly.
-/// Zero-cost — no hash lookup; the global intern table is accessed only at
-/// string construction time, not here.
+/// Zero-cost — no hash lookup; the global symbol table assigned the id at
+/// string construction time.
 struct StringInternTable;
 
 impl InternTable for StringInternTable {
@@ -55,7 +102,7 @@ pub enum PackedType {
     Bool,
     /// Any type backed by an intern table. Replaces the old `String` variant;
     /// `"String" | "&str" | "str"` maps here via `StringInternTable`.
-    Interned(Arc<dyn InternTable>),
+    Interned(Rc<dyn InternTable>),
 }
 
 impl std::fmt::Debug for PackedType {
@@ -89,7 +136,7 @@ impl PackedType {
         match name {
             "i32" => Some(PackedType::I32),
             "u32" => Some(PackedType::U32),
-            "String" | "&str" | "str" => Some(PackedType::Interned(Arc::new(StringInternTable))),
+            "String" | "&str" | "str" => Some(PackedType::Interned(Rc::new(StringInternTable))),
             "bool" => Some(PackedType::Bool),
             _ => None,
         }
