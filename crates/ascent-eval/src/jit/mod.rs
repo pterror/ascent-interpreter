@@ -264,15 +264,20 @@ impl JitCompiler {
     ///
     /// Accepts Clause and Condition(If(expr)) body items where expr uses only
     /// supported packed ops. Literal I32/Bool clause args are also accepted.
+    ///
+    /// Returns `Ok(())` if eligible, or `Err(reason)` explaining why not.
     #[cfg(feature = "specialized")]
-    pub fn is_packed_eligible(rule: &CRule) -> bool {
+    pub fn packed_eligible_reason(rule: &CRule) -> Result<(), &'static str> {
         let clause_count = rule
             .body
             .iter()
             .filter(|item| matches!(item, CBodyItem::Clause(_)))
             .count();
-        if clause_count == 0 || clause_count > 4 {
-            return false;
+        if clause_count == 0 {
+            return Err("no clause body items");
+        }
+        if clause_count > 4 {
+            return Err("more than 4 clause body items");
         }
         for item in &rule.body {
             match item {
@@ -282,30 +287,30 @@ impl JitCompiler {
                             CClauseArg::Var(_) => {}
                             CClauseArg::Expr(CExpr::Literal(crate::value::Value::I32(_)))
                             | CClauseArg::Expr(CExpr::Literal(crate::value::Value::Bool(_))) => {}
-                            CClauseArg::Expr(_) => return false,
+                            CClauseArg::Expr(_) => return Err("unsupported clause arg expression"),
                         }
                     }
                     if !clause.conditions.is_empty() {
-                        return false;
+                        return Err("clause has per-clause conditions");
                     }
                 }
                 CBodyItem::Condition(CCondition::If(expr)) => {
                     if !is_supported_packed_expr(expr) {
-                        return false;
+                        return Err("unsupported condition expression");
                     }
                 }
-                _ => return false,
+                _ => return Err("unsupported body item (aggregation or other)"),
             }
         }
         // All head args must be pure Var references
         for head in &rule.heads {
             for arg in &head.args {
                 if !matches!(arg, CExpr::Var(_)) {
-                    return false;
+                    return Err("head arg is not a plain variable (contains expression)");
                 }
             }
         }
-        true
+        Ok(())
     }
 
     /// Get or compile the packed JIT variant. Returns None if not eligible.
@@ -318,7 +323,8 @@ impl JitCompiler {
         if self.packed_cache.contains_key(&rule_idx) {
             return self.packed_cache[&rule_idx].as_ref();
         }
-        if !Self::is_packed_eligible(rule) {
+        if let Err(reason) = Self::packed_eligible_reason(rule) {
+            eprintln!("JIT: rule {rule_idx} not eligible for packed JIT: {reason}");
             self.packed_cache.insert(rule_idx, None);
             return None;
         }
@@ -327,10 +333,7 @@ impl JitCompiler {
                 self.packed_cache.insert(rule_idx, Some(compiled));
                 self.packed_cache[&rule_idx].as_ref()
             }
-            Err(_) => {
-                self.packed_cache.insert(rule_idx, None);
-                None
-            }
+            Err(e) => panic!("JIT: eligible rule {rule_idx} failed to compile: {e}"),
         }
     }
 
@@ -417,7 +420,8 @@ impl JitCompiler {
         if self.packed_cache_v3.contains_key(&rule_idx) {
             return self.packed_cache_v3[&rule_idx].as_ref();
         }
-        if !Self::is_packed_eligible(rule) {
+        if let Err(reason) = Self::packed_eligible_reason(rule) {
+            eprintln!("JIT: rule {rule_idx} not eligible for packed JIT v3: {reason}");
             self.packed_cache_v3.insert(rule_idx, None);
             return None;
         }
@@ -426,10 +430,7 @@ impl JitCompiler {
                 self.packed_cache_v3.insert(rule_idx, Some(compiled));
                 self.packed_cache_v3[&rule_idx].as_ref()
             }
-            Err(_) => {
-                self.packed_cache_v3.insert(rule_idx, None);
-                None
-            }
+            Err(e) => panic!("JIT: eligible rule {rule_idx} failed to compile (v3): {e}"),
         }
     }
 
@@ -533,10 +534,7 @@ impl JitCompiler {
                 self.stratum_stage3_fn_cache.insert(stratum_key, Some(fn_ptr));
                 Some(fn_ptr)
             }
-            Err(_) => {
-                self.stratum_stage3_fn_cache.insert(stratum_key, None);
-                None
-            }
+            Err(e) => panic!("JIT: stratum {stratum_key} failed stage3 compile: {e}"),
         }
     }
 
@@ -595,8 +593,9 @@ impl JitCompiler {
         }
 
         // All rules must be packed-JIT eligible
-        for rule in rules {
-            if !Self::is_packed_eligible(rule) {
+        for (i, rule) in rules.iter().enumerate() {
+            if let Err(reason) = Self::packed_eligible_reason(rule) {
+                eprintln!("JIT: stratum {stratum_key} rule {i} not eligible for stage4: {reason}");
                 self.stratum_stage4_fn_cache.insert(stratum_key, None);
                 return None;
             }
@@ -607,10 +606,7 @@ impl JitCompiler {
                 self.stratum_stage4_fn_cache.insert(stratum_key, Some(fn_ptr));
                 Some(fn_ptr)
             }
-            Err(_) => {
-                self.stratum_stage4_fn_cache.insert(stratum_key, None);
-                None
-            }
+            Err(e) => panic!("JIT: eligible stratum {stratum_key} failed stage4 compile: {e}"),
         }
     }
 
