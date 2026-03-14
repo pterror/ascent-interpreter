@@ -637,7 +637,68 @@ impl JitDedupTable {
         }
     }
 
-    /// Insert a packed tuple.  Called only from `update_jit_indices()`.
+    /// Probe the table for a packed tuple. Returns true if present.
+    pub fn probe(&self, hash: u32, packed: &[u32]) -> bool {
+        debug_assert_eq!(packed.len() + 1, self.stride);
+        let cap = self.handle.cap as usize;
+        if cap == 0 { return false; }
+        let mask = cap - 1;
+        let mut slot = (hash as usize) & mask;
+        loop {
+            let base = slot * self.stride;
+            let h = self.entries_vec[base];
+            if h == JITDEDUP_EMPTY { return false; }
+            if h == hash && self.entries_vec[base + 1..base + self.stride] == *packed {
+                return true;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// Probe then insert atomically. Returns true if new (inserted), false if duplicate.
+    ///
+    /// May reallocate; updates `handle.entries` in place so the stable handle address
+    /// remains valid for JIT code that reloads from the handle on each invocation.
+    pub fn insert_if_new(&mut self, hash: u32, packed: &[u32]) -> bool {
+        debug_assert_eq!(packed.len() + 1, self.stride);
+        let cap = self.handle.cap as usize;
+        if cap > 0 {
+            let mask = cap - 1;
+            let mut slot = (hash as usize) & mask;
+            loop {
+                let base = slot * self.stride;
+                let h = self.entries_vec[base];
+                if h == JITDEDUP_EMPTY { break; }
+                if h == hash && self.entries_vec[base + 1..base + self.stride] == *packed {
+                    return false;
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+        // Not found — grow if needed then insert.
+        self.maybe_grow();
+        let cap = self.handle.cap as usize;
+        let mask = cap - 1;
+        let mut slot = (hash as usize) & mask;
+        loop {
+            let base = slot * self.stride;
+            if self.entries_vec[base] == JITDEDUP_EMPTY {
+                self.entries_vec[base] = hash;
+                self.entries_vec[base + 1..base + self.stride].copy_from_slice(packed);
+                self.count += 1;
+                return true;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// Reset to empty without deallocating. Handle address and capacity are preserved.
+    pub fn clear(&mut self) {
+        self.entries_vec.fill(JITDEDUP_EMPTY);
+        self.count = 0;
+    }
+
+    /// Insert a packed tuple (unconditional — caller guarantees no duplicate).
     pub fn insert(&mut self, hash: u32, packed: &[u32]) {
         debug_assert_eq!(packed.len() + 1, self.stride);
         self.maybe_grow();

@@ -9,7 +9,6 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
-use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use hashbrown::HashTable;
@@ -147,13 +146,6 @@ impl PackedType {
     }
 }
 
-/// Hash a packed u32 slice using FxHasher.
-#[inline]
-fn hash_packed(tuple: &[u32]) -> u64 {
-    let mut hasher = FxHasher::default();
-    tuple.hash(&mut hasher);
-    hasher.finish()
-}
 
 /// Try to classify all columns as packable. Returns None if any column
 /// is unknown or not u32-representable.
@@ -188,8 +180,6 @@ pub struct PackedStorage {
     pub(crate) count: usize,
     /// Number of columns.
     pub(crate) arity: usize,
-    /// Dedup table (hashes packed_data).
-    dedup: HashTable<usize>,
     /// Tuple indices added this iteration.
     pub(crate) delta: Vec<usize>,
     /// Tuple indices from previous iteration.
@@ -211,13 +201,8 @@ pub struct PackedStorage {
     /// Number of tuples already indexed into jit_indices (for incremental update).
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) jit_full_indexed_count: usize,
-    /// JIT-accessible dedup snapshot — rebuilt incrementally in update_jit_indices().
-    /// Read-only during scans; only mutated between iterations (in advance()).
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    /// Authoritative dedup table (inline u32 hash table, also probed by JIT code directly).
     pub(crate) jit_dedup: crate::jit_index::JitDedupTable,
-    /// Number of tuples already reflected in jit_dedup.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) jit_dedup_indexed_count: usize,
 }
 
 impl PackedStorage {
@@ -230,7 +215,6 @@ impl PackedStorage {
             col_types,
             count: 0,
             arity,
-            dedup: HashTable::new(),
             delta: Vec::new(),
             recent: Vec::new(),
             recent_set: FxHashSet::default(),
@@ -243,10 +227,7 @@ impl PackedStorage {
             jit_recent_indices: Vec::new(),
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_full_indexed_count: 0,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_dedup: crate::jit_index::JitDedupTable::new(arity),
-            #[cfg(all(feature = "jit", feature = "specialized"))]
-            jit_dedup_indexed_count: 0,
         }
     }
 
@@ -323,17 +304,9 @@ impl PackedStorage {
             return Err(tuple);
         };
 
-        // Dedup using packed data (fast u32 hash/eq)
-        let hash = hash_packed(&packed);
-        let packed_data = &self.packed_data;
-        let arity = self.arity;
-        if self
-            .dedup
-            .find(hash, |&idx| {
-                &packed_data[idx * arity..(idx + 1) * arity] == packed.as_slice()
-            })
-            .is_some()
-        {
+        // Dedup via jit_dedup (also probed inline by JIT code)
+        let hash = crate::jit_index::jit_dedup_hash(&packed);
+        if !self.jit_dedup.insert_if_new(hash, &packed) {
             return Ok(false);
         }
 
@@ -347,11 +320,6 @@ impl PackedStorage {
         self.source_tags.push(source);
         self.count += 1;
         self.delta.push(idx);
-
-        let packed_data = &self.packed_data;
-        self.dedup.insert_unique(hash, idx, |&i| {
-            hash_packed(&packed_data[i * arity..(i + 1) * arity])
-        });
         Ok(true)
     }
 
@@ -372,16 +340,8 @@ impl PackedStorage {
             return true;
         }
 
-        let hash = hash_packed(packed);
-        let packed_data = &self.packed_data;
-        let arity = self.arity;
-        if self
-            .dedup
-            .find(hash, |&idx| {
-                &packed_data[idx * arity..(idx + 1) * arity] == packed
-            })
-            .is_some()
-        {
+        let hash = crate::jit_index::jit_dedup_hash(packed);
+        if !self.jit_dedup.insert_if_new(hash, packed) {
             return false;
         }
 
@@ -396,11 +356,6 @@ impl PackedStorage {
         self.source_tags.push(SourceId::ANONYMOUS);
         self.count += 1;
         self.delta.push(idx);
-
-        let packed_data = &self.packed_data;
-        self.dedup.insert_unique(hash, idx, |&i| {
-            hash_packed(&packed_data[i * arity..(i + 1) * arity])
-        });
         true
     }
 
@@ -413,14 +368,8 @@ impl PackedStorage {
             return false;
         };
 
-        let hash = hash_packed(&packed);
-        let packed_data = &self.packed_data;
-        let arity = self.arity;
-        self.dedup
-            .find(hash, |&idx| {
-                &packed_data[idx * arity..(idx + 1) * arity] == packed.as_slice()
-            })
-            .is_some()
+        let hash = crate::jit_index::jit_dedup_hash(&packed);
+        self.jit_dedup.probe(hash, &packed)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &[Value]> {
@@ -540,17 +489,6 @@ impl PackedStorage {
             }
         }
 
-        // Incrementally update the JIT dedup snapshot with newly added tuples.
-        // Only processes [jit_dedup_indexed_count..count]; growth happens here,
-        // not during scans, so the entries pointer cached by JIT code is stable.
-        if self.arity > 0 {
-            for idx in self.jit_dedup_indexed_count..self.count {
-                let packed = &self.packed_data[idx * self.arity..(idx + 1) * self.arity];
-                let hash = crate::jit_index::jit_dedup_hash(packed);
-                self.jit_dedup.insert(hash, packed);
-            }
-            self.jit_dedup_indexed_count = self.count;
-        }
     }
 
     pub fn set_delta_range(&mut self, start: usize) {
@@ -569,7 +507,7 @@ impl PackedStorage {
         self.value_data.clear();
         self.packed_data.clear();
         self.count = 0;
-        self.dedup = HashTable::new();
+        self.jit_dedup.clear();
         self.delta.clear();
         self.recent.clear();
         self.recent_set.clear();
@@ -642,7 +580,7 @@ impl PackedStorage {
         let mut new_value_data = Vec::with_capacity(self.value_data.len());
         let mut new_packed_data = Vec::with_capacity(self.packed_data.len());
         let mut new_sources = Vec::with_capacity(self.source_tags.len());
-        let mut new_dedup = HashTable::new();
+        let mut new_jit_dedup = crate::jit_index::JitDedupTable::new(arity);
         let mut new_indices: Vec<FxHashMap<u32, Vec<usize>>> =
             (0..arity).map(|_| FxHashMap::default()).collect();
         let mut new_count = 0;
@@ -663,10 +601,8 @@ impl PackedStorage {
                 new_indices[col].entry(p).or_default().push(idx);
             }
 
-            let hash = hash_packed(packed_tuple);
-            new_dedup.insert_unique(hash, idx, |&j| {
-                hash_packed(&new_packed_data[j * arity..(j + 1) * arity])
-            });
+            let hash = crate::jit_index::jit_dedup_hash(packed_tuple);
+            new_jit_dedup.insert(hash, packed_tuple);
 
             new_count += 1;
         }
@@ -675,7 +611,7 @@ impl PackedStorage {
         self.packed_data = new_packed_data;
         self.source_tags = new_sources;
         self.count = new_count;
-        self.dedup = new_dedup;
+        self.jit_dedup = new_jit_dedup;
         self.indices = new_indices;
         self.delta.clear();
         self.recent.clear();
