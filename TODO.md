@@ -170,6 +170,62 @@ The true minimum is **zero per-iteration calls + one per rule-invocation for ins
 
 - [x] **Inline dedup probe for `packed_try_insert`** — at fixpoint, most head tuples are duplicates; `packed_try_insert` is called once per match but returns 0 (duplicate) the vast majority of the time. Implemented: `JitDedupTable` (open-addressed flat u32 hash table, stride = arity+1) embedded in `PackedStorage`, populated incrementally by `update_jit_indices()`. JIT loads `head_dedup_handles` pointer from ctx offset 40 at function entry, computes hash and probes table inline, jumps past `packed_try_insert` on duplicate (zero Rust calls for duplicates; one call for new tuples). Note: bulk-insert scratch buffer not implemented — new tuples still call `packed_try_insert` individually, but this is one call per new tuple (already minimal).
 
+### Near-native performance roadmap
+
+**Goal:** within ~1.5× of `ascent_macro` on join-heavy queries. Current gaps: triangle 12×, connected_components 6.7×, TC 2.6×, fibonacci 2.3×.
+
+**Step 0 — Profile to split the triangle gap** *(do first, informs priority of steps 1 vs 3)*
+
+Run `perf stat -e instructions,L1-dcache-load-misses` on `triangle_detection/jit_hot/20`.
+- High L1-dcache-load-misses → join index data structure is the dominant factor → do Step 1 first.
+- Low cache misses, high instruction count → codegen quality dominates → do Step 3 first.
+
+**Step 1 — Fix join index data structure** *(estimated 3–5× on join-heavy queries)*
+
+`PackedIndex` currently stores match lists as linked-list chains — pointer-chasing on every inner-loop
+iteration. `ascent_macro` uses `HashMap<K, Vec<V>>`: after the key lookup, inner iteration is a
+sequential scan of a contiguous array. Replacing chains with contiguous per-key storage (Vec-per-key,
+or Robin Hood open-addressing with inline value arrays) gets cache-sequential inner loops. Affects all
+backends equally; orthogonal to JIT codegen.
+
+**Step 2 — Write-ahead buffer for head insertion** *(estimated 1.2–1.5×)*
+
+Accumulate new head tuples in a fixed-size stack buffer during the inner loop; flush to `PackedStorage`
+after the inner loop body. Eliminates the `packed_try_insert` Rust call from the hot path for
+non-dedup-failing cases. For recursive rules (head ∈ clause rels): flush at end of each outer
+iteration instead of end of inner loop. Note: dedup probe is already inline; this removes the
+remaining call for *new* tuples.
+
+**Step 3 — Complete the asm backend for ~100% rule coverage** *(closes the codegen gap)*
+
+Extends `asm_codegen.rs` with a proper register assigner and full pattern coverage. Keep Cranelift
+as fallback for anything the asm backend explicitly rejects.
+
+- **3a — Depth-priority register assignment** (~150 lines): variables bound in clause `i` are live
+  from clause `i` entry to head emission; assign by depth so clause-0 variables (longest-lived, in
+  every inner-loop iteration) get callee-saved registers first (r12, r13, r15), spill later-bound
+  variables to dedicated stack slots only when the register file is exhausted. Eliminates the
+  load/store pairs per inner iteration that make the current asm backend slower than Cranelift.
+
+- **3b — N-clause rules** (~300 lines): per-depth stack slots for loop state (count, loop index,
+  recent_ptr); emit N−1 levels of nested hash-probe loops recursively. Unblocks triangle (3 clauses)
+  and any deeper join.
+
+- **3c — Expression completeness** (~150 lines): `CUnOp::Deref` is a no-op in the packed
+  representation (trivial); add Div/Mod/bitwise; handle arbitrary user-defined function calls via
+  function pointer with caller-save spill/restore around the call site. Remove all `check_expr` /
+  `check_binop` `Err` returns for arithmetic ops.
+
+- **3d — Aggregation codegen** (~250 lines): single scan loop, accumulate into a register (or stack
+  slot for non-scalar aggregators), emit result tuple after the loop. The aggregation function itself
+  is a call (user-defined); the loop structure is simpler than a join.
+
+- **3e — Negation / anti-join** (~150 lines): probe the negated relation's index; branch to
+  `skip_label` on *hit* rather than miss. Reuses all probe infrastructure from 3b.
+
+**Expected residual after all steps:** ≤ 1.5× — pure instruction-quality difference between
+hand-written x86-64 and LLVM-compiled Rust for equivalent logic.
+
 ### Relation storage optimizations
 
 - [ ] **Lazy `recent_col_indices` rebuild** — `advance()` in both `PackedStorage` (`specialized.rs`) and `RelationStorage` (`relation.rs`) unconditionally rebuilds recent indices even for sink relations (head-only, never body clauses). The right implementation is a new `ensure_recent_indices(&mut self)` called at eval-loop level only for relations that are body clauses in the current stratum — avoids the `&self`/`RefCell` tangle. Impact limited to programs with head-only output relations; benchmarks (TC, triangles) don't benefit.
