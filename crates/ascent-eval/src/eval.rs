@@ -4082,7 +4082,7 @@ mod jit_hot_tests {
             }
             engine.run(&program);
             let rel = engine.relation("path").unwrap();
-            assert!(rel.len() > 0, "expected path tuples from shared jit run");
+            assert!(!rel.is_empty(), "expected path tuples from shared jit run");
         }
     }
 }

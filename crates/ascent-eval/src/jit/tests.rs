@@ -179,7 +179,6 @@ fn test_jit_self_join() {
 
 /// These test the typed packed JIT path, which requires the `specialized` feature.
 /// The packed JIT reads u32 directly from PackedStorage, bypassing Value enum.
-
 #[cfg(feature = "specialized")]
 #[test]
 fn test_packed_jit_single_clause_copy() {
@@ -390,7 +389,6 @@ fn test_packed_jit_arithmetic_condition() {
 
 /// These tests exercise the stratum meta-function JIT path, which compiles
 /// a whole fixpoint loop per stratum into a single Cranelift function.
-
 #[cfg(feature = "specialized")]
 #[test]
 fn test_stratum_meta_tc() {
@@ -450,12 +448,10 @@ fn test_stratum_meta_multi_rule_stratum() {
     );
 }
 
-#[cfg(feature = "specialized")]
 // ─── Stage 3 direct-insert tests ────────────────────────────────────
 
 /// These tests specifically exercise the Stage 3 (direct-insert) path and verify
 /// correctness across recursive, multi-rule, and conditional scenarios.
-
 #[cfg(feature = "specialized")]
 #[test]
 fn test_stage3_recursive_triangle() {
@@ -556,7 +552,6 @@ fn test_stratum_meta_single_rule_fixpoint() {
 /// These tests specifically exercise the Stage 4 (inlined rule bodies) path,
 /// which compiles all rule bodies directly into a single Cranelift function,
 /// eliminating call_indirect overhead.
-
 #[cfg(feature = "specialized")]
 #[test]
 fn test_stage4_transitive_closure() {

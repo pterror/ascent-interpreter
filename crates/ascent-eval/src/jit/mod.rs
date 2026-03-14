@@ -13,6 +13,8 @@ mod packed_codegen;
 pub(crate) mod packed_helpers;
 #[cfg(feature = "specialized")]
 mod stratum_codegen;
+#[cfg(all(feature = "specialized", feature = "jit-asm"))]
+mod asm_codegen;
 #[cfg(test)]
 mod tests;
 
@@ -152,6 +154,9 @@ pub struct JitCompiler {
     /// Cache of Stage 4 stratum functions (inlined rule bodies).
     #[cfg(feature = "specialized")]
     pub(crate) stratum_stage4_fn_cache: FxHashMap<usize, Option<packed_helpers::StratumStage4Fn>>,
+    /// Asm-backend stratum buffers: kept alive so the fn_ptr remains valid.
+    #[cfg(all(feature = "specialized", feature = "jit-asm"))]
+    pub(crate) asm_buffers: Vec<asm_codegen::AsmStratum>,
     /// Total number of interned variables (set by Engine before each compilation batch).
     /// Used to declare the right number of Cranelift Variables in JIT-compiled functions.
     #[cfg(feature = "specialized")]
@@ -261,6 +266,8 @@ impl JitCompiler {
             stratum_stage3_fn_cache: FxHashMap::default(),
             #[cfg(feature = "specialized")]
             stratum_stage4_fn_cache: FxHashMap::default(),
+            #[cfg(all(feature = "specialized", feature = "jit-asm"))]
+            asm_buffers: Vec::new(),
             #[cfg(feature = "specialized")]
             var_count: 0,
         })
@@ -635,6 +642,58 @@ impl JitCompiler {
         stratum_key: usize,
         rules: &[&CRule],
     ) -> Result<packed_helpers::StratumStage4Fn, String> {
+        // Try the lightweight asm backend first; fall back to Cranelift on Err.
+        #[cfg(feature = "jit-asm")]
+        {
+            let rule_data: Vec<(Vec<crate::compiled::CClause>, Vec<crate::compiled::CHeadClause>, Vec<crate::compiled::CExpr>)> = rules
+                .iter()
+                .map(|rule| {
+                    let clauses: Vec<crate::compiled::CClause> = rule
+                        .body
+                        .iter()
+                        .filter_map(|item| match item {
+                            CBodyItem::Clause(c) => Some(c.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    let conditions: Vec<crate::compiled::CExpr> = rule
+                        .body
+                        .iter()
+                        .filter_map(|item| match item {
+                            CBodyItem::Condition(CCondition::If(expr)) => Some(expr.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    (clauses, rule.heads.clone(), conditions)
+                })
+                .collect();
+            let rules_refs: Vec<(&[crate::compiled::CClause], &[crate::compiled::CHeadClause], &[crate::compiled::CExpr])> = rule_data
+                .iter()
+                .map(|(c, h, conds)| (c.as_slice(), h.as_slice(), conds.as_slice()))
+                .collect();
+
+            match asm_codegen::codegen_stratum_asm(
+                &rules_refs,
+                self.var_count,
+                packed_helpers::jit_stratum_advance_s4 as usize,
+                packed_helpers::packed_try_insert as usize,
+                packed_helpers::packed_count as usize,
+                packed_helpers::packed_data_ptr as usize,
+                packed_helpers::packed_recent_ptr as usize,
+            ) {
+                Ok(asm_stratum) => {
+                    let fn_ptr = asm_stratum.fn_ptr;
+                    self.asm_buffers.push(asm_stratum);
+                    return Ok(fn_ptr);
+                }
+                Err(reason) => {
+                    if std::env::var("ASCENT_DUMP_JIT").is_ok() {
+                        eprintln!("asm backend skipped stratum {stratum_key}: {reason}");
+                    }
+                }
+            }
+        }
+
         let name = format!("stratum_stage4_{stratum_key}");
         let ptr_type = self.module.target_config().pointer_type();
 

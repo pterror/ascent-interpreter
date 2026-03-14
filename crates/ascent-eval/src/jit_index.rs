@@ -1,3 +1,4 @@
+#![allow(clippy::items_after_test_module)]
 //! Open-addressed hash index for inline JIT probing.
 //!
 //! Provides a C-visible hash table layout (`JitHashIndex`) that JIT-generated
