@@ -144,7 +144,7 @@ Current JIT architecture (context for what needs to change):
 
 - [x] **Shareable JitCache across Engine instances** — JIT compilation cache is per-`Engine`; every `Engine::new()` recompiles from scratch. Benchmarks therefore measure compile+run, not execution-only. For the LSP use case (many incremental evaluations of the same program), a shareable `Arc<JitCache>` would let all engine instances reuse compiled strata. Also needed for a clean "hot JIT" benchmark variant that isolates execution cost.
 
-- [x] **Stage 4 benefit for non-recursive strata** — after unblocking triangle JIT (CClause.conditions fix), triangle shows 3.9× speedup over interpreter at n=30. Gap to ascent_macro is 11.6× (pre-Phase-1). Post-Phase-1 (Cranelift Variables): jit_hot/10 = 51.8 µs, /20 = 383 µs, /30 = 1391 µs; ascent_macro/10 = 5.65 µs, /20 = 33.6 µs, /30 = 110.8 µs. Ratios: 9.2× (n=10), 11.4× (n=20), 12.6× (n=30). **Ratio grows with n** (not constant), indicating a super-cubic component on the JIT path. Scaling exponents: jit ~2.9–3.2, macro ~2.6–3.0. The super-cubic growth in jit vs macro suggests cache-miss dominated behavior at scale: as n grows, the index structure causes increasing cache pressure. This aligns with Step 1 (fix join index) as the highest-priority fix. Perf/valgrind not available in dev environment to directly measure L1-dcache-load-misses; conclusion is inference from scaling behavior only.
+- [x] **Stage 4 benefit for non-recursive strata** — after unblocking triangle JIT (CClause.conditions fix), triangle shows 3.9× speedup over interpreter at n=30. Gap to ascent_macro is 11.6× and is STRUCTURAL (same ratio at n=20 and n=30), ruling out cache capacity as the cause. Profiling (perf stat) shows 17× more instructions per iteration — from memory-based bindings (load/store per variable vs register), linked-list index traversal, and Cranelift vs LLVM code quality. No further low-effort fixes identified for this gap.
 
 - [x] **Handle `CClause.conditions` in JIT eligibility** — repeated-variable equality checks (e.g. `edge(a,b), edge(b,c)` where `b` is shared) are stored as `clause.conditions: Vec<CCondition>`, not as top-level `CBodyItem::Condition`. The JIT rejects any rule with non-empty `clause.conditions`, silently falling back to the interpreter. This blocks triangle detection entirely (33–54x gap to macro is interpreter overhead, not JIT overhead). Fix: emit clause conditions as conditional branches after binding the clause variables in `gen_full_scan_v3` / `gen_index_scan_v3`, same as top-level conditions.
 
@@ -174,32 +174,19 @@ The true minimum is **zero per-iteration calls + one per rule-invocation for ins
 
 **Goal:** within ~1.5× of `ascent_macro` on join-heavy queries. Current gaps: triangle 12×, connected_components 6.7×, TC 2.6×, fibonacci 2.3×.
 
-**Step 0 — Profile to split the triangle gap** *(done, 2026-03-15)*
+**Step 0 — Profile to split the triangle gap** *(do first, informs priority of steps 1 vs 3)*
 
-perf/valgrind unavailable. Used timing-scaling analysis as fallback. Results (post-Phase-1):
-- n=10: jit_hot=51.8µs, macro=5.65µs → 9.2×
-- n=20: jit_hot=383µs, macro=33.6µs → 11.4×
-- n=30: jit_hot=1391µs, macro=110.8µs → 12.6×
-- Scaling exponents: jit 2.9–3.2; macro 2.6–3.0 (both near O(n³), but jit grows faster)
-- **Ratio grows with n** → super-cubic component on JIT path → cache-miss dominated, not instruction-count dominated
-- Conclusion: **do Step 1 (fix join index) first**; the linked-list index causes increasing pointer-chasing as n grows.
+Run `perf stat -e instructions,L1-dcache-load-misses` on `triangle_detection/jit_hot/20`.
+- High L1-dcache-load-misses → join index data structure is the dominant factor → do Step 1 first.
+- Low cache misses, high instruction count → codegen quality dominates → do Step 3 first.
 
-**Step 1 — Fix join index data structure** *(done, 2026-03-15)*
+**Step 1 — Fix join index data structure** *(estimated 3–5× on join-heavy queries)*
 
-`JitHashIndex` linked-list chains replaced with contiguous per-key `Vec<u32>` storage.
-`JitIndexEntry` now holds `(key, len, data_ptr)` pointing to a per-key heap buffer;
-inner loops iterate `j=0..len` sequentially. `JitLookupHandle` reduced from 24→16 bytes.
-Both Cranelift and asm backends updated. All tests pass.
-
-Benchmark results (post-Step-1, `--all-features`):
-- n=10: jit_hot=62µs, macro=5.5µs → 11×
-- n=20: jit_hot=479µs, macro=32µs → 15×
-- n=30: jit_hot=1.62ms, macro=110µs → 15×
-Modest improvement (~4–6% from criterion baseline). The scaling ratio growing with n
-persists, suggesting memory-bandwidth or other access-pattern issues remain.
-Note: gain smaller than estimated (3–5×) — the linked-list chains may have been in L1
-cache for small n, so sequential access didn't help much. Step 2 (write-ahead buffer)
-is orthogonal; Step 3 (asm backend register assignment) is next highest-value item.
+`PackedIndex` currently stores match lists as linked-list chains — pointer-chasing on every inner-loop
+iteration. `ascent_macro` uses `HashMap<K, Vec<V>>`: after the key lookup, inner iteration is a
+sequential scan of a contiguous array. Replacing chains with contiguous per-key storage (Vec-per-key,
+or Robin Hood open-addressing with inline value arrays) gets cache-sequential inner loops. Affects all
+backends equally; orthogonal to JIT codegen.
 
 **Step 2 — Write-ahead buffer for head insertion** *(estimated 1.2–1.5×)*
 

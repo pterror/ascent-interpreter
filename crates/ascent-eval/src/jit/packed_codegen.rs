@@ -1120,19 +1120,21 @@ fn gen_full_scan_v3(
 
 /// Inline hash-probe index scan (Stage 3 / Stage 4).
 ///
-/// Probes inline into the `JitHashIndex` stored in
-/// `lookup_handles[clause_offset * 2 + use_recent]`.
+/// Replaces the old `call packed_lookup` with a direct open-addressed probe
+/// into the `JitHashIndex` stored in `lookup_handles[clause_offset * 2 + use_recent]`.
 ///
-/// Handle layout (`JitLookupHandle`, 16 bytes):
-/// - offset  0: entries  *const JitIndexEntry
-/// - offset  8: mask     u32   (capacity - 1)
+/// Handle layout (`JitLookupHandle`, 24 bytes):
+/// - offset  0: entries_ptr  *const JitIndexEntry
+/// - offset  8: values_ptr   *const u32
+/// - offset 16: mask         u32   (capacity - 1)
 ///
 /// `JitIndexEntry` layout (16 bytes):
-/// - offset  0: key      u32
-/// - offset  4: len      u32   (number of tuple_idxs)
-/// - offset  8: data_ptr *const u32  (contiguous tuple_idx array)
+/// - offset  0: key    u32
+/// - offset  4: head   u32  (index of first node in linked-list chain; SENTINEL = empty)
 ///
-/// Inner loop iterates `data_ptr[0..len]` sequentially — no pointer chasing.
+/// Values layout (linked-list nodes, stride 8 bytes):
+/// - values[node * 2 + 0] = tuple_idx  (u32)
+/// - values[node * 2 + 1] = next node  (u32; SENTINEL = end of chain)
 #[allow(clippy::too_many_arguments)]
 fn gen_index_scan_v3(
     builder: &mut FunctionBuilder,
@@ -1160,7 +1162,7 @@ fn gen_index_scan_v3(
 
     // ─── Load handle (compile-time constant byte offset) ────────────────────
     // handle index = clause_offset * 2 + use_recent
-    let handle_byte_offset = (clause_offset * 2 + use_recent as usize) * 16;
+    let handle_byte_offset = (clause_offset * 2 + use_recent as usize) * 24;
     let handle_ptr = if handle_byte_offset == 0 {
         lookup_handles
     } else {
@@ -1168,9 +1170,9 @@ fn gen_index_scan_v3(
         builder.ins().iadd(lookup_handles, off)
     };
 
-    // JitLookupHandle: entries @ offset 0, mask @ offset 8 (u32)
     let entries_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), handle_ptr, 0i32);
-    let mask_i32    = builder.ins().load(I32,      MemFlags::trusted(), handle_ptr, 8i32);
+    let values_ptr  = builder.ins().load(ptr_type, MemFlags::trusted(), handle_ptr, 8i32);
+    let mask_i32    = builder.ins().load(I32,      MemFlags::trusted(), handle_ptr, 16i32);
     let mask        = builder.ins().uextend(ptr_type, mask_i32);
 
     // ─── Hash probe ──────────────────────────────────────────────────────────
@@ -1194,8 +1196,8 @@ fn gen_index_scan_v3(
     //   probe_loop:  check empty → empty_exit; check found → probe_found; else → probe_miss
     //   probe_miss:  increment slot, back-edge to probe_loop
     //   probe_found: load head at offset 4, jump after_probe(head)
-    //   empty_exit:  check overflow slot; select (data_ptr, len) or (null, 0), jump after_probe
-    //   after_probe(data_ptr: ptr_type, len: ptr_type):  inner sequential value loop
+    //   empty_exit:  check overflow slot; select head or SENTINEL, jump after_probe(head)
+    //   after_probe(entry_head: I32):  inner linked-list value loop
 
     let probe_loop       = builder.create_block();
     let probe_check_found= builder.create_block();
@@ -1204,9 +1206,8 @@ fn gen_index_scan_v3(
     let empty_exit       = builder.create_block();
     let after_probe      = builder.create_block();
 
-    // after_probe receives (data_ptr: ptr_type, len: ptr_type)
-    builder.append_block_param(after_probe, ptr_type); // data_ptr
-    builder.append_block_param(after_probe, ptr_type); // len (usize)
+    // after_probe receives entry_head: I32 (head of linked-list chain, SENTINEL = empty)
+    builder.append_block_param(after_probe, I32);
 
     // Cache packed_data_ptr before entering the probe/value loops.
     // Non-recursive rules: pointer is stable (no head insert can reallocate it).
@@ -1261,15 +1262,15 @@ fn gen_index_scan_v3(
     builder.switch_to_block(probe_found);
     builder.seal_block(probe_found);
 
-    // Re-compute entry_ptr from the final slot value.
-    let slot_found      = builder.use_var(var_slot);
-    let ebo_found       = builder.ins().imul_imm(slot_found, 16_i64);
-    let entry_ptr_found = builder.ins().iadd(entries_ptr, ebo_found);
-    // JitIndexEntry: len at offset 4, data_ptr at offset 8
-    let found_len_i32   = builder.ins().load(I32,      MemFlags::trusted(), entry_ptr_found, 4i32);
-    let found_data_ptr  = builder.ins().load(ptr_type, MemFlags::trusted(), entry_ptr_found, 8i32);
-    let found_len       = builder.ins().uextend(ptr_type, found_len_i32);
-    builder.ins().jump(after_probe, &[found_data_ptr, found_len]);
+    // Re-compute entry_ptr from the final slot value (same slot as probe_loop above).
+    // The value of `slot` from probe_loop dominates probe_found through probe_check_found.
+    // We need to re-read it via the variable because it was defined before the loop.
+    let slot_found     = builder.use_var(var_slot);
+    let ebo_found      = builder.ins().imul_imm(slot_found, 16_i64);
+    let entry_ptr_found= builder.ins().iadd(entries_ptr, ebo_found);
+    // head is at offset 4 in JitIndexEntry
+    let found_head     = builder.ins().load(I32, MemFlags::trusted(), entry_ptr_found, 4i32);
+    builder.ins().jump(after_probe, &[found_head]);
 
     // ─── empty_exit ──────────────────────────────────────────────────────────
     // Before giving up, check the overflow slot at entries[mask + 1] which
@@ -1278,54 +1279,59 @@ fn gen_index_scan_v3(
     builder.seal_block(empty_exit);
 
     // overflow slot index = mask + 1
-    let mask_plus_one  = builder.ins().iadd_imm(mask, 1);
-    let ovf_byte_off   = builder.ins().imul_imm(mask_plus_one, 16_i64);
-    let ovf_entry_ptr  = builder.ins().iadd(entries_ptr, ovf_byte_off);
-    let ovf_key        = builder.ins().load(I32, MemFlags::trusted(), ovf_entry_ptr, 0i32);
-    let ovf_match      = builder.ins().icmp(IntCC::Equal, ovf_key, key_i32);
-    let ovf_len_i32    = builder.ins().load(I32,      MemFlags::trusted(), ovf_entry_ptr, 4i32);
-    let ovf_data_ptr   = builder.ins().load(ptr_type, MemFlags::trusted(), ovf_entry_ptr, 8i32);
-    let zero_ptr       = builder.ins().iconst(ptr_type, 0);
-    let zero_i32       = builder.ins().iconst(I32, 0);
-    // If no match: data_ptr = null, len = 0 → loop runs 0 iterations
-    let sel_data_ptr   = builder.ins().select(ovf_match, ovf_data_ptr, zero_ptr);
-    let sel_len_i32    = builder.ins().select(ovf_match, ovf_len_i32, zero_i32);
-    let sel_len        = builder.ins().uextend(ptr_type, sel_len_i32);
-    builder.ins().jump(after_probe, &[sel_data_ptr, sel_len]);
+    let mask_plus_one = builder.ins().iadd_imm(mask, 1);
+    let ovf_byte_off  = builder.ins().imul_imm(mask_plus_one, 16_i64);
+    let ovf_entry_ptr = builder.ins().iadd(entries_ptr, ovf_byte_off);
+    let ovf_key       = builder.ins().load(I32, MemFlags::trusted(), ovf_entry_ptr, 0i32);
+    let ovf_match     = builder.ins().icmp(IntCC::Equal, ovf_key, key_i32);
+    // Load head from overflow slot (at offset 4)
+    let ovf_head      = builder.ins().load(I32, MemFlags::trusted(), ovf_entry_ptr, 4i32);
+    let sentinel_i32  = builder.ins().iconst(I32, 0xFFFF_FFFFu32 as i64);
+    let sel_head      = builder.ins().select(ovf_match, ovf_head, sentinel_i32);
+    builder.ins().jump(after_probe, &[sel_head]);
 
-    // ─── after_probe(data_ptr: ptr_type, len: ptr_type) ──────────────────────
+    // ─── after_probe(entry_head: I32) ────────────────────────────────────────
     builder.switch_to_block(after_probe);
     builder.seal_block(after_probe);
 
-    let entry_data_ptr = builder.block_params(after_probe)[0];
-    let entry_len      = builder.block_params(after_probe)[1];
+    let entry_head = builder.block_params(after_probe)[0]; // I32, SENTINEL = no entries
 
-    // ─── Inner value loop (sequential array scan) ────────────────────────────
-    // Iterate j = 0..len; tuple_idx = data_ptr[j] (u32, 4-byte stride).
+    // ─── Inner value loop (linked-list traversal) ─────────────────────────────
+    // ptr starts at entry_head, advance via values_ptr[ptr*2+1] until SENTINEL.
     let loop_header = builder.create_block();
     let loop_body   = builder.create_block();
     let loop_exit   = builder.create_block();
 
-    let var_j = Variable::new(*next_var);
+    let var_ptr = Variable::new(*next_var);
     *next_var += 1;
-    builder.declare_var(var_j, ptr_type);
-    let zero_ptr = builder.ins().iconst(ptr_type, 0);
-    builder.def_var(var_j, zero_ptr);
+    builder.declare_var(var_ptr, I32);
+    builder.def_var(var_ptr, entry_head);
     builder.ins().jump(loop_header, &[]);
 
     builder.switch_to_block(loop_header);
-    let j = builder.use_var(var_j);
-    let is_done = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, j, entry_len);
+    let ptr = builder.use_var(var_ptr);
+    let sentinel = builder.ins().iconst(I32, 0xFFFF_FFFFu32 as i64);
+    let is_done = builder.ins().icmp(IntCC::Equal, ptr, sentinel);
     builder.ins().brif(is_done, loop_exit, &[], loop_body, &[]);
 
     builder.switch_to_block(loop_body);
-    let j = builder.use_var(var_j);
+    let ptr = builder.use_var(var_ptr);
 
-    // tuple_idx = data_ptr[j]  (u32 → ptr_type)
-    let byte_off      = builder.ins().imul_imm(j, 4_i64);
-    let elem_addr     = builder.ins().iadd(entry_data_ptr, byte_off);
-    let tuple_idx_u32 = builder.ins().load(I32, MemFlags::trusted(), elem_addr, 0i32);
+    // values layout: stride 8 bytes per node (two u32s)
+    // values_ptr[ptr*8 + 0] = tuple_idx (u32)
+    // values_ptr[ptr*8 + 4] = next_ptr  (u32)
+    let ptr_ext    = builder.ins().uextend(ptr_type, ptr);
+    let byte_off   = builder.ins().imul_imm(ptr_ext, 8_i64);
+    let node_addr  = builder.ins().iadd(values_ptr, byte_off);
+    let tuple_idx_u32 = builder.ins().load(I32, MemFlags::trusted(), node_addr, 0i32);
+    let next_ptr      = builder.ins().load(I32, MemFlags::trusted(), node_addr, 4i32);
     let tuple_idx     = builder.ins().uextend(ptr_type, tuple_idx_u32);
+
+    // Store next_ptr in a variable so continue_block can advance the chain.
+    let var_next_ptr = Variable::new(*next_var);
+    *next_var += 1;
+    builder.declare_var(var_next_ptr, I32);
+    builder.def_var(var_next_ptr, next_ptr);
 
     // Use pre-fetched pointer for non-recursive rules; re-fetch for recursive ones.
     let packed_buf = if let Some(buf) = cached_packed_buf {
@@ -1404,11 +1410,9 @@ fn gen_index_scan_v3(
     }
     builder.seal_block(continue_block);
 
-    // j += 1
-    let j = builder.use_var(var_j);
-    let one_ptr = builder.ins().iconst(ptr_type, 1);
-    let j_next = builder.ins().iadd(j, one_ptr);
-    builder.def_var(var_j, j_next);
+    // Advance to next node in chain.
+    let next_ptr_val = builder.use_var(var_next_ptr);
+    builder.def_var(var_ptr, next_ptr_val);
     builder.ins().jump(loop_header, &[]);
 
     builder.switch_to_block(loop_exit);

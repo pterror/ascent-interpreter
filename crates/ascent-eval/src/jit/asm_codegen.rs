@@ -19,17 +19,17 @@
 //!   [rbp-48]  ctx ptr (*mut StratumStage4Ctx)          CTX_SLOT
 //!   [rbp-52-id*4]  variable[id] (u32)                  var_slot(id)
 //!   [rbp-52-V*4-col*4]  head-tuple scratch col         head_col(V, col)
-//!   [rbp-52-V*4-H*4]    inner len spill (u32)           vptr_slot(V,H)
+//!   [rbp-52-V*4-H*4]    values_ptr spill               vptr_slot(V,H)
 //! ```
 //! where V = var_count, H = max_head_arity.
 //!
 //! # Register use inside loop bodies
 //! All callee-saved registers survive `call` instructions:
 //!   r12 = outer loop count
-//!   r13 = recent_ptr for outer clause (if use_recent0); index data_ptr for inner clause
+//!   r13 = recent_ptr for outer clause  (only if use_recent0)
 //!   r14 = outer loop counter i
-//!   r15 = inner loop counter j (0..len, indexes into index data_ptr[])
-//!   rbx = packed_data_ptr (pre-fetched before inner loop; re-fetched per-iter if recursive)
+//!   r15 = inner linked-list node (current; zero-extended u32)
+//!   rbx = inner data_ptr (pre-fetched before inner loop, or re-fetched if recursive)
 //!
 //! Caller-saved (clobbered by `call`): rax, rcx, rdx, rsi, rdi, r8-r11.
 
@@ -62,12 +62,6 @@ fn vptr_slot(var_count: usize, max_head_arity: usize) -> i32 {
     -52 - (var_count as i32) * 4 - (max_head_arity as i32) * 4 - 8
 }
 
-/// Stack slot for saving the outer recent_ptr (r13) across the inner probe+loop.
-/// Lives in the guard/alignment region, 8 bytes below vptr_slot.
-fn rptr_save_slot(var_count: usize, max_head_arity: usize) -> i32 {
-    vptr_slot(var_count, max_head_arity) - 8
-}
-
 /// Compute `sub rsp, FRAME_SIZE` value.  Must be ≡ 8 (mod 16) because after
 /// 5 callee-saved pushes rsp ≡ 8 (mod 16), and we need rsp ≡ 0 for calls.
 fn frame_size(var_count: usize, max_head_arity: usize) -> i32 {
@@ -75,10 +69,10 @@ fn frame_size(var_count: usize, max_head_arity: usize) -> i32 {
     //   8   = ctx slot   (at -48, occupies [-48..-41])
     //   V*4 = variable slots
     //   H*4 = head-tuple scratch (ascending; col[0] at lowest address)
-    //   8   = inner len spill  (vptr_slot; 8 bytes below the head-col base; stores u32 len)
-    //   8   = outer recent_ptr save slot (rptr_save_slot; 8 bytes below vptr_slot)
-    //   8   = guard / alignment slack
-    let raw = 8 + var_count * 4 + max_head_arity * 4 + 24;
+    //   8   = values_ptr spill  (8 bytes below the head-col base)
+    //   8   = guard / alignment slack to ensure the 8-byte vptr store fits
+    //         within the frame for all (V, H) combinations.
+    let raw = 8 + var_count * 4 + max_head_arity * 4 + 16;
     // Round up to next value ≡ 8 (mod 16)
     let rem = raw % 16;
     let pad = if rem <= 8 { 8 - rem } else { 24 - rem };
@@ -382,17 +376,17 @@ fn emit_heads(
     Ok(())
 }
 
-// ─── Hash probe + sequential array setup ──────────────────────────────────
+// ─── Hash probe + linked-list traversal ──────────────────────────────────
 
-/// Emit an inline index probe and sequential-array setup for `clause` at
+/// Emit an inline index probe and linked-list traversal for `clause` at
 /// `clause_seq`.  Precondition: `ecx` holds the probe key (u32).
 ///
 /// After the probe, sets:
-///   r15 = 0 (initial inner loop counter j)
-///   rbx = data_ptr (contiguous u32 array of tuple_idxs)
+///   r15 = initial linked-list node (SENTINEL = 0xFFFF_FFFF = no results)
+///   rbx = inner data_ptr (if !is_recursive; else undefined — caller re-fetches)
 ///
-/// Saves len (u32) to vptr_slot for use in the inner loop header.
-/// Jumps to `no_match` if the probe finds no entries (len == 0).
+/// Saves values_ptr to the vptr stack slot for use inside the inner loop.
+/// Jumps to `no_match` if the probe finds no entries.
 #[allow(clippy::too_many_arguments)]
 fn emit_probe_setup(
     asm: &mut Assembler,
@@ -405,15 +399,15 @@ fn emit_probe_setup(
     pdptr_addr: usize,
     no_match: DynamicLabel,
 ) -> Result<(), String> {
-    // JitLookupHandle is now 16 bytes: entries_ptr @ 0, mask @ 8 (u32).
-    // Load lookup handle: entries_ptr → r8, mask → r10
-    let handle_off: i32 = ((clause_seq * 2 + if use_recent { 1 } else { 0 }) * 16) as i32;
+    // Load lookup handle: entries_ptr → r8, values_ptr → r9, mask → r10
+    let handle_off: i32 = ((clause_seq * 2 + if use_recent { 1 } else { 0 }) * 24) as i32;
     load_rule_ctx!(asm, rule_i);
     dynasm!(asm
         ; mov rax, [rax + 24i8]          // lookup_handles ptr
         ; add rax, handle_off
         ; mov r8,  [rax]                 // entries_ptr
-        ; mov r10d, [rax + 8i8]         // mask (u32 → r10)
+        ; mov r9,  [rax + 8i8]          // values_ptr
+        ; mov r10d, [rax + 16i8]        // mask (u32 → r10)
     );
     // ecx = key (u32)
 
@@ -436,7 +430,7 @@ fn emit_probe_setup(
     dynasm!(asm
         ; lea rax, [rdx + rdx]    // rdx*2
         ; shl rax, 3              // rdx*16
-        ; add rax, r8             // entry_ptr (rax = entry_ptr)
+        ; add rax, r8             // entry_ptr
         ; mov esi, [rax]          // entry_key
         ; cmp esi, -1i32          // EMPTY_KEY?
         ; je =>probe_ovf
@@ -447,13 +441,8 @@ fn emit_probe_setup(
         ; jmp =>probe_lp
     );
 
-    // probe_ok: JitIndexEntry.len @ offset 4, JitIndexEntry.data_ptr @ offset 8
     dynasm!(asm; =>probe_ok);
-    dynasm!(asm
-        ; mov r10d, [rax + 4i8]   // r10 = len (u32)
-        ; mov r9,  [rax + 8i8]   // r9  = data_ptr
-        ; jmp =>after_probe
-    );
+    dynasm!(asm; mov esi, [rax + 4i8]; jmp =>after_probe);  // head @ offset 4
 
     dynasm!(asm; =>probe_ovf);
     // Overflow slot: entries[mask+1]
@@ -465,29 +454,21 @@ fn emit_probe_setup(
         ; mov esi, [rax]          // ovf_key
         ; cmp esi, ecx
         ; jne =>no_match          // no entry for this key
-        ; mov r10d, [rax + 4i8]  // r10 = len (u32)
-        ; mov r9,  [rax + 8i8]  // r9  = data_ptr
+        ; mov esi, [rax + 4i8]   // ovf head
     );
 
     dynasm!(asm; =>after_probe);
-    // r10 = len, r9 = data_ptr (index array of tuple_idxs)
-    // If len == 0: no entries for this key
-    dynasm!(asm; test r10d, r10d; jz =>no_match);
+    // esi = head node; check SENTINEL
+    dynasm!(asm; cmp esi, -1i32; je =>no_match; mov r15d, esi);
 
-    // r15 = inner loop counter j = 0
-    dynasm!(asm; xor r15d, r15d);
-
-    // Save len to vptr_slot (r10 may be clobbered by calls inside the loop).
+    // Save values_ptr to vptr_slot (r9 will be clobbered by calls inside the loop)
     let vs = vptr_slot(var_count, max_head_arity);
-    dynasm!(asm; mov [rbp + vs], r10);
+    dynasm!(asm; mov [rbp + vs], r9);
 
-    // Save index data_ptr to r13 (callee-saved; survives calls inside the loop).
-    // r13 was used for recent_ptr of clause0 only; for clause1 it is free.
-    dynasm!(asm; mov r13, r9);
-
-    // Pre-fetch packed_data_ptr into rbx (if non-recursive).
-    // For recursive rules: rbx is re-fetched inside the loop per-iteration.
+    // Pre-fetch inner data_ptr into rbx (if non-recursive; otherwise caller re-fetches)
     if !is_recursive {
+        // r8/r9/r10 are set; loading data_ptr clobbers them (caller-saved).
+        // We only need r9 (values_ptr) saved to stack already — so clobbering r9 now is fine.
         load_rel_rdi!(asm, rule_i, clause_seq);
         call_abs!(asm, pdptr_addr);
         dynasm!(asm; mov rbx, rax);
@@ -496,16 +477,14 @@ fn emit_probe_setup(
     Ok(())
 }
 
-/// Emit the sequential inner value loop.
+/// Emit the linked-list traversal loop body once per node.
+/// Preconditions:
+///   r15 = current node (u32, zero-extended)
+///   rbx = data_ptr for this clause (if !is_recursive; else re-fetched)
+///   vptr_slot holds values_ptr
 ///
-/// Preconditions (set by `emit_probe_setup`):
-///   r15  = inner loop counter j = 0
-///   r13  = index data_ptr (contiguous u32 array of tuple_idxs)
-///   rbx  = packed_data_ptr (pre-fetched; re-fetched per-iter if recursive)
-///   vptr_slot holds len (u32)
-///
-/// Iterates j = 0..len, loading tuple_idx = index_data_ptr[j] on each iteration.
-/// Jumps to `no_match` when j >= len (loop exhausted).
+/// After the body: jumps to `inner_continue` (which then loads next node from r15 and loops).
+/// When node == SENTINEL: jumps to `no_match` (same as outer_continue for 2-clause rules).
 #[allow(clippy::too_many_arguments)]
 fn emit_inner_loop(
     asm: &mut Assembler,
@@ -515,14 +494,14 @@ fn emit_inner_loop(
     heads: &[CHeadClause],
     rule_conds: &[CExpr],
     use_recent: bool,
-    is_recursive: bool,
+    _is_recursive: bool,
     var_count: usize,
     max_head_arity: usize,
     pdptr_addr: usize,
     pti_addr: usize,
     no_match: DynamicLabel,
 ) -> Result<(), String> {
-    let _ = use_recent;
+    let _ = use_recent; // only used in emit_probe_setup label selection, not here
     let arity = clause.args.len();
     let stride = (arity * 4) as i32;
     let vs = vptr_slot(var_count, max_head_arity);
@@ -531,33 +510,34 @@ fn emit_inner_loop(
     let inner_continue = asm.new_dynamic_label();
 
     dynasm!(asm; =>inner_hdr);
-    // Check j < len (len saved as u32 at vptr_slot)
+    dynasm!(asm; cmp r15d, -1i32; je =>no_match);
+
+    // Load tuple_idx (eax) and next_node (r15) from values_ptr[r15*8]
+    // values_ptr is in the vptr stack slot (r9 may be clobbered elsewhere)
     dynasm!(asm
-        ; mov eax, [rbp + vs]   // eax = len (u32, zero-extends to rax)
-        ; cmp r15, rax          // j >= len?
-        ; jae =>no_match
+        ; mov rax, [rbp + vs]           // rax = values_ptr
+        ; mov ecx, [rax + r15*8]        // tuple_idx (u32 → ecx; zero-extends to rcx)
+        ; mov esi, [rax + r15*8 + 4i8]  // next_node (u32)
+        ; mov r15d, esi                  // r15 = next_node (zero-extended via 32-bit write)
+        ; mov eax, ecx                   // rax = tuple_idx (zero-extended via 32-bit write)
     );
 
-    // tuple_idx = index_data_ptr[j]  (u32 at r13 + j*4)
-    dynasm!(asm
-        ; mov eax, [r13 + r15*4]  // eax = tuple_idx (zero-extends to rax)
-    );
-
-    // For recursive: re-fetch packed_data_ptr into rbx. tuple_idx in rax must survive.
-    if is_recursive {
+    // For recursive: re-fetch data_ptr.  tuple_idx in rax must survive.
+    // Use aligned push: push rax + sub rsp,8 then call, add rsp,8 + pop rax.
+    if _is_recursive {
         dynasm!(asm
-            ; push rax      // save tuple_idx; rsp ≡8 (odd push after even alignment)
+            ; push rax      // save tuple_idx; rsp was ≡0, now ≡8
             ; sub rsp, 8    // realign to 0 for the upcoming call
         );
         load_rel_rdi!(asm, rule_i, clause_seq);
         call_abs!(asm, pdptr_addr);
         dynasm!(asm
-            ; mov rbx, rax  // rbx = packed_data_ptr
-            ; add rsp, 8    // undo realign
-            ; pop rax       // restore tuple_idx
+            ; mov rbx, rax  // rbx = data_ptr
+            ; add rsp, 8    // undo realign; rsp back to ≡8
+            ; pop rax       // restore tuple_idx; rsp back to ≡0
         );
     }
-    // rax = tuple_idx (zero-extended), rbx = packed_data_ptr
+    // rax = tuple_idx, rbx = data_ptr
 
     // tuple_ptr = data_ptr + tuple_idx * stride
     dynasm!(asm
@@ -586,8 +566,8 @@ fn emit_inner_loop(
     emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti_addr)?;
 
     dynasm!(asm; =>inner_continue);
-    // j += 1 and loop back
-    dynasm!(asm; inc r15; jmp =>inner_hdr);
+    // r15 already holds next_node (loaded above); loop back
+    dynasm!(asm; jmp =>inner_hdr);
 
     Ok(())
 }
@@ -851,20 +831,12 @@ fn emit_two_clause_scan(
     // ecx = key
 
     // ── Inner: hash probe + setup ─────────────────────────────────────────────
-    // If use_recent0: r13 holds outer recent_ptr; emit_probe_setup will overwrite r13
-    // with the inner index data_ptr.  Save r13 to rptr_save_slot before the probe so
-    // we can restore it at outer_continue.
-    if use_recent0 {
-        let rs = rptr_save_slot(var_count, max_head_arity);
-        dynasm!(asm; mov [rbp + rs], r13);
-    }
-
     emit_probe_setup(
         asm, rule_i, 1, use_recent1, is_rec1,
         var_count, max_head_arity, pdptr, outer_continue,
     )?;
-    // r15 = 0 (inner loop counter j); r13 = index data_ptr; rbx = packed_data_ptr
-    // vptr_slot holds len (u32) for sequential iteration
+    // r15 = initial node; rbx = inner data_ptr (if !is_rec1; else unchanged/garbage)
+    // vptr_slot holds values_ptr for clause1
 
     // ── Inner loop ────────────────────────────────────────────────────────────
     emit_inner_loop(
@@ -875,11 +847,6 @@ fn emit_two_clause_scan(
 
     // ── Outer loop advance ────────────────────────────────────────────────────
     dynasm!(asm; =>outer_continue);
-    // Restore outer recent_ptr to r13 if we saved it above.
-    if use_recent0 {
-        let rs = rptr_save_slot(var_count, max_head_arity);
-        dynasm!(asm; mov r13, [rbp + rs]);
-    }
     dynasm!(asm; inc r14; jmp =>outer_hdr);
 
     Ok(())

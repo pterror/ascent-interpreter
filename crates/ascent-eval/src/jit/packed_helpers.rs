@@ -445,6 +445,7 @@ pub unsafe extern "C" fn jit_stratum_advance_s4(ctx: *mut StratumStage4Ctx) -> u
         };
         let handle = unsafe { &mut *ctx.handles_buf.add(i) };
         handle.entries = idx.entries_ptr;
+        handle.values = idx.values_ptr;
         handle.mask = idx.mask;
         handle._pad = 0;
     }
