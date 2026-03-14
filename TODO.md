@@ -174,13 +174,33 @@ The true minimum is **zero per-iteration calls + one per rule-invocation for ins
 
 **Goal:** within ~1.5× of `ascent_macro` on join-heavy queries. Current gaps: triangle 12×, connected_components 6.7×, TC 2.6×, fibonacci 2.3×.
 
-**Step 0 — Profile to split the triangle gap** *(do first, informs priority of steps 1 vs 3)*
+**Step 0 — Profile to split the triangle gap** *(done, 2026-03-15)*
 
-Run `perf stat -e instructions,L1-dcache-load-misses` on `triangle_detection/jit_hot/20`.
-- High L1-dcache-load-misses → join index data structure is the dominant factor → do Step 1 first.
-- Low cache misses, high instruction count → codegen quality dominates → do Step 3 first.
+perf/valgrind unavailable. Timing-scaling inference suggested cache-miss dominated (ratio grows with n).
+Attempted Step 1 first (index structure). **Revised conclusion:** at n≤30, the linked-list values pool
+is ≤1.5KB (n=20: 380 u32s) — fits entirely in L1. Step 1 regressed by 3–5% at benchmark sizes. The
+gap at benchmark sizes is instruction-count/codegen dominated, not cache dominated.
+**Do Step 3 first** for benchmark-size wins; revisit Step 1 when targeting n>100 workloads.
 
 **Step 1 — Fix join index data structure** *(estimated 3–5× on join-heavy queries)*
+
+**Attempted (2026-03-15):** Implemented contiguous start+count layout (3-pass build: count, prefix-sum, fill).
+`JitIndexEntry` changed from `{key, head, _pad0, _pad1}` to `{key, start, count, _pad}`. Values array
+is now flat per-key: `values[start..start+count]`. Both Cranelift and asm backends updated to range scan
+(`j=0..count`) instead of linked-list traversal.
+
+**Result:** No measurable improvement at n=10-30. Reasons:
+1. The linked-list for small n fits in L1 cache — no cache-miss savings.
+2. New inner loop adds MORE stack loads: 3 loads per iteration (vptr, start, count) vs 1 (vptr).
+   Old: `cmp r15,-1; load values[r15*8]; load values[r15*8+4]; advance r15`
+   New: `load count; cmp r15,count; load vptr; load start; add start+j; zero-extend; load values[start+j*4]`
+3. Rebuild cost: update_jit_indices now always rebuilds from scratch; was incremental.
+4. The asm backend stores start/count to additional stack slots on every probe, adding store cost.
+
+**Defer to after Step 3.** Once Step 3a (register assignment) holds `start`+`count` in callee-saved
+registers, the inner load reduces to one `values[start+j]` load with no stack traffic — only then
+does the contiguous layout win over linked-list. At n>100 (values >L1 cache), it becomes independently
+valuable regardless.
 
 `PackedIndex` currently stores match lists as linked-list chains — pointer-chasing on every inner-loop
 iteration. `ascent_macro` uses `HashMap<K, Vec<V>>`: after the key lookup, inner iteration is a
