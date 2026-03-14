@@ -290,7 +290,6 @@ impl std::fmt::Debug for StratumMetaRuntime {
 #[allow(dead_code, clippy::vec_box)]
 struct StratumStage3Runtime {
     stage3_ctx: Box<crate::jit::packed_helpers::StratumStage3Ctx>,
-    _per_rule_bindings: Vec<Box<[u32]>>,
     _per_rule_clause_rels: Vec<Box<[*const crate::specialized::PackedStorage]>>,
     _per_rule_head_rels: Vec<Box<[*mut crate::specialized::PackedStorage]>>,
     _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContextV3>>,
@@ -316,7 +315,6 @@ impl std::fmt::Debug for StratumStage3Runtime {
 #[allow(dead_code, clippy::vec_box)]
 struct StratumStage4Runtime {
     stage4_ctx: Box<crate::jit::packed_helpers::StratumStage4Ctx>,
-    _per_rule_bindings: Vec<Box<[u32]>>,
     _per_rule_clause_rels: Vec<Box<[*const crate::specialized::PackedStorage]>>,
     _per_rule_head_rels: Vec<Box<[*mut crate::specialized::PackedStorage]>>,
     _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContextV3>>,
@@ -881,6 +879,7 @@ impl Engine {
                 return false;
             };
             let mut jit = jit_cell.lock().unwrap();
+            jit.var_count = self.var_count;
             match jit.compile_stratum_stage4(stratum_key, rules) {
                 Some(f) => f,
                 None => return false,
@@ -912,7 +911,6 @@ impl Engine {
         use crate::relation::Relation;
         use crate::specialized::PackedStorage;
 
-        let mut per_rule_bindings: Vec<Box<[u32]>> = Vec::new();
         let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
         let mut per_rule_head_rels: Vec<Box<[*mut PackedStorage]>> = Vec::new();
         let mut per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>> =
@@ -1016,9 +1014,6 @@ impl Engine {
 
             let clause_rels_box: Box<[*const PackedStorage]> = clause_rels.into_boxed_slice();
             let head_rels_box: Box<[*mut PackedStorage]> = head_rels.into_boxed_slice();
-            let bindings_box: Box<[u32]> = vec![0u32; self.var_count].into_boxed_slice();
-
-            let bindings_ptr: *mut u32 = bindings_box.as_ptr() as *mut u32;
             let head_rels_ptr: *const *mut PackedStorage = head_rels_box.as_ptr();
 
             // Build dedup handle pointers (one per head relation).
@@ -1033,7 +1028,6 @@ impl Engine {
                 rels: clause_rels_box.as_ptr(),
                 rels_len: clause_rels_box.len() as u32,
                 _pad: 0,
-                bindings: bindings_ptr,
                 head_rels: head_rels_ptr,
                 lookup_handles: std::ptr::null(), // fixed up below
                 head_dedup_handles: head_dedup_handles_ptr,
@@ -1042,7 +1036,6 @@ impl Engine {
             rule_ctx_ptrs_vec
                 .push(&*ctx as *const PackedJitContextV3 as *mut PackedJitContextV3);
 
-            per_rule_bindings.push(bindings_box);
             per_rule_clause_rels.push(clause_rels_box);
             per_rule_head_rels.push(head_rels_box);
             per_rule_dedup_handles.push(dedup_handles);
@@ -1089,7 +1082,6 @@ impl Engine {
 
         Some(StratumStage4Runtime {
             stage4_ctx,
-            _per_rule_bindings: per_rule_bindings,
             _per_rule_clause_rels: per_rule_clause_rels,
             _per_rule_head_rels: per_rule_head_rels,
             _per_rule_ctxs: per_rule_ctxs,
@@ -1118,6 +1110,7 @@ impl Engine {
                 return false;
             };
             let mut jit = jit_cell.lock().unwrap();
+            jit.var_count = self.var_count;
             for (rule, &rule_idx) in rules.iter().zip(rule_indices.iter()) {
                 if jit.get_or_compile_packed_v3(rule_idx, rule).is_none() {
                     return false;
@@ -1163,7 +1156,6 @@ impl Engine {
 
         let jit_ref = self.jit.as_ref()?.lock().unwrap();
 
-        let mut per_rule_bindings: Vec<Box<[u32]>> = Vec::new();
         let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
         let mut per_rule_head_rels: Vec<Box<[*mut PackedStorage]>> = Vec::new();
         let mut per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>> =
@@ -1221,9 +1213,6 @@ impl Engine {
 
             let clause_rels_box: Box<[*const PackedStorage]> = clause_rels.into_boxed_slice();
             let head_rels_box: Box<[*mut PackedStorage]> = head_rels.into_boxed_slice();
-            let bindings_box: Box<[u32]> = vec![0u32; self.var_count].into_boxed_slice();
-
-            let bindings_ptr: *mut u32 = bindings_box.as_ptr() as *mut u32;
             let head_rels_ptr: *const *mut PackedStorage = head_rels_box.as_ptr();
 
             // Build dedup handle pointers (one per head relation).
@@ -1237,7 +1226,6 @@ impl Engine {
                 rels: clause_rels_box.as_ptr(),
                 rels_len: clause_rels_box.len() as u32,
                 _pad: 0,
-                bindings: bindings_ptr,
                 head_rels: head_rels_ptr,
                 lookup_handles: std::ptr::null(),
                 head_dedup_handles: head_dedup_handles_ptr,
@@ -1261,7 +1249,6 @@ impl Engine {
             full_ctx_ptrs_vec
                 .push(&*ctx as *const PackedJitContextV3 as *mut PackedJitContextV3);
 
-            per_rule_bindings.push(bindings_box);
             per_rule_clause_rels.push(clause_rels_box);
             per_rule_head_rels.push(head_rels_box);
             per_rule_dedup_handles.push(dedup_handles);
@@ -1298,7 +1285,6 @@ impl Engine {
 
         Some(StratumStage3Runtime {
             stage3_ctx,
-            _per_rule_bindings: per_rule_bindings,
             _per_rule_clause_rels: per_rule_clause_rels,
             _per_rule_head_rels: per_rule_head_rels,
             _per_rule_ctxs: per_rule_ctxs,

@@ -152,6 +152,10 @@ pub struct JitCompiler {
     /// Cache of Stage 4 stratum functions (inlined rule bodies).
     #[cfg(feature = "specialized")]
     pub(crate) stratum_stage4_fn_cache: FxHashMap<usize, Option<packed_helpers::StratumStage4Fn>>,
+    /// Total number of interned variables (set by Engine before each compilation batch).
+    /// Used to declare the right number of Cranelift Variables in JIT-compiled functions.
+    #[cfg(feature = "specialized")]
+    pub(crate) var_count: usize,
 }
 
 // Safety: JitCompiler is only accessed from one thread at a time (guarded by Mutex).
@@ -257,6 +261,8 @@ impl JitCompiler {
             stratum_stage3_fn_cache: FxHashMap::default(),
             #[cfg(feature = "specialized")]
             stratum_stage4_fn_cache: FxHashMap::default(),
+            #[cfg(feature = "specialized")]
+            var_count: 0,
         })
     }
 
@@ -504,7 +510,12 @@ impl JitCompiler {
             &mut self.builder_ctx,
             &mut self.codegen_ctx,
             &self.packed_helpers,
+            self.var_count,
         )?;
+
+        if std::env::var("ASCENT_DUMP_JIT").is_ok() {
+            eprintln!("=== V3 CLIF IR ({name}) ===\n{}", self.codegen_ctx.func.display());
+        }
 
         self.module
             .finalize_definitions()
@@ -681,7 +692,12 @@ impl JitCompiler {
             &mut self.builder_ctx,
             &mut self.codegen_ctx,
             &self.packed_helpers,
+            self.var_count,
         )?;
+
+        if std::env::var("ASCENT_DUMP_JIT").is_ok() {
+            eprintln!("=== Stage4 CLIF IR (stratum {stratum_key}) ===\n{}", self.codegen_ctx.func.display());
+        }
 
         self.module
             .finalize_definitions()

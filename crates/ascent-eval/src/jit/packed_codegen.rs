@@ -631,6 +631,77 @@ fn load_bound_val(
     }
 }
 
+// ─── Variable-based binding access (Stage 3/4) ───────────────────────
+
+/// Read binding variable `var_id` from a Cranelift Variable slice (Stage 3/4).
+#[inline]
+fn use_binding(builder: &mut FunctionBuilder, vars: &[Variable], var_id: u32) -> CValue {
+    builder.use_var(vars[var_id as usize])
+}
+
+/// Write `val` into binding Variable `var_id` (Stage 3/4).
+#[inline]
+fn def_binding(builder: &mut FunctionBuilder, vars: &[Variable], var_id: u32, val: CValue) {
+    builder.def_var(vars[var_id as usize], val);
+}
+
+/// Load the I32 key value for a bound column using Variables (Stage 3/4).
+fn load_bound_val_vars(
+    builder: &mut FunctionBuilder,
+    clause: &CClause,
+    col: usize,
+    vars: &[Variable],
+) -> CValue {
+    match &clause.args[col] {
+        CClauseArg::Var(id) => use_binding(builder, vars, *id),
+        CClauseArg::Expr(expr) => compile_packed_expr_vars(builder, expr, vars)
+            .expect("packed JIT: bound clause expr should be caught by eligibility check"),
+    }
+}
+
+/// Compile a CExpr using Cranelift Variables for bindings (Stage 3/4).
+fn compile_packed_expr_vars(
+    builder: &mut FunctionBuilder,
+    expr: &CExpr,
+    vars: &[Variable],
+) -> Result<CValue, String> {
+    match expr {
+        CExpr::Var(id) => Ok(use_binding(builder, vars, *id)),
+        CExpr::Literal(Value::I32(n)) => Ok(builder.ins().iconst(I32, *n as i64)),
+        CExpr::Literal(Value::Bool(b)) => Ok(builder.ins().iconst(I32, if *b { 1 } else { 0 })),
+        CExpr::VarBinVar(op, a, b) => {
+            let av = use_binding(builder, vars, *a);
+            let bv = use_binding(builder, vars, *b);
+            compile_packed_binop(builder, *op, av, bv)
+        }
+        CExpr::VarBinLit(op, a, Value::I32(n)) => {
+            let av = use_binding(builder, vars, *a);
+            let bv = builder.ins().iconst(I32, *n as i64);
+            compile_packed_binop(builder, *op, av, bv)
+        }
+        CExpr::LitBinVar(op, Value::I32(n), b) => {
+            let av = builder.ins().iconst(I32, *n as i64);
+            let bv = use_binding(builder, vars, *b);
+            compile_packed_binop(builder, *op, av, bv)
+        }
+        CExpr::Binary(op, a, b) => {
+            let av = compile_packed_expr_vars(builder, a, vars)?;
+            let bv = compile_packed_expr_vars(builder, b, vars)?;
+            compile_packed_binop(builder, *op, av, bv)
+        }
+        CExpr::Unary(CUnOp::Not, inner) => {
+            let v = compile_packed_expr_vars(builder, inner, vars)?;
+            let one = builder.ins().iconst(I32, 1);
+            Ok(builder.ins().bxor(v, one))
+        }
+        CExpr::Unary(CUnOp::Neg, inner) => {
+            let v = compile_packed_expr_vars(builder, inner, vars)?;
+            Ok(builder.ins().ineg(v))
+        }
+        _ => Err(format!("packed JIT: unsupported expr in condition: {expr:?}")),
+    }
+}
+
 // ─── Condition compilation ───────────────────────────────────────────
 
 /// Compile a CExpr to a Cranelift I32 value for use in conditions.
@@ -723,7 +794,9 @@ fn compile_packed_binop(
 ///
 /// Identical to `codegen_packed_rule_body` except head tuples are written
 /// directly to `PackedJitContextV3.head_rels[head_idx]` via `packed_try_insert`
-/// instead of being pushed onto a results buffer.
+/// instead of being pushed onto a results buffer.  Bindings are held in
+/// Cranelift Variables (register-allocated) rather than a heap u32 array.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn codegen_packed_rule_body_v3(
     rule: &CRule,
     recent_clause_idx: Option<usize>,
@@ -732,6 +805,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
     builder_ctx: &mut cranelift_frontend::FunctionBuilderContext,
     ctx: &mut cranelift_codegen::Context,
     helpers: &PackedJitHelperIds,
+    var_count: usize,
 ) -> Result<(), String> {
     let ptr_type = module.target_config().pointer_type();
 
@@ -749,17 +823,29 @@ pub(crate) fn codegen_packed_rule_body_v3(
     let entry_block = builder.create_block();
     builder.append_block_params_for_function_params(entry_block);
     builder.switch_to_block(entry_block);
+
+    // Declare one Cranelift Variable per VarId (0..var_count) for register-allocated bindings.
+    // Initialize to 0 so all paths are SSA-valid even before the first write.
+    let zero_i32 = builder.ins().iconst(I32, 0);
+    let vars: Vec<Variable> = (0..var_count)
+        .map(|i| {
+            let v = Variable::new(i);
+            builder.declare_var(v, I32);
+            builder.def_var(v, zero_i32);
+            v
+        })
+        .collect();
+
     builder.seal_block(entry_block);
 
     let ctx_ptr = builder.block_params(entry_block)[0];
 
     let flags = MemFlags::trusted();
-    // Load context fields (PackedJitContextV3 layout)
+    // Load context fields (PackedJitContextV3 layout — no bindings ptr, offsets shifted)
     let rels = builder.ins().load(ptr_type, flags, ctx_ptr, 0_i32);
-    let bindings = builder.ins().load(ptr_type, flags, ctx_ptr, 16_i32);
-    let head_rels = builder.ins().load(ptr_type, flags, ctx_ptr, 24_i32); // V3: head_rels
-    let lookup_handles = builder.ins().load(ptr_type, flags, ctx_ptr, 32_i32); // inline probe handles
-    let head_dedup_handles = builder.ins().load(ptr_type, flags, ctx_ptr, 40_i32); // dedup handles
+    let head_rels = builder.ins().load(ptr_type, flags, ctx_ptr, 16_i32);
+    let lookup_handles = builder.ins().load(ptr_type, flags, ctx_ptr, 24_i32);
+    let head_dedup_handles = builder.ins().load(ptr_type, flags, ctx_ptr, 32_i32);
 
     let clauses: Vec<(usize, &CClause)> = rule
         .body
@@ -780,7 +866,8 @@ pub(crate) fn codegen_packed_rule_body_v3(
         })
         .collect();
 
-    let mut next_var = 0usize;
+    // Loop-counter Variables start after binding Variables to avoid ID conflicts.
+    let mut next_var = var_count;
 
     gen_clauses_v3(
         &mut builder,
@@ -788,7 +875,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
         0,
         recent_clause_idx,
         rels,
-        bindings,
+        &vars,
         head_rels,
         lookup_handles,
         head_dedup_handles,
@@ -817,7 +904,7 @@ pub(crate) fn gen_clauses_v3(
     clause_offset: usize,
     recent_clause_idx: Option<usize>,
     rels: CValue,
-    bindings: CValue,
+    vars: &[Variable],
     head_rels: CValue,
     lookup_handles: CValue,
     head_dedup_handles: CValue,
@@ -831,19 +918,19 @@ pub(crate) fn gen_clauses_v3(
         if !conditions.is_empty() {
             let done_block = builder.create_block();
             for &expr in conditions {
-                let cond_val = compile_packed_expr(builder, expr, bindings)
-                    .expect("compile_packed_expr: should succeed for eligible exprs");
+                let cond_val = compile_packed_expr_vars(builder, expr, vars)
+                    .expect("compile_packed_expr_vars: should succeed for eligible exprs");
                 let pass_block = builder.create_block();
                 builder.ins().brif(cond_val, pass_block, &[], done_block, &[]);
                 builder.switch_to_block(pass_block);
                 builder.seal_block(pass_block);
             }
-            gen_emit_heads_v3(builder, heads, head_rels, head_dedup_handles, bindings, func_refs, ptr_type, next_var);
+            gen_emit_heads_v3(builder, heads, head_rels, head_dedup_handles, vars, func_refs, ptr_type, next_var);
             builder.ins().jump(done_block, &[]);
             builder.switch_to_block(done_block);
             builder.seal_block(done_block);
         } else {
-            gen_emit_heads_v3(builder, heads, head_rels, head_dedup_handles, bindings, func_refs, ptr_type, next_var);
+            gen_emit_heads_v3(builder, heads, head_rels, head_dedup_handles, vars, func_refs, ptr_type, next_var);
         }
         return;
     }
@@ -869,14 +956,14 @@ pub(crate) fn gen_clauses_v3(
     if clause.bound_cols.is_empty() {
         gen_full_scan_v3(
             builder, clause, rel_ptr, arity, use_recent, use_recent_val,
-            clauses, clause_offset, recent_clause_idx, rels, bindings, head_rels,
+            clauses, clause_offset, recent_clause_idx, rels, vars, head_rels,
             lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
             is_recursive,
         );
     } else {
         gen_index_scan_v3(
             builder, clause, rel_ptr, arity, use_recent,
-            clauses, clause_offset, recent_clause_idx, rels, bindings, head_rels,
+            clauses, clause_offset, recent_clause_idx, rels, vars, head_rels,
             lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
             is_recursive,
         );
@@ -895,7 +982,7 @@ fn gen_full_scan_v3(
     clause_offset: usize,
     recent_clause_idx: Option<usize>,
     rels: CValue,
-    bindings: CValue,
+    vars: &[Variable],
     head_rels: CValue,
     lookup_handles: CValue,
     head_dedup_handles: CValue,
@@ -994,13 +1081,13 @@ fn gen_full_scan_v3(
 
     for &(col, var_id) in &clause.fresh_cols {
         let val = load_packed_col(builder, tuple_ptr, col);
-        store_binding(builder, bindings, var_id, val);
+        def_binding(builder, vars, var_id, val);
     }
 
     // Emit per-clause conditions (merged from `if expr` conditions by the optimizer)
     for cond in &clause.conditions {
         if let CCondition::If(expr) = cond {
-            let cond_val = compile_packed_expr(builder, expr, bindings)
+            let cond_val = compile_packed_expr_vars(builder, expr, vars)
                 .expect("clause condition: supported by eligibility check");
             let pass_block = builder.create_block();
             builder.ins().brif(cond_val, pass_block, &[], continue_block, &[]);
@@ -1011,7 +1098,7 @@ fn gen_full_scan_v3(
 
     gen_clauses_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
-        rels, bindings, head_rels, lookup_handles, head_dedup_handles,
+        rels, vars, head_rels, lookup_handles, head_dedup_handles,
         func_refs, heads, ptr_type, next_var, conditions,
     );
 
@@ -1059,7 +1146,7 @@ fn gen_index_scan_v3(
     clause_offset: usize,
     recent_clause_idx: Option<usize>,
     rels: CValue,
-    bindings: CValue,
+    vars: &[Variable],
     head_rels: CValue,
     lookup_handles: CValue,
     head_dedup_handles: CValue,
@@ -1071,7 +1158,7 @@ fn gen_index_scan_v3(
     is_recursive: bool,
 ) {
     let primary_col = clause.bound_cols[0];
-    let key_i32 = load_bound_val(builder, clause, primary_col, bindings);
+    let key_i32 = load_bound_val_vars(builder, clause, primary_col, vars);
 
     // ─── Load handle (compile-time constant byte offset) ────────────────────
     // handle index = clause_offset * 2 + use_recent
@@ -1284,7 +1371,7 @@ fn gen_index_scan_v3(
 
     for &col in &clause.bound_cols[1..] {
         let actual   = load_packed_col(builder, tuple_ptr, col);
-        let expected = load_bound_val(builder, clause, col, bindings);
+        let expected = load_bound_val_vars(builder, clause, col, vars);
         let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
         let pass_block = builder.create_block();
         builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
@@ -1294,13 +1381,13 @@ fn gen_index_scan_v3(
 
     for &(col, var_id) in &clause.fresh_cols {
         let val = load_packed_col(builder, tuple_ptr, col);
-        store_binding(builder, bindings, var_id, val);
+        def_binding(builder, vars, var_id, val);
     }
 
     // Emit per-clause conditions (merged from `if expr` conditions by the optimizer)
     for cond in &clause.conditions {
         if let CCondition::If(expr) = cond {
-            let cond_val = compile_packed_expr(builder, expr, bindings)
+            let cond_val = compile_packed_expr_vars(builder, expr, vars)
                 .expect("clause condition: supported by eligibility check");
             let pass_block = builder.create_block();
             builder.ins().brif(cond_val, pass_block, &[], continue_block, &[]);
@@ -1311,7 +1398,7 @@ fn gen_index_scan_v3(
 
     gen_clauses_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
-        rels, bindings, head_rels, lookup_handles, head_dedup_handles,
+        rels, vars, head_rels, lookup_handles, head_dedup_handles,
         func_refs, heads, ptr_type, next_var, conditions,
     );
 
@@ -1357,7 +1444,7 @@ fn gen_emit_heads_v3(
     heads: &[CHeadClause],
     head_rels: CValue,
     head_dedup_handles: CValue,
-    bindings: CValue,
+    vars: &[Variable],
     func_refs: &FuncRefsV3,
     ptr_type: cranelift_codegen::ir::Type,
     next_var: &mut usize,
@@ -1388,7 +1475,7 @@ fn gen_emit_heads_v3(
             2,
         ));
         for (col, arg) in head.args.iter().enumerate() {
-            let val = compile_packed_expr(builder, arg, bindings)
+            let val = compile_packed_expr_vars(builder, arg, vars)
                 .expect("head expr: supported by eligibility check");
             let slot_addr = builder.ins().stack_addr(ptr_type, slot, (col * 4) as i32);
             builder.ins().store(MemFlags::trusted(), val, slot_addr, 0);

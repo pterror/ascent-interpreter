@@ -4,10 +4,11 @@
 //! packed JIT rule variant in sequence and delegating flush+advance to a
 //! Rust helper.
 
+use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::I32;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Module};
 
@@ -363,6 +364,7 @@ pub(crate) fn codegen_stratum_stage4_fn(
     builder_ctx: &mut FunctionBuilderContext,
     codegen_ctx: &mut cranelift_codegen::Context,
     helpers: &PackedJitHelperIds,
+    var_count: usize,
 ) -> Result<(), String> {
     let ptr_t = module.target_config().pointer_type();
 
@@ -388,9 +390,24 @@ pub(crate) fn codegen_stratum_stage4_fn(
     // ─── entry ──────────────────────────────────────────────────────────────
     builder.append_block_params_for_function_params(entry);
     builder.switch_to_block(entry);
-    builder.seal_block(entry);
+    // entry is sealed after Variables are declared (below).
 
     let stage4_ctx = builder.block_params(entry)[0];
+
+    // Declare one Cranelift Variable per VarId (0..var_count) for register-allocated bindings.
+    // Initialize to 0 so all paths are SSA-valid even before the first write.
+    // All binding Variables are declared in the entry block before it is sealed.
+    let zero_i32 = builder.ins().iconst(I32, 0);
+    let vars: Vec<Variable> = (0..var_count)
+        .map(|i| {
+            let v = Variable::new(i);
+            builder.declare_var(v, I32);
+            builder.def_var(v, zero_i32);
+            v
+        })
+        .collect();
+
+    builder.seal_block(entry);
 
     // Load StratumStage4Ctx fields
     let rule_ctxs_val = builder.ins().load(ptr_t, MemFlags::trusted(), stage4_ctx, 0i32);
@@ -410,7 +427,8 @@ pub(crate) fn codegen_stratum_stage4_fn(
     builder.switch_to_block(full_body);
     builder.seal_block(full_body);
 
-    let mut next_var = 0usize;
+    // Loop-counter Variables start after binding Variables to avoid ID conflicts.
+    let mut next_var = var_count;
 
     emit_rule_bodies(
         &mut builder,
@@ -419,6 +437,7 @@ pub(crate) fn codegen_stratum_stage4_fn(
         None, // full variant — no recent clause
         &func_refs,
         ptr_t,
+        &vars,
         &mut next_var,
         post_full,
     );
@@ -466,6 +485,7 @@ pub(crate) fn codegen_stratum_stage4_fn(
             &recent_emissions,
             &func_refs,
             ptr_t,
+            &vars,
             &mut recent_next_var,
             post_inner,
         );
@@ -506,6 +526,7 @@ fn emit_rule_bodies(
     recent_clause_idx: Option<usize>,
     func_refs: &FuncRefsV3,
     ptr_t: cranelift_codegen::ir::Type,
+    vars: &[Variable],
     next_var: &mut usize,
     continuation: Block,
 ) {
@@ -517,13 +538,12 @@ fn emit_rule_bodies(
     for (rule_i, (clauses, heads, conditions)) in rules.iter().enumerate() {
         let ctx_i = rule_ctx_vals[rule_i];
 
-        // Load PackedJitContextV3 fields: rels @ 0, bindings @ 16, head_rels @ 24,
-        // lookup_handles @ 32, head_dedup_handles @ 40
+        // Load PackedJitContextV3 fields: rels @ 0, head_rels @ 16,
+        // lookup_handles @ 24, head_dedup_handles @ 32 (bindings removed — in Variables).
         let rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 0i32);
-        let bindings_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
-        let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
-        let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
-        let head_dedup_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 40i32);
+        let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
+        let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
+        let head_dedup_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
 
         // Build the (body_idx, &CClause) pairs as gen_clauses_v3 expects.
         // body_idx is the sequential clause index (0-based within the clauses slice).
@@ -538,7 +558,7 @@ fn emit_rule_bodies(
             0,
             recent_clause_idx,
             rels_i,
-            bindings_i,
+            vars,
             head_rels_i,
             lookup_handles_i,
             head_dedup_i,
@@ -571,6 +591,7 @@ fn emit_recent_rule_bodies(
     recent_emissions: &[(usize, usize)],
     func_refs: &FuncRefsV3,
     ptr_t: cranelift_codegen::ir::Type,
+    vars: &[Variable],
     next_var: &mut usize,
     continuation: Block,
 ) {
@@ -579,10 +600,9 @@ fn emit_recent_rule_bodies(
         let ctx_i = rule_ctx_vals[rule_i];
 
         let rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 0i32);
-        let bindings_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
-        let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
-        let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
-        let head_dedup_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 40i32);
+        let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
+        let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
+        let head_dedup_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
 
         let indexed_clauses: Vec<(usize, &CClause)> =
             clauses.iter().enumerate().collect();
@@ -597,7 +617,7 @@ fn emit_recent_rule_bodies(
             0,
             Some(clause_seq),
             rels_i,
-            bindings_i,
+            vars,
             head_rels_i,
             lookup_handles_i,
             head_dedup_i,

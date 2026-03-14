@@ -237,23 +237,21 @@ pub type StratumMetaFn = unsafe extern "C" fn(*mut StratumMetaCtx);
 /// Runtime context for Stage 3 packed JIT rule variants.
 ///
 /// Head relations are written to directly — no results buffer needed.
+/// Bindings are held in Cranelift Variables (register-allocated), not in a heap array.
 ///
 /// repr(C) layout on 64-bit:
 ///   rels               (ptr)  @ offset  0
 ///   rels_len           (u32)  @ offset  8
 ///   _pad               (u32)  @ offset 12
-///   bindings           (ptr)  @ offset 16
-///   head_rels          (ptr)  @ offset 24
-///   lookup_handles     (ptr)  @ offset 32  ← flat array of JitLookupHandle
-///   head_dedup_handles (ptr)  @ offset 40  ← one *mut JitDedupHandle per head
+///   head_rels          (ptr)  @ offset 16
+///   lookup_handles     (ptr)  @ offset 24  ← flat array of JitLookupHandle
+///   head_dedup_handles (ptr)  @ offset 32  ← one *mut JitDedupHandle per head
 #[repr(C)]
 pub struct PackedJitContextV3 {
     /// Array of PackedStorage pointers, one per clause relation.
     pub rels: *const *const PackedStorage,
     pub rels_len: u32,
     pub _pad: u32,
-    /// Flat u32 binding scratch: `bindings[var_id]` = current packed value.
-    pub bindings: *mut u32,
     /// Array of *mut PackedStorage, one per head relation (direct insert target).
     pub head_rels: *const *mut PackedStorage,
     /// Pointer to flat array of JitLookupHandle, indexed by `clause_offset * 2 + use_recent`.
@@ -270,10 +268,9 @@ pub type PackedJitFnV3 = unsafe extern "C" fn(*mut PackedJitContextV3);
 const _: () = {
     assert!(std::mem::offset_of!(PackedJitContextV3, rels) == 0);
     assert!(std::mem::offset_of!(PackedJitContextV3, rels_len) == 8);
-    assert!(std::mem::offset_of!(PackedJitContextV3, bindings) == 16);
-    assert!(std::mem::offset_of!(PackedJitContextV3, head_rels) == 24);
-    assert!(std::mem::offset_of!(PackedJitContextV3, lookup_handles) == 32);
-    assert!(std::mem::offset_of!(PackedJitContextV3, head_dedup_handles) == 40);
+    assert!(std::mem::offset_of!(PackedJitContextV3, head_rels) == 16);
+    assert!(std::mem::offset_of!(PackedJitContextV3, lookup_handles) == 24);
+    assert!(std::mem::offset_of!(PackedJitContextV3, head_dedup_handles) == 32);
 };
 
 /// Context for Stage 3 stratum meta-function (direct-insert variant).
