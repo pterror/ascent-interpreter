@@ -57,6 +57,72 @@ fn var_slot(id: u32) -> i32 {
     -52 - (id as i32) * 4
 }
 
+// ─── Variable location tracking ───────────────────────────────────────────
+
+/// Where a variable's value lives at JIT time.
+///
+/// Register encoding uses the x86-64 ModRM register numbering:
+///   3 = rbx, 13 = r13.
+/// Only callee-saved registers that are not already claimed by loop machinery
+/// may appear here (r12/r14 are reserved; r15 is clobbered during inner probes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VarLoc {
+    /// rbp-relative stack slot (existing behaviour).
+    Stack(i32),
+    /// Callee-saved register (3=rbx, 13=r13).
+    Reg(u8),
+}
+
+/// Decide where each variable lives for one rule/variant.
+///
+/// `outer_fresh_ids`: variable IDs first bound by the outer clause (clause0
+///   fresh_cols), in ascending ID order.  These are "outer-stable": they are
+///   written once in the outer loop body and must survive the entire inner loop.
+///
+/// `use_recent0`: if true, r13 is occupied by the recent_ptr for clause0 and
+///   is NOT available for variable assignment.
+///
+/// `is_two_clause`: if false (1-clause rule) both r13 and rbx are free.
+///
+/// Returns a Vec indexed by variable ID.
+fn compute_var_locs(
+    var_count: usize,
+    outer_fresh_ids: &[u32],
+    use_recent0: bool,
+    is_two_clause: bool,
+) -> Vec<VarLoc> {
+    // Start with everything on the stack.
+    let mut locs: Vec<VarLoc> = (0..var_count as u32).map(|id| VarLoc::Stack(var_slot(id))).collect();
+
+    // Build the list of available registers, priority-ordered.
+    let mut available: Vec<u8> = Vec::new();
+
+    if !use_recent0 {
+        // r13 is free when we don't need it for the outer recent_ptr.
+        available.push(13);
+    }
+    if !is_two_clause {
+        // For 1-clause rules, rbx is never used for tuple_idx/data_ptr in a
+        // way that overlaps with variable lifetime, so it's free.
+        available.push(3);
+    }
+    // Note: for 2-clause rules rbx is repurposed for tuple_idx then data_ptr
+    // inside the outer/inner body, so assigning a variable to rbx would
+    // clobber it — exclude rbx from the 2-clause register pool.
+
+    // Assign registers to outer-stable variables in ID order.
+    let mut reg_iter = available.into_iter();
+    for &var_id in outer_fresh_ids {
+        if let Some(reg) = reg_iter.next() {
+            locs[var_id as usize] = VarLoc::Reg(reg);
+        } else {
+            break; // no more registers; remainder spill to stack
+        }
+    }
+
+    locs
+}
+
 fn vptr_slot(var_count: usize, max_head_arity: usize) -> i32 {
     // 8 bytes below the head-col region base (= head_col_slot(vc, mha, 0) - 8)
     -52 - (var_count as i32) * 4 - (max_head_arity as i32) * 4 - 8
@@ -116,6 +182,38 @@ macro_rules! load_rel_rdi {
     }};
 }
 
+// ─── Variable access helpers ──────────────────────────────────────────────
+
+/// Load variable `id` into `eax` (zero-extends to rax).
+fn emit_load_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
+    match var_locs[id as usize] {
+        VarLoc::Stack(slot) => dynasm!(asm; mov eax, [rbp + slot]),
+        VarLoc::Reg(3)      => dynasm!(asm; mov eax, ebx),
+        VarLoc::Reg(13)     => dynasm!(asm; mov eax, r13d),
+        VarLoc::Reg(r)      => panic!("emit_load_var: unexpected reg {r}"),
+    }
+}
+
+/// Load variable `id` into `ecx` (zero-extends to rcx).
+fn emit_load_var_ecx(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
+    match var_locs[id as usize] {
+        VarLoc::Stack(slot) => dynasm!(asm; mov ecx, [rbp + slot]),
+        VarLoc::Reg(3)      => dynasm!(asm; mov ecx, ebx),
+        VarLoc::Reg(13)     => dynasm!(asm; mov ecx, r13d),
+        VarLoc::Reg(r)      => panic!("emit_load_var_ecx: unexpected reg {r}"),
+    }
+}
+
+/// Store `edx` into variable `id`.
+fn emit_store_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
+    match var_locs[id as usize] {
+        VarLoc::Stack(slot) => dynasm!(asm; mov [rbp + slot], edx),
+        VarLoc::Reg(3)      => dynasm!(asm; mov ebx, edx),
+        VarLoc::Reg(13)     => dynasm!(asm; mov r13d, edx),
+        VarLoc::Reg(r)      => panic!("emit_store_var: unexpected reg {r}"),
+    }
+}
+
 // ─── Expression compilation ───────────────────────────────────────────────
 
 fn check_expr(expr: &CExpr) -> Result<(), String> {
@@ -156,38 +254,41 @@ fn head_col_slot(var_count: usize, max_head_arity: usize, col: usize) -> i32 {
 
 /// Emit expression → eax (i32). Clobbers rcx, rdx (not across calls).
 #[allow(clippy::only_used_in_recursion)]
-fn emit_expr(asm: &mut Assembler, expr: &CExpr, vc: usize) -> Result<(), String> {
+fn emit_expr(asm: &mut Assembler, expr: &CExpr, var_locs: &[VarLoc]) -> Result<(), String> {
     match expr {
-        CExpr::Var(id) => dynasm!(asm; mov eax, [rbp + var_slot(*id)]),
+        CExpr::Var(id) => emit_load_var(asm, var_locs, *id),
         CExpr::Literal(Value::I32(n)) => dynasm!(asm; mov eax, *n),
         CExpr::Literal(Value::Bool(b)) => dynasm!(asm; mov eax, if *b { 1i32 } else { 0i32 }),
         CExpr::VarBinVar(op, a, b) => {
-            dynasm!(asm; mov eax, [rbp + var_slot(*a)]; mov ecx, [rbp + var_slot(*b)]);
+            emit_load_var(asm, var_locs, *a);
+            emit_load_var_ecx(asm, var_locs, *b);
             emit_binop(asm, *op)?;
         }
         CExpr::VarBinLit(op, a, Value::I32(n)) => {
-            dynasm!(asm; mov eax, [rbp + var_slot(*a)]; mov ecx, *n);
+            emit_load_var(asm, var_locs, *a);
+            dynasm!(asm; mov ecx, *n);
             emit_binop(asm, *op)?;
         }
         CExpr::LitBinVar(op, Value::I32(n), b) => {
-            dynasm!(asm; mov eax, *n; mov ecx, [rbp + var_slot(*b)]);
+            dynasm!(asm; mov eax, *n);
+            emit_load_var_ecx(asm, var_locs, *b);
             emit_binop(asm, *op)?;
         }
         CExpr::Binary(op, a, b) => {
             // Evaluate b, push to stack; evaluate a; pop b into ecx.
             // push/pop are balanced; no calls between them, so alignment OK.
-            emit_expr(asm, b, vc)?;
+            emit_expr(asm, b, var_locs)?;
             dynasm!(asm; push rax);
-            emit_expr(asm, a, vc)?;
+            emit_expr(asm, a, var_locs)?;
             dynasm!(asm; pop rcx);
             emit_binop(asm, *op)?;
         }
         CExpr::Unary(CUnOp::Not, i) => {
-            emit_expr(asm, i, vc)?;
+            emit_expr(asm, i, var_locs)?;
             dynasm!(asm; xor eax, 1i8);
         }
         CExpr::Unary(CUnOp::Neg, i) => {
-            emit_expr(asm, i, vc)?;
+            emit_expr(asm, i, var_locs)?;
             dynasm!(asm; neg eax);
         }
         _ => return Err(format!("asm: unsupported expr: {expr:?}")),
@@ -223,6 +324,7 @@ fn emit_bind_cols(
     asm: &mut Assembler,
     clause: &CClause,
     skip: DynamicLabel,
+    var_locs: &[VarLoc],
 ) -> Result<(), String> {
     // Check literal equality constraints
     for (col, arg) in clause.args.iter().enumerate() {
@@ -241,20 +343,15 @@ fn emit_bind_cols(
     // Check variable-bound cols
     for &col in &clause.bound_cols {
         if let CClauseArg::Var(var_id) = &clause.args[col] {
-            dynasm!(asm
-                ; mov edx, [rax + (col as i32)*4]
-                ; mov ecx, [rbp + var_slot(*var_id)]
-                ; cmp edx, ecx
-                ; jne =>skip
-            );
+            dynasm!(asm; mov edx, [rax + (col as i32)*4]);
+            emit_load_var_ecx(asm, var_locs, *var_id);
+            dynasm!(asm; cmp edx, ecx; jne =>skip);
         }
     }
     // Bind fresh cols
     for &(col, var_id) in &clause.fresh_cols {
-        dynasm!(asm
-            ; mov edx, [rax + (col as i32)*4]
-            ; mov [rbp + var_slot(var_id)], edx
-        );
+        dynasm!(asm; mov edx, [rax + (col as i32)*4]);
+        emit_store_var(asm, var_locs, var_id);
     }
     Ok(())
 }
@@ -270,6 +367,7 @@ fn emit_heads(
     var_count: usize,
     max_head_arity: usize,
     pti: usize,
+    var_locs: &[VarLoc],
 ) -> Result<(), String> {
     for (hi, head) in heads.iter().enumerate() {
         let arity = head.args.len();
@@ -277,7 +375,7 @@ fn emit_heads(
 
         // Build candidate tuple on stack (ascending addresses: col0 at base, col1 at base+4…)
         for (col, arg) in head.args.iter().enumerate() {
-            emit_expr(asm, arg, var_count)?;
+            emit_expr(asm, arg, var_locs)?;
             dynasm!(asm; mov [rbp + head_col_slot(var_count, max_head_arity, col)], eax);
         }
 
@@ -500,6 +598,7 @@ fn emit_inner_loop(
     pdptr_addr: usize,
     pti_addr: usize,
     no_match: DynamicLabel,
+    var_locs: &[VarLoc],
 ) -> Result<(), String> {
     let _ = use_recent; // only used in emit_probe_setup label selection, not here
     let arity = clause.args.len();
@@ -546,24 +645,24 @@ fn emit_inner_loop(
     );
 
     // Bind cols (rax = tuple_ptr); skip inner_continue on failure
-    emit_bind_cols(asm, clause, inner_continue)?;
+    emit_bind_cols(asm, clause, inner_continue, var_locs)?;
 
     // Per-clause conditions
     for cond in &clause.conditions {
         if let CCondition::If(expr) = cond {
-            emit_expr(asm, expr, var_count)?;
+            emit_expr(asm, expr, var_locs)?;
             dynasm!(asm; test eax, eax; jz =>inner_continue);
         }
     }
 
     // Rule-level conditions
     for expr in rule_conds {
-        emit_expr(asm, expr, var_count)?;
+        emit_expr(asm, expr, var_locs)?;
         dynasm!(asm; test eax, eax; jz =>inner_continue);
     }
 
     // Emit heads
-    emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti_addr)?;
+    emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti_addr, var_locs)?;
 
     dynasm!(asm; =>inner_continue);
     // r15 already holds next_node (loaded above); loop back
@@ -592,14 +691,27 @@ fn emit_rule_variant(
 ) -> Result<(), String> {
     let variant_exit = asm.new_dynamic_label();
 
+    // Compute variable locations for this variant.
+    // Outer-stable variables are those first bound by clauses[0].fresh_cols.
+    let use_recent0 = recent_idx == Some(0);
+    let is_two_clause = clauses.len() == 2;
+    let outer_fresh_ids: Vec<u32> = if clauses.is_empty() {
+        vec![]
+    } else {
+        let mut ids: Vec<u32> = clauses[0].fresh_cols.iter().map(|&(_, id)| id).collect();
+        ids.sort_unstable();
+        ids
+    };
+    let var_locs = compute_var_locs(var_count, &outer_fresh_ids, use_recent0, is_two_clause);
+
     match clauses.len() {
         0 => {
             // No scan: emit conditions + heads
             for expr in rule_conds {
-                emit_expr(asm, expr, var_count)?;
+                emit_expr(asm, expr, &var_locs)?;
                 dynasm!(asm; test eax, eax; jz =>variant_exit);
             }
-            emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti)?;
+            emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti, &var_locs)?;
         }
 
         1 => {
@@ -610,12 +722,11 @@ fn emit_rule_variant(
             emit_one_clause_scan(
                 asm, rule_i, clause, heads, rule_conds,
                 use_recent, is_rec, var_count, max_head_arity,
-                pti, pcount, pdptr, prptr, variant_exit,
+                pti, pcount, pdptr, prptr, variant_exit, &var_locs,
             )?;
         }
 
         2 => {
-            let use_recent0 = recent_idx == Some(0);
             let use_recent1 = recent_idx == Some(1);
             let is_rec0 = heads.iter().any(|h| h.relation == clauses[0].relation);
             let is_rec1 = heads.iter().any(|h| h.relation == clauses[1].relation);
@@ -624,7 +735,7 @@ fn emit_rule_variant(
                 asm, rule_i, &clauses[0], &clauses[1], heads, rule_conds,
                 use_recent0, use_recent1, is_rec0, is_rec1,
                 var_count, max_head_arity,
-                pti, pcount, pdptr, prptr, variant_exit,
+                pti, pcount, pdptr, prptr, variant_exit, &var_locs,
             )?;
         }
 
@@ -653,6 +764,7 @@ fn emit_one_clause_scan(
     pdptr: usize,
     prptr: usize,
     outer_exit: DynamicLabel,
+    var_locs: &[VarLoc],
 ) -> Result<(), String> {
     if !clause.bound_cols.is_empty() {
         return Err("asm: 1-clause rule with bound_cols unsupported".into());
@@ -706,24 +818,24 @@ fn emit_one_clause_scan(
     );
 
     // Bind cols
-    emit_bind_cols(asm, clause, loop_continue)?;
+    emit_bind_cols(asm, clause, loop_continue, var_locs)?;
 
     // Clause conditions
     for cond in &clause.conditions {
         if let CCondition::If(expr) = cond {
-            emit_expr(asm, expr, var_count)?;
+            emit_expr(asm, expr, var_locs)?;
             dynasm!(asm; test eax, eax; jz =>loop_continue);
         }
     }
 
     // Rule conditions
     for expr in rule_conds {
-        emit_expr(asm, expr, var_count)?;
+        emit_expr(asm, expr, var_locs)?;
         dynasm!(asm; test eax, eax; jz =>loop_continue);
     }
 
     // Heads
-    emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti)?;
+    emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti, var_locs)?;
 
     dynasm!(asm; =>loop_continue);
     dynasm!(asm; inc r14; jmp =>loop_hdr);
@@ -753,6 +865,7 @@ fn emit_two_clause_scan(
     pdptr: usize,
     prptr: usize,
     outer_exit: DynamicLabel,
+    var_locs: &[VarLoc],
 ) -> Result<(), String> {
     if !clause0.bound_cols.is_empty() {
         return Err("asm: clause0 has bound_cols; unsupported in 2-clause rules".into());
@@ -807,12 +920,12 @@ fn emit_two_clause_scan(
     );
 
     // Bind clause0 cols
-    emit_bind_cols(asm, clause0, outer_continue)?;
+    emit_bind_cols(asm, clause0, outer_continue, var_locs)?;
 
     // Clause0 conditions
     for cond in &clause0.conditions {
         if let CCondition::If(expr) = cond {
-            emit_expr(asm, expr, var_count)?;
+            emit_expr(asm, expr, var_locs)?;
             dynasm!(asm; test eax, eax; jz =>outer_continue);
         }
     }
@@ -821,7 +934,7 @@ fn emit_two_clause_scan(
     let primary_col1 = clause1.bound_cols[0];
     match &clause1.args[primary_col1] {
         CClauseArg::Var(var_id) => {
-            dynasm!(asm; mov ecx, [rbp + var_slot(*var_id)]);
+            emit_load_var_ecx(asm, var_locs, *var_id);
         }
         CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
             dynasm!(asm; mov ecx, *n);
@@ -843,6 +956,7 @@ fn emit_two_clause_scan(
         asm, rule_i, 1, clause1, heads, rule_conds,
         use_recent1, is_rec1,
         var_count, max_head_arity, pdptr, pti, outer_continue,
+        var_locs,
     )?;
 
     // ── Outer loop advance ────────────────────────────────────────────────────
