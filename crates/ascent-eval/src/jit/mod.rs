@@ -290,8 +290,15 @@ impl JitCompiler {
                             CClauseArg::Expr(_) => return Err("unsupported clause arg expression"),
                         }
                     }
-                    if !clause.conditions.is_empty() {
-                        return Err("clause has per-clause conditions");
+                    for cond in &clause.conditions {
+                        match cond {
+                            CCondition::If(expr) => {
+                                if !is_supported_packed_expr(expr) {
+                                    return Err("unsupported clause condition expression");
+                                }
+                            }
+                            _ => return Err("clause has IfLet/Let condition (not supported)"),
+                        }
                     }
                 }
                 CBodyItem::Condition(CCondition::If(expr)) => {
@@ -302,11 +309,10 @@ impl JitCompiler {
                 _ => return Err("unsupported body item (aggregation or other)"),
             }
         }
-        // All head args must be pure Var references
         for head in &rule.heads {
             for arg in &head.args {
-                if !matches!(arg, CExpr::Var(_)) {
-                    return Err("head arg is not a plain variable (contains expression)");
+                if !is_supported_packed_expr(arg) {
+                    return Err("head arg uses unsupported expression");
                 }
             }
         }

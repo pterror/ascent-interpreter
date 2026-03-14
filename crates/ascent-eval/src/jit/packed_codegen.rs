@@ -25,7 +25,7 @@ use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags, StackSlotData, Stac
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Module};
 
-use crate::compiled::{CBodyItem, CBinOp, CClause, CClauseArg, CExpr, CHeadClause, CRule, CUnOp};
+use crate::compiled::{CBodyItem, CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CRule, CUnOp};
 use crate::jit::PackedJitHelperIds;
 use crate::value::Value;
 
@@ -332,6 +332,18 @@ fn gen_full_scan(
         store_binding(builder, fields.bindings, var_id, val);
     }
 
+    // Emit per-clause conditions (merged from `if expr` conditions by the optimizer)
+    for cond in &clause.conditions {
+        if let CCondition::If(expr) = cond {
+            let cond_val = compile_packed_expr(builder, expr, fields.bindings)
+                .expect("clause condition: supported by eligibility check");
+            let pass_block = builder.create_block();
+            builder.ins().brif(cond_val, pass_block, &[], continue_block, &[]);
+            builder.switch_to_block(pass_block);
+            builder.seal_block(pass_block);
+        }
+    }
+
     // Recurse to next clause
     gen_clauses(
         builder,
@@ -479,6 +491,18 @@ fn gen_index_scan(
         store_binding(builder, fields.bindings, var_id, val);
     }
 
+    // Emit per-clause conditions (merged from `if expr` conditions by the optimizer)
+    for cond in &clause.conditions {
+        if let CCondition::If(expr) = cond {
+            let cond_val = compile_packed_expr(builder, expr, fields.bindings)
+                .expect("clause condition: supported by eligibility check");
+            let pass_block = builder.create_block();
+            builder.ins().brif(cond_val, pass_block, &[], continue_block, &[]);
+            inner_blocks_to_seal.push(pass_block);
+            builder.switch_to_block(pass_block);
+        }
+    }
+
     gen_clauses(
         builder,
         clauses,
@@ -543,13 +567,10 @@ fn gen_emit_heads(
             2, // align = 4 bytes (2^2)
         ));
 
-        // Copy each head arg (must be CExpr::Var) from bindings into the slot
+        // Copy each head arg from bindings into the slot (expressions supported by eligibility)
         for (col, arg) in head.args.iter().enumerate() {
-            let var_id = match arg {
-                CExpr::Var(id) => *id,
-                _ => panic!("packed JIT: non-Var head arg (should be caught by eligibility check)"),
-            };
-            let val = load_binding(builder, fields.bindings, var_id);
+            let val = compile_packed_expr(builder, arg, fields.bindings)
+                .expect("head expr: supported by eligibility check");
             let slot_addr = builder.ins().stack_addr(ptr_type, slot, (col * 4) as i32);
             builder.ins().store(MemFlags::trusted(), val, slot_addr, 0);
         }
@@ -983,6 +1004,18 @@ fn gen_full_scan_v3(
         store_binding(builder, bindings, var_id, val);
     }
 
+    // Emit per-clause conditions (merged from `if expr` conditions by the optimizer)
+    for cond in &clause.conditions {
+        if let CCondition::If(expr) = cond {
+            let cond_val = compile_packed_expr(builder, expr, bindings)
+                .expect("clause condition: supported by eligibility check");
+            let pass_block = builder.create_block();
+            builder.ins().brif(cond_val, pass_block, &[], continue_block, &[]);
+            builder.switch_to_block(pass_block);
+            builder.seal_block(pass_block);
+        }
+    }
+
     gen_clauses_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
         rels, bindings, head_rels, lookup_handles, head_dedup_handles,
@@ -1271,6 +1304,18 @@ fn gen_index_scan_v3(
         store_binding(builder, bindings, var_id, val);
     }
 
+    // Emit per-clause conditions (merged from `if expr` conditions by the optimizer)
+    for cond in &clause.conditions {
+        if let CCondition::If(expr) = cond {
+            let cond_val = compile_packed_expr(builder, expr, bindings)
+                .expect("clause condition: supported by eligibility check");
+            let pass_block = builder.create_block();
+            builder.ins().brif(cond_val, pass_block, &[], continue_block, &[]);
+            inner_blocks_to_seal.push(pass_block);
+            builder.switch_to_block(pass_block);
+        }
+    }
+
     gen_clauses_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
         rels, bindings, head_rels, lookup_handles, head_dedup_handles,
@@ -1350,11 +1395,8 @@ fn gen_emit_heads_v3(
             2,
         ));
         for (col, arg) in head.args.iter().enumerate() {
-            let var_id = match arg {
-                CExpr::Var(id) => *id,
-                _ => panic!("packed JIT v3: non-Var head arg"),
-            };
-            let val = load_binding(builder, bindings, var_id);
+            let val = compile_packed_expr(builder, arg, bindings)
+                .expect("head expr: supported by eligibility check");
             let slot_addr = builder.ins().stack_addr(ptr_type, slot, (col * 4) as i32);
             builder.ins().store(MemFlags::trusted(), val, slot_addr, 0);
         }
