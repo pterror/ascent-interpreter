@@ -182,25 +182,33 @@ is ≤1.5KB (n=20: 380 u32s) — fits entirely in L1. Step 1 regressed by 3–5%
 gap at benchmark sizes is instruction-count/codegen dominated, not cache dominated.
 **Do Step 3 first** for benchmark-size wins; revisit Step 1 when targeting n>100 workloads.
 
-**Step 1 — Fix join index data structure** *(estimated 3–5× on join-heavy queries)*
+**Step 1 — Fix join index data structure** *(required to close the triangle gap)*
 
-**Attempted (2026-03-15):** Implemented contiguous start+count layout (3-pass build: count, prefix-sum, fill).
-`JitIndexEntry` changed from `{key, head, _pad0, _pad1}` to `{key, start, count, _pad}`. Values array
-is now flat per-key: `values[start..start+count]`. Both Cranelift and asm backends updated to range scan
-(`j=0..count`) instead of linked-list traversal.
+**Root cause (confirmed 2026-03-15):** The linked-list inner loop creates a serialized load-use
+dependency chain: each step requires the result of the previous load to compute the next address.
+At ~4 cycles/step (L1 load latency) with ~10 steps = 40 serialized cycles per outer iteration.
+`ascent_macro` uses `HashMap<K, Vec<V>>` — the inner iteration is a sequential array scan where
+the CPU can speculatively load ahead. LLVM also auto-vectorizes it with SIMD. This alone accounts
+for most of the 11.5× triangle gap.
 
-**Result:** No measurable improvement at n=10-30. Reasons:
-1. The linked-list for small n fits in L1 cache — no cache-miss savings.
-2. New inner loop adds MORE stack loads: 3 loads per iteration (vptr, start, count) vs 1 (vptr).
-   Old: `cmp r15,-1; load values[r15*8]; load values[r15*8+4]; advance r15`
-   New: `load count; cmp r15,count; load vptr; load start; add start+j; zero-extend; load values[start+j*4]`
-3. Rebuild cost: update_jit_indices now always rebuilds from scratch; was incremental.
-4. The asm backend stores start/count to additional stack slots on every probe, adding store cost.
+**Attempted (2026-03-15):** Global contiguous start+count layout — 3-pass rebuild of entire index
+on every `advance()`. Result: 3-5% regression at n≤30 (inner loop adds more stack loads; rebuild
+overhead > gain), TC +739% regression (O(N³) total rebuild work).
 
-**Defer to after Step 3.** Once Step 3a (register assignment) holds `start`+`count` in callee-saved
-registers, the inner load reduces to one `values[start+j]` load with no stack traffic — only then
-does the contiguous layout win over linked-list. At n>100 (values >L1 cache), it becomes independently
-valuable regardless.
+**Correct approach: EDB-contiguous index strategy**
+- EDB/stable relations (never in a head): build contiguous index ONCE before stratum start, never
+  rebuild. Enables sequential scan in inner loops for all variants.
+- Derived/recursive relations (in a head): keep linked-list full index (O(1) incremental inserts);
+  rebuild RECENT index contiguously per `advance()` — O(|recent|) per iteration, not O(|full|).
+- Inner loop code: two variants in both asm and Cranelift backends — contiguous scan (EDB) and
+  linked-list traversal (derived). Select at variant-emit time based on `is_edb[level]` flag.
+
+For triangle (edge is EDB): full edge index contiguous → sequential inner loops → expected ~3-4×
+improvement. For TC (edge EDB, path derived): edge inner probe sequential, path full stays
+linked-list; TC gap closes modestly.
+
+Implementation scope: `jit_index.rs` (new index type), `specialized.rs` (detection + build),
+asm/Cranelift backends (new contiguous inner loop). ~400 lines across 4 files.
 
 `PackedIndex` currently stores match lists as linked-list chains — pointer-chasing on every inner-loop
 iteration. `ascent_macro` uses `HashMap<K, Vec<V>>`: after the key lookup, inner iteration is a
@@ -227,14 +235,17 @@ as fallback for anything the asm backend explicitly rejects.
   variables to dedicated stack slots only when the register file is exhausted. Eliminates the
   load/store pairs per inner iteration that make the current asm backend slower than Cranelift.
 
-- **3b — N-clause rules** *(implemented 2026-03-15; not committed — at parity with Cranelift)*:
+- **3b — N-clause rules** *(committed `cec22d0`, 2026-03-15, at parity with Cranelift)*:
   Recursive `emit_clause_level` with per-depth stack slots (vptr, node-save, dptr-save). Triangle
-  (3-clause) now handled by asm backend. Benchmark: n=10 54µs, n=20 403µs — matches Cranelift
-  baseline exactly. 10× gap vs ascent_macro unchanged. Root cause: `packed_data_ptr` (called once per
-  outer iteration) + `packed_try_insert` (once per output) dominate; loop-control improvement from
-  asm over Cranelift is negligible. **Next:** Step 3c (expression completeness) or investigate
-  eliminating `packed_data_ptr` call for non-recursive outer scan (data ptr is stable if head ∉
-  clause0 relation).
+  (3-clause) now handled by asm backend. Benchmark: n=20 380µs asm ≈ 380µs Cranelift — 11.5×
+  gap vs ascent_macro (33µs) unchanged. Attempted: pre-fetch `packed_data_ptr` before outer loop
+  for non-recursive clauses (would eliminate 6600 calls per fixpoint iteration). **Result: no
+  measurable improvement.** Function calls are hidden by OOO execution — they're not on the
+  critical path. **True bottleneck identified: serialized load-use dependency chain in linked-list
+  traversal.** Each step: `load values[node*8]` → `load values[node*8+4]` → `mov r15d, result`
+  → next step depends on r15. At ~4 cycles/step (L1 load latency) with ~10 steps per inner
+  iteration = 40 cycles serialized vs ascent_macro's Vec slice which is speculative/pipelined/
+  vectorizable. Fix requires contiguous per-key values arrays (see Step 1 / Step 4).
 
 - **3c — Expression completeness** (~150 lines): `CUnOp::Deref` is a no-op in the packed
   representation (trivial); add Div/Mod/bitwise; handle arbitrary user-defined function calls via
@@ -248,8 +259,19 @@ as fallback for anything the asm backend explicitly rejects.
 - **3e — Negation / anti-join** (~150 lines): probe the negated relation's index; branch to
   `skip_label` on *hit* rather than miss. Reuses all probe infrastructure from 3b.
 
-**Expected residual after all steps:** ≤ 1.5× — pure instruction-quality difference between
-hand-written x86-64 and LLVM-compiled Rust for equivalent logic.
+**Step 4 — EDB-contiguous index (implements Step 1 correctly)** *(highest-value remaining item)*
+
+Implement the EDB-contiguous index strategy described in Step 1. This is the missing piece that
+unblocks the 11.5× triangle gap — without contiguous inner loops, no amount of JIT code quality
+improvement can close the gap (the bottleneck is the serialized load-use chain, not instruction
+count).
+
+Do Step 1 (EDB-contiguous) BEFORE 3c–3e. Coverage expansion (3c–3e) on top of a fundamentally
+slow inner loop structure is wasted effort.
+
+**Expected residual after Steps 3+4:** triangle ~3×, TC ~2× — Cranelift vs LLVM code quality gap
+on now-sequential inner loops. Further closing requires SIMD vectorization in asm backend or a
+better codegen backend.
 
 ### Relation storage optimizations
 
