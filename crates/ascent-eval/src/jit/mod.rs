@@ -285,9 +285,11 @@ impl JitCompiler {
                     for arg in &clause.args {
                         match arg {
                             CClauseArg::Var(_) => {}
-                            CClauseArg::Expr(CExpr::Literal(crate::value::Value::I32(_)))
-                            | CClauseArg::Expr(CExpr::Literal(crate::value::Value::Bool(_))) => {}
-                            CClauseArg::Expr(_) => return Err("unsupported clause arg expression"),
+                            CClauseArg::Expr(expr) => {
+                                if !is_supported_packed_expr(expr) {
+                                    return Err("unsupported clause arg expression");
+                                }
+                            }
                         }
                     }
                     for cond in &clause.conditions {

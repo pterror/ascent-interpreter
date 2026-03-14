@@ -626,15 +626,8 @@ fn load_bound_val(
 ) -> CValue {
     match &clause.args[col] {
         CClauseArg::Var(id) => load_binding(builder, bindings_ptr, *id),
-        CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
-            builder.ins().iconst(I32, *n as i64)
-        }
-        CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
-            builder.ins().iconst(I32, if *b { 1 } else { 0 })
-        }
-        CClauseArg::Expr(_) => {
-            panic!("packed JIT: non-literal Expr arg in bound column (should be caught by eligibility)")
-        }
+        CClauseArg::Expr(expr) => compile_packed_expr(builder, expr, bindings_ptr)
+            .expect("packed JIT: bound clause expr should be caught by eligibility check"),
     }
 }
 
