@@ -227,9 +227,14 @@ as fallback for anything the asm backend explicitly rejects.
   variables to dedicated stack slots only when the register file is exhausted. Eliminates the
   load/store pairs per inner iteration that make the current asm backend slower than Cranelift.
 
-- **3b — N-clause rules** (~300 lines): per-depth stack slots for loop state (count, loop index,
-  recent_ptr); emit N−1 levels of nested hash-probe loops recursively. Unblocks triangle (3 clauses)
-  and any deeper join.
+- **3b — N-clause rules** *(implemented 2026-03-15; not committed — at parity with Cranelift)*:
+  Recursive `emit_clause_level` with per-depth stack slots (vptr, node-save, dptr-save). Triangle
+  (3-clause) now handled by asm backend. Benchmark: n=10 54µs, n=20 403µs — matches Cranelift
+  baseline exactly. 10× gap vs ascent_macro unchanged. Root cause: `packed_data_ptr` (called once per
+  outer iteration) + `packed_try_insert` (once per output) dominate; loop-control improvement from
+  asm over Cranelift is negligible. **Next:** Step 3c (expression completeness) or investigate
+  eliminating `packed_data_ptr` call for non-recursive outer scan (data ptr is stable if head ∉
+  clause0 relation).
 
 - **3c — Expression completeness** (~150 lines): `CUnOp::Deref` is a no-op in the packed
   representation (trivial); add Div/Mod/bitwise; handle arbitrary user-defined function calls via
