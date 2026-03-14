@@ -40,6 +40,8 @@ cd docs && bun dev # Local docs
 
 **Something unexpected is a signal, not noise.** Surprising output, anomalous numbers, files containing what they shouldn't — stop and ask why before continuing. Don't accept anomalies and move on.
 
+**When explaining why something behaves a certain way, state what evidence supports it.** If the evidence is "profiling data," cite it. If it's "reasoning from known costs," show the reasoning. If there isn't any, say so rather than rationalizing.
+
 **Do the work properly.** Don't leave workarounds or hacks undocumented. When asked to analyze X, actually read X — don't synthesize from conversation.
 
 ## JIT Design Rule
