@@ -259,19 +259,28 @@ as fallback for anything the asm backend explicitly rejects.
 - **3e — Negation / anti-join** (~150 lines): probe the negated relation's index; branch to
   `skip_label` on *hit* rather than miss. Reuses all probe infrastructure from 3b.
 
-**Step 4 — EDB-contiguous index (implements Step 1 correctly)** *(highest-value remaining item)*
+**Step 4 — EDB-contiguous index (implements Step 1 correctly)** ✅ DONE (2026-03-15)
 
-Implement the EDB-contiguous index strategy described in Step 1. This is the missing piece that
-unblocks the 11.5× triangle gap — without contiguous inner loops, no amount of JIT code quality
-improvement can close the gap (the bottleneck is the serialized load-use chain, not instruction
-count).
+Implemented EDB-contiguous index strategy. JitHashIndex gains `build_contiguous()` and
+`is_contiguous` flag. `PackedStorage` gains `jit_is_edb` flag; `update_jit_indices()` builds
+contiguous full+recent indices for EDB, linked-list for derived. Both Cranelift and asm backends
+emit contiguous inner loops (sequential j=0..count scan) when `!is_recursive`, linked-list loops
+otherwise.
 
-Do Step 1 (EDB-contiguous) BEFORE 3c–3e. Coverage expansion (3c–3e) on top of a fundamentally
-slow inner loop structure is wasted effort.
+**Actual benchmark results (2026-03-15):**
+- triangle `jit_hot/20`: 408µs (-5.8% vs 405µs before; ratio vs ascent_macro: 12.4× unchanged)
+- triangle `jit_hot/30`: 1.39ms (-7.8% vs ~1.5ms before; ratio vs ascent_macro ~12×)
+- TC `jit_hot/50`: 273µs (no significant change; ratio vs ascent_macro: 2.6×)
 
-**Expected residual after Steps 3+4:** triangle ~3×, TC ~2× — Cranelift vs LLVM code quality gap
-on now-sequential inner loops. Further closing requires SIMD vectorization in asm backend or a
-better codegen backend.
+**Assessment:** Contiguous inner loops give ~6-8% wins at benchmark sizes (n≤30), not the 3-4×
+expected. Root cause of smaller-than-expected gain: at benchmark sizes (n=20: only 190 edges),
+each key has only 1-2 values on average — linked-list overhead is negligible for small chains.
+The load-use serialization argument only applies when chains are long (n>100+). The 11.5× gap
+at benchmark sizes is still dominated by Cranelift vs LLVM code quality (more instructions,
+poorer register allocation, no auto-vectorization).
+
+**Residual gap:** triangle still 12×. Next step: asm backend with depth-priority register
+assignment (Step 3a) to eliminate stack spills in inner loops, or evaluate QBE/LLVM backend.
 
 ### Relation storage optimizations
 
