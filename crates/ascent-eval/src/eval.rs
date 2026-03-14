@@ -900,14 +900,23 @@ impl Engine {
                 }
             }
 
-            // Rebuild EDB indices contiguously now, before the runtime context is
-            // built.  The fact strata ran earlier with `jit_is_edb = false`, so any
-            // existing jit_indices were built as linked-list.  `build_stratum_stage4_runtime`
-            // reads the index pointers directly; if we don't rebuild first the JIT
-            // code (which uses contiguous mode for EDB) will see stale linked-list
-            // entries where `count == 0`, causing the inner loop to produce no results.
+            // If an EDB relation already has a linked-list JIT index (built by a
+            // prior fact stratum that ran with `jit_is_edb = false`), rebuild it
+            // contiguously NOW — before `build_stratum_stage4_runtime` reads the
+            // index pointers.  The JIT code uses contiguous mode for EDB; stale
+            // linked-list entries have `count == 0` and the inner loop would find
+            // nothing.
+            //
+            // Specifically: only rebuild when the index is non-empty AND linked-list.
+            // If `jit_indices` is empty (relation never advanced; data lives in delta),
+            // skip — `jit_stratum_advance_s4` will build the correct contiguous index
+            // on the first advance and refresh the handles.
             for (_, rel) in self.relations.iter_mut() {
-                if let Relation::Packed(ps) = rel && ps.jit_is_edb {
+                if let Relation::Packed(ps) = rel
+                    && ps.jit_is_edb
+                    && !ps.jit_indices.is_empty()
+                    && !ps.jit_indices[0].is_contiguous
+                {
                     ps.update_jit_indices();
                 }
             }
