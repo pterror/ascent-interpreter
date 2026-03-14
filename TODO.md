@@ -268,19 +268,20 @@ emit contiguous inner loops (sequential j=0..count scan) when `!is_recursive`, l
 otherwise.
 
 **Actual benchmark results (2026-03-15):**
-- triangle `jit_hot/20`: 408µs (-5.8% vs 405µs before; ratio vs ascent_macro: 12.4× unchanged)
-- triangle `jit_hot/30`: 1.39ms (-7.8% vs ~1.5ms before; ratio vs ascent_macro ~12×)
-- TC `jit_hot/50`: 273µs (no significant change; ratio vs ascent_macro: 2.6×)
+- triangle `jit_hot/20`: ~380µs (ratio vs ascent_macro: 11.5× unchanged; ~1% noise improvement)
+- TC `jit_hot/50`: ~268µs (~5% regression vs 254µs before; EDB index rebuild adds overhead)
 
-**Assessment:** Contiguous inner loops give ~6-8% wins at benchmark sizes (n≤30), not the 3-4×
-expected. Root cause of smaller-than-expected gain: at benchmark sizes (n=20: only 190 edges),
-each key has only 1-2 values on average — linked-list overhead is negligible for small chains.
-The load-use serialization argument only applies when chains are long (n>100+). The 11.5× gap
-at benchmark sizes is still dominated by Cranelift vs LLVM code quality (more instructions,
-poorer register allocation, no auto-vectorization).
+**Assessment:** Contiguous inner loops give negligible wins at benchmark sizes (n≤30), not the
+3-4× expected. Root cause: at n=20 (only ~190 edges in a complete graph), each key has 1-2
+values on average — linked-list chain traversal overhead is negligible for short chains. The
+load-use serialization argument only applies when chains are long (n>100+). The 11.5× gap
+at benchmark sizes is dominated by Cranelift vs LLVM code quality. TC has a slight regression
+from EDB detection and index-format conversion overhead on each stratum run.
 
-**Residual gap:** triangle still 12×. Next step: asm backend with depth-priority register
-assignment (Step 3a) to eliminate stack spills in inner loops, or evaluate QBE/LLVM backend.
+**Residual gap:** triangle 11.5×, TC 2.6×. Steps 3a (register assignment, `14c60f1`) and 3b
+(N-clause asm, `cec22d0`) are already done. Remaining options: (a) evaluate larger n where
+contiguous gains are measurable; (b) Step 3c–3e to expand asm coverage; (c) accept the gap
+as a Cranelift vs LLVM quality ceiling and move on to other features.
 
 ### Relation storage optimizations
 
