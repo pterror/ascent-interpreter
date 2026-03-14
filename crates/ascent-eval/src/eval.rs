@@ -873,6 +873,46 @@ impl Engine {
 
         let stratum_key = scc_key;
 
+        // Step 0: mark EDB relations for this stratum.
+        //
+        // A relation is EDB in this stratum if it appears as a clause body but never
+        // as a rule head. EDB relations are stable — their full JIT index can be built
+        // contiguously once before the stratum runs and never rebuilt.
+        {
+            use crate::compiled::CBodyItem;
+            use crate::relation::Relation;
+
+            // Collect all relation names that appear in any head.
+            let head_rels: rustc_hash::FxHashSet<&str> = rules
+                .iter()
+                .flat_map(|r| r.heads.iter().map(|h| h.relation.as_str()))
+                .collect();
+
+            // For each body clause: set is_edb iff not in any head.
+            for rule in rules {
+                for item in &rule.body {
+                    if let CBodyItem::Clause(c) = item {
+                        let is_edb = !head_rels.contains(c.relation.as_str());
+                        if let Some(Relation::Packed(ps)) = self.relations.get_mut(&c.relation) {
+                            ps.jit_is_edb = is_edb;
+                        }
+                    }
+                }
+            }
+
+            // Rebuild EDB indices contiguously now, before the runtime context is
+            // built.  The fact strata ran earlier with `jit_is_edb = false`, so any
+            // existing jit_indices were built as linked-list.  `build_stratum_stage4_runtime`
+            // reads the index pointers directly; if we don't rebuild first the JIT
+            // code (which uses contiguous mode for EDB) will see stale linked-list
+            // entries where `count == 0`, causing the inner loop to produce no results.
+            for (_, rel) in self.relations.iter_mut() {
+                if let Relation::Packed(ps) = rel && ps.jit_is_edb {
+                    ps.update_jit_indices();
+                }
+            }
+        }
+
         // Step 1: compile the Stage 4 stratum function (eligibility checked inside)
         let stage4_fn = {
             let Some(jit_cell) = self.jit.as_ref() else {

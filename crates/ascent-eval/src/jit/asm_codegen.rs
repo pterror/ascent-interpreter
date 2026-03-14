@@ -160,6 +160,15 @@ fn level_dptr_save_slot(level: usize, var_count: usize, max_head_arity: usize, m
     level_slots_base(var_count, max_head_arity) - 2 * (max_depth as i32) * 8 - (level as i32) * 8
 }
 
+/// Slot to store match count for contiguous-mode level L (L >= 1).
+/// Used only when the clause at level L has a contiguous index.
+/// Stores the u32 count loaded from entry.count (JitIndexEntry offset 8).
+/// L >= 1.  Offset: base - 3*MAX_DEPTH*8 - L*8
+fn level_count_slot(level: usize, var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 {
+    debug_assert!(level >= 1);
+    level_slots_base(var_count, max_head_arity) - 3 * (max_depth as i32) * 8 - (level as i32) * 8
+}
+
 /// Compute `sub rsp, FRAME_SIZE` value.  Must be ≡ 8 (mod 16) because after
 /// 5 callee-saved pushes rsp ≡ 8 (mod 16), and we need rsp ≡ 0 for calls.
 fn frame_size(var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 {
@@ -170,8 +179,9 @@ fn frame_size(var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 
     //   D*8    = per-level values_ptr spill (levels 1..max_depth)
     //   D*8    = per-level node save slots  (levels 1..max_depth)
     //   D*8    = per-level dptr save slots  (levels 1..max_depth)
+    //   D*8    = per-level count slots      (levels 1..max_depth; contiguous mode)
     //   8      = guard / alignment slack
-    let level_bytes = max_depth * 3 * 8;
+    let level_bytes = max_depth * 4 * 8;
     let raw = 8 + var_count * 4 + max_head_arity * 4 + level_bytes + 8;
     // Round up to next value ≡ 8 (mod 16)
     let rem = raw % 16;
@@ -601,12 +611,21 @@ fn emit_clause_level(
         dynasm!(asm; inc r14; jmp =>loop_hdr);
 
     } else {
-        // ── Level >= 1: hash probe + linked-list traversal ──────────────────
+        // ── Level >= 1: hash probe + inner scan ────────────────────────────
+        //
+        // Contiguous mode (!is_rec): values array holds tuple_idxs sequentially.
+        //   Inner loop: j = 0..count, load values[head + j]
+        //   No pointer-chasing — sequential scan enables CPU speculation/prefetch.
+        //
+        // Linked-list mode (is_rec): values are stride-2 nodes (tuple_idx, next).
+        //   Inner loop: follow next-pointers until SENTINEL.
 
         let arity = clause.args.len();
         let stride = (arity * 4) as i32;
         let use_recent = p.use_recent[level];
         let is_rec = p.is_rec[level];
+        // Contiguous mode: EDB relations (!is_rec) use sequential scan.
+        let is_contiguous = !is_rec;
 
         // Compute probe key into ecx
         if clause.bound_cols.is_empty() {
@@ -625,11 +644,10 @@ fn emit_clause_level(
             _ => return Err(format!("asm: clause{level} primary bound col has unsupported arg")),
         }
 
-        // Save the ENCLOSING level's r15 (next_node) and rbx (data_ptr) before
-        // we clobber them with the new probe.  The enclosing level is `level-1`.
-        // When level == 1 this is the first probe — nothing was saved at a lower
-        // level yet, so no save is needed here for level-1 (level-1's data is
-        // r12/r13/r14 which are not clobbered by the probe).
+        // Save the ENCLOSING level's r15 and rbx before we clobber them with
+        // the new probe.  The enclosing level is `level-1`.
+        // When level == 1 this is the first probe; level-1's data (r12/r13/r14)
+        // is not clobbered, so no save is needed.
         // When level >= 2 we must save level-1's r15/rbx.
         if level >= 2 {
             let save_level = level - 1;
@@ -679,8 +697,17 @@ fn emit_clause_level(
             ; and rdx, r10
             ; jmp =>probe_lp
         );
+        // probe_ok: rax = entry_ptr, load head at +4, and count at +8 (contiguous mode)
         dynasm!(asm; =>probe_ok);
-        dynasm!(asm; mov esi, [rax + 4i8]; jmp =>after_probe);
+        if is_contiguous {
+            dynasm!(asm
+                ; mov esi, [rax + 4i8]    // esi = head (start offset)
+                ; mov eax, [rax + 8i8]    // eax = count
+                ; jmp =>after_probe
+            );
+        } else {
+            dynasm!(asm; mov esi, [rax + 4i8]; jmp =>after_probe);
+        }
 
         dynasm!(asm; =>probe_ovf);
         dynasm!(asm
@@ -691,42 +718,133 @@ fn emit_clause_level(
             ; mov esi, [rax]
             ; cmp esi, ecx
             ; jne =>when_exhausted    // key not found → exhaust this level
-            ; mov esi, [rax + 4i8]
         );
+        if is_contiguous {
+            dynasm!(asm
+                ; mov esi, [rax + 4i8]    // esi = head
+                ; mov eax, [rax + 8i8]    // eax = count
+            );
+        } else {
+            dynasm!(asm; mov esi, [rax + 4i8]);
+        }
 
         dynasm!(asm; =>after_probe);
-        // esi = head node; check SENTINEL
-        dynasm!(asm; cmp esi, -1i32; je =>when_exhausted; mov r15d, esi);
 
         // Save values_ptr to the per-level vptr slot
         let vs = level_vptr_slot(level, p.var_count, p.max_head_arity);
         dynasm!(asm; mov [rbp + vs], r9);
 
-        // Pre-fetch data_ptr into rbx (if non-recursive)
-        if !is_rec {
+        if is_contiguous {
+            // Contiguous mode:
+            //   esi = head (start index in flat values array)
+            //   eax = count
+            //   r15d = j counter (starts at 0)
+            //
+            // Check count == 0 → no matches.
+            let cnt_slot = level_count_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+            dynasm!(asm
+                ; test eax, eax
+                ; jz =>when_exhausted
+                ; xor r15d, r15d         // j = 0
+            );
+            // Save count at cnt_slot, head (esi) at cnt_slot+4.
+            // Both must survive recursive calls into deeper levels.
+            dynasm!(asm
+                ; mov [rbp + cnt_slot], eax           // save count
+                ; mov [rbp + cnt_slot + 4], esi       // save head
+            );
+
+            // Pre-fetch data_ptr into rbx (stable for non-recursive = always in contiguous mode)
             load_rel_rdi!(asm, p.rule_i, level);
             call_abs!(asm, p.pdptr);
             dynasm!(asm; mov rbx, rax);
-        }
 
-        // ── Inner linked-list loop ──────────────────────────────────────────
-        let inner_hdr = asm.new_dynamic_label();
-        let inner_continue = asm.new_dynamic_label();
+            // ── Inner contiguous scan loop ────────────────────────────────────
+            let inner_hdr = asm.new_dynamic_label();
+            let inner_continue = asm.new_dynamic_label();
 
-        dynasm!(asm; =>inner_hdr);
-        dynasm!(asm; cmp r15d, -1i32; je =>when_exhausted);
+            dynasm!(asm; =>inner_hdr);
+            // Check j < count; reload head from stack (may have been clobbered by sub-level).
+            dynasm!(asm
+                ; mov eax, [rbp + cnt_slot]
+                ; mov esi, [rbp + cnt_slot + 4]       // reload head
+                ; cmp r15d, eax
+                ; jge =>when_exhausted
+            );
 
-        // Load tuple_idx (ecx) and next_node (r15) from values_ptr[r15*8]
-        dynasm!(asm
-            ; mov rax, [rbp + vs]
-            ; mov ecx, [rax + r15*8]
-            ; mov esi, [rax + r15*8 + 4i8]
-            ; mov r15d, esi            // advance r15 to next node
-            ; mov eax, ecx             // rax = tuple_idx
-        );
+            // tuple_idx = values[head + j]   (head in esi, j in r15d)
+            dynasm!(asm
+                ; mov rax, [rbp + vs]                   // values_ptr
+                ; lea rax, [rax + rsi*4]                // values_ptr + head*4
+                ; mov ecx, [rax + r15*4]                // values[head + j] = tuple_idx
+                ; inc r15d                              // j++
+            );
 
-        // For recursive: re-fetch data_ptr (rax must survive; push/pop alignment)
-        if is_rec {
+            // rax = tuple_ptr = data_ptr + tuple_idx * stride
+            dynasm!(asm
+                ; imul rcx, rcx, stride
+                ; add rcx, rbx
+                ; mov rax, rcx
+            );
+
+            // Bind cols (rax = tuple_ptr)
+            emit_bind_cols(asm, clause, inner_continue, p.var_locs)?;
+
+            // Clause conditions
+            for cond in &clause.conditions {
+                if let CCondition::If(expr) = cond {
+                    emit_expr(asm, expr, p.var_locs)?;
+                    dynasm!(asm; test eax, eax; jz =>inner_continue);
+                }
+            }
+
+            if level + 1 == p.clauses.len() {
+                for expr in p.rule_conds {
+                    emit_expr(asm, expr, p.var_locs)?;
+                    dynasm!(asm; test eax, eax; jz =>inner_continue);
+                }
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
+            } else {
+                let sub_exhausted = asm.new_dynamic_label();
+                emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
+
+                dynasm!(asm; =>sub_exhausted);
+                let node_slot = level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+                let dptr_slot = level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+                dynasm!(asm
+                    ; mov r15, [rbp + node_slot]
+                    ; mov rbx, [rbp + dptr_slot]
+                );
+            }
+
+            dynasm!(asm; =>inner_continue);
+            dynasm!(asm; jmp =>inner_hdr);
+
+        } else {
+            // Linked-list mode:
+            //   esi = head node index; SENTINEL = -1u32
+            dynasm!(asm; cmp esi, -1i32; je =>when_exhausted; mov r15d, esi);
+
+            // Pre-fetch data_ptr into rbx (if non-recursive — always false here since is_rec=true)
+            // Actually for linked-list we keep the existing behaviour: re-fetch inside loop.
+
+            // ── Inner linked-list loop ──────────────────────────────────────
+            let inner_hdr = asm.new_dynamic_label();
+            let inner_continue = asm.new_dynamic_label();
+
+            dynasm!(asm; =>inner_hdr);
+            dynasm!(asm; cmp r15d, -1i32; je =>when_exhausted);
+
+            // Load tuple_idx (ecx) and next_node (r15) from values_ptr[r15*8]
+            dynasm!(asm
+                ; mov rax, [rbp + vs]
+                ; mov ecx, [rax + r15*8]
+                ; mov esi, [rax + r15*8 + 4i8]
+                ; mov r15d, esi            // advance r15 to next node
+                ; mov eax, ecx             // rax = tuple_idx
+            );
+
+            // Re-fetch data_ptr (recursive: head insert can reallocate)
             dynasm!(asm
                 ; push rax
                 ; sub rsp, 8
@@ -738,62 +856,52 @@ fn emit_clause_level(
                 ; add rsp, 8
                 ; pop rax
             );
-        }
 
-        // tuple_ptr = data_ptr + tuple_idx * stride
-        dynasm!(asm
-            ; imul rax, rax, stride
-            ; add rax, rbx
-        );
-
-        // Bind cols (rax = tuple_ptr)
-        emit_bind_cols(asm, clause, inner_continue, p.var_locs)?;
-
-        // Clause conditions
-        for cond in &clause.conditions {
-            if let CCondition::If(expr) = cond {
-                emit_expr(asm, expr, p.var_locs)?;
-                dynasm!(asm; test eax, eax; jz =>inner_continue);
-            }
-        }
-
-        if level + 1 == p.clauses.len() {
-            // Last clause: emit rule-level conditions and heads
-            for expr in p.rule_conds {
-                emit_expr(asm, expr, p.var_locs)?;
-                dynasm!(asm; test eax, eax; jz =>inner_continue);
-            }
-            emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
-            // Fall to inner_continue
-        } else {
-            // Not last: recurse to level+1.
-            //
-            // When level+1 exhausts (its when_exhausted fires), we need to:
-            //   1. Restore r15 and rbx for the current level (level).
-            //   2. Jump back to inner_hdr to process the next node.
-            //
-            // We pass a fresh `sub_exhausted` label as when_exhausted for level+1.
-            // That label is defined immediately after the recursive call, and it
-            // performs the restore + jump.
-            let sub_exhausted = asm.new_dynamic_label();
-            emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
-
-            // sub_exhausted: level+1 is done; restore level's r15 and rbx,
-            // then jump back to this level's inner_hdr.
-            dynasm!(asm; =>sub_exhausted);
-            // level+1's init saved the CURRENT level's r15/rbx at save_slots(level)
-            let node_slot = level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
-            let dptr_slot = level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+            // tuple_ptr = data_ptr + tuple_idx * stride
             dynasm!(asm
-                ; mov r15, [rbp + node_slot]
-                ; mov rbx, [rbp + dptr_slot]
+                ; imul rax, rax, stride
+                ; add rax, rbx
             );
-            // Fall to inner_continue → jmp inner_hdr
-        }
 
-        dynasm!(asm; =>inner_continue);
-        dynasm!(asm; jmp =>inner_hdr);
-    }
+            // Bind cols (rax = tuple_ptr)
+            emit_bind_cols(asm, clause, inner_continue, p.var_locs)?;
+
+            // Clause conditions
+            for cond in &clause.conditions {
+                if let CCondition::If(expr) = cond {
+                    emit_expr(asm, expr, p.var_locs)?;
+                    dynasm!(asm; test eax, eax; jz =>inner_continue);
+                }
+            }
+
+            if level + 1 == p.clauses.len() {
+                // Last clause: emit rule-level conditions and heads
+                for expr in p.rule_conds {
+                    emit_expr(asm, expr, p.var_locs)?;
+                    dynasm!(asm; test eax, eax; jz =>inner_continue);
+                }
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
+                // Fall to inner_continue
+            } else {
+                // Not last: recurse to level+1.
+                let sub_exhausted = asm.new_dynamic_label();
+                emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
+
+                // sub_exhausted: level+1 is done; restore level's r15 and rbx.
+                dynasm!(asm; =>sub_exhausted);
+                let node_slot = level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+                let dptr_slot = level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+                dynasm!(asm
+                    ; mov r15, [rbp + node_slot]
+                    ; mov rbx, [rbp + dptr_slot]
+                );
+                // Fall to inner_continue → jmp inner_hdr
+            }
+
+            dynasm!(asm; =>inner_continue);
+            dynasm!(asm; jmp =>inner_hdr);
+        } // end else (linked-list branch)
+    } // end else (level >= 1)
 
     Ok(())
 }

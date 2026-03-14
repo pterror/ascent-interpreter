@@ -1191,13 +1191,17 @@ fn gen_index_scan_v3(
     builder.declare_var(var_slot, ptr_type);
     builder.def_var(var_slot, init_slot);
 
-    // Probe loop with block params to carry entry_head out.
+    // Probe loop with block params to carry entry_head (and optionally count) out.
     // Block structure:
     //   probe_loop:  check empty → empty_exit; check found → probe_found; else → probe_miss
     //   probe_miss:  increment slot, back-edge to probe_loop
-    //   probe_found: load head at offset 4, jump after_probe(head)
-    //   empty_exit:  check overflow slot; select head or SENTINEL, jump after_probe(head)
-    //   after_probe(entry_head: I32):  inner linked-list value loop
+    //   probe_found: load head at offset 4 (+ count at offset 8 if contiguous),
+    //                jump after_probe(head [, count])
+    //   empty_exit:  check overflow slot; select head or SENTINEL (+ count if contiguous),
+    //                jump after_probe(head [, count])
+    //   after_probe(entry_head: I32 [, entry_count: I32]):
+    //     contiguous → sequential j=0..count scan
+    //     linked-list → pointer-chasing SENTINEL loop
 
     let probe_loop       = builder.create_block();
     let probe_check_found= builder.create_block();
@@ -1206,8 +1210,15 @@ fn gen_index_scan_v3(
     let empty_exit       = builder.create_block();
     let after_probe      = builder.create_block();
 
-    // after_probe receives entry_head: I32 (head of linked-list chain, SENTINEL = empty)
+    // Contiguous mode = !is_recursive: EDB relation, sequential scan in values array.
+    let is_contiguous = !is_recursive;
+
+    // after_probe always receives entry_head: I32.
+    // In contiguous mode it also receives entry_count: I32.
     builder.append_block_param(after_probe, I32);
+    if is_contiguous {
+        builder.append_block_param(after_probe, I32);
+    }
 
     // Cache packed_data_ptr before entering the probe/value loops.
     // Non-recursive rules: pointer is stable (no head insert can reallocate it).
@@ -1263,14 +1274,17 @@ fn gen_index_scan_v3(
     builder.seal_block(probe_found);
 
     // Re-compute entry_ptr from the final slot value (same slot as probe_loop above).
-    // The value of `slot` from probe_loop dominates probe_found through probe_check_found.
-    // We need to re-read it via the variable because it was defined before the loop.
     let slot_found     = builder.use_var(var_slot);
     let ebo_found      = builder.ins().imul_imm(slot_found, 16_i64);
     let entry_ptr_found= builder.ins().iadd(entries_ptr, ebo_found);
-    // head is at offset 4 in JitIndexEntry
-    let found_head     = builder.ins().load(I32, MemFlags::trusted(), entry_ptr_found, 4i32);
-    builder.ins().jump(after_probe, &[found_head]);
+    // head is at offset 4, count at offset 8 in JitIndexEntry
+    let found_head  = builder.ins().load(I32, MemFlags::trusted(), entry_ptr_found, 4i32);
+    if is_contiguous {
+        let found_count = builder.ins().load(I32, MemFlags::trusted(), entry_ptr_found, 8i32);
+        builder.ins().jump(after_probe, &[found_head, found_count]);
+    } else {
+        builder.ins().jump(after_probe, &[found_head]);
+    }
 
     // ─── empty_exit ──────────────────────────────────────────────────────────
     // Before giving up, check the overflow slot at entries[mask + 1] which
@@ -1288,137 +1302,265 @@ fn gen_index_scan_v3(
     let ovf_head      = builder.ins().load(I32, MemFlags::trusted(), ovf_entry_ptr, 4i32);
     let sentinel_i32  = builder.ins().iconst(I32, 0xFFFF_FFFFu32 as i64);
     let sel_head      = builder.ins().select(ovf_match, ovf_head, sentinel_i32);
-    builder.ins().jump(after_probe, &[sel_head]);
+    if is_contiguous {
+        let ovf_count     = builder.ins().load(I32, MemFlags::trusted(), ovf_entry_ptr, 8i32);
+        let zero_i32      = builder.ins().iconst(I32, 0);
+        let sel_count     = builder.ins().select(ovf_match, ovf_count, zero_i32);
+        builder.ins().jump(after_probe, &[sel_head, sel_count]);
+    } else {
+        builder.ins().jump(after_probe, &[sel_head]);
+    }
 
-    // ─── after_probe(entry_head: I32) ────────────────────────────────────────
+    // ─── after_probe(entry_head: I32 [, entry_count: I32]) ──────────────────
     builder.switch_to_block(after_probe);
     builder.seal_block(after_probe);
 
-    let entry_head = builder.block_params(after_probe)[0]; // I32, SENTINEL = no entries
+    let entry_head = builder.block_params(after_probe)[0]; // I32
 
-    // ─── Inner value loop (linked-list traversal) ─────────────────────────────
-    // ptr starts at entry_head, advance via values_ptr[ptr*2+1] until SENTINEL.
-    let loop_header = builder.create_block();
-    let loop_body   = builder.create_block();
-    let loop_exit   = builder.create_block();
+    if is_contiguous {
+        // ─── Inner contiguous scan loop ───────────────────────────────────────
+        // values[head .. head+count] = tuple_idxs for this key (sequential u32s).
+        // j = 0..count: load values_ptr[head + j] as tuple_idx.
 
-    let var_ptr = Variable::new(*next_var);
-    *next_var += 1;
-    builder.declare_var(var_ptr, I32);
-    builder.def_var(var_ptr, entry_head);
-    builder.ins().jump(loop_header, &[]);
+        let entry_count = builder.block_params(after_probe)[1]; // I32
 
-    builder.switch_to_block(loop_header);
-    let ptr = builder.use_var(var_ptr);
-    let sentinel = builder.ins().iconst(I32, 0xFFFF_FFFFu32 as i64);
-    let is_done = builder.ins().icmp(IntCC::Equal, ptr, sentinel);
-    builder.ins().brif(is_done, loop_exit, &[], loop_body, &[]);
+        let loop_header = builder.create_block();
+        let loop_body   = builder.create_block();
+        let loop_exit   = builder.create_block();
 
-    builder.switch_to_block(loop_body);
-    let ptr = builder.use_var(var_ptr);
+        // j counter variable
+        let var_j = Variable::new(*next_var);
+        *next_var += 1;
+        builder.declare_var(var_j, I32);
+        let zero_i32 = builder.ins().iconst(I32, 0);
+        builder.def_var(var_j, zero_i32);
+        builder.ins().jump(loop_header, &[]);
 
-    // values layout: stride 8 bytes per node (two u32s)
-    // values_ptr[ptr*8 + 0] = tuple_idx (u32)
-    // values_ptr[ptr*8 + 4] = next_ptr  (u32)
-    let ptr_ext    = builder.ins().uextend(ptr_type, ptr);
-    let byte_off   = builder.ins().imul_imm(ptr_ext, 8_i64);
-    let node_addr  = builder.ins().iadd(values_ptr, byte_off);
-    let tuple_idx_u32 = builder.ins().load(I32, MemFlags::trusted(), node_addr, 0i32);
-    let next_ptr      = builder.ins().load(I32, MemFlags::trusted(), node_addr, 4i32);
-    let tuple_idx     = builder.ins().uextend(ptr_type, tuple_idx_u32);
+        // Loop header: if j >= count, exit
+        builder.switch_to_block(loop_header);
+        let j = builder.use_var(var_j);
+        let is_done = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, j, entry_count);
+        builder.ins().brif(is_done, loop_exit, &[], loop_body, &[]);
 
-    // Store next_ptr in a variable so continue_block can advance the chain.
-    let var_next_ptr = Variable::new(*next_var);
-    *next_var += 1;
-    builder.declare_var(var_next_ptr, I32);
-    builder.def_var(var_next_ptr, next_ptr);
+        // Loop body: load values_ptr[head + j] as tuple_idx
+        builder.switch_to_block(loop_body);
+        let j = builder.use_var(var_j);
 
-    // Use pre-fetched pointer for non-recursive rules; re-fetch for recursive ones.
-    let packed_buf = if let Some(buf) = cached_packed_buf {
-        buf
-    } else {
-        let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
-        builder.inst_results(call)[0]
-    };
-    let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
+        // byte_offset = (head + j) * 4
+        let j_ext  = builder.ins().uextend(ptr_type, j);
+        let head_ext = builder.ins().uextend(ptr_type, entry_head);
+        let idx_in_values = builder.ins().iadd(head_ext, j_ext);
+        let byte_off = builder.ins().imul_imm(idx_in_values, 4_i64);
+        let elem_addr = builder.ins().iadd(values_ptr, byte_off);
+        let tuple_idx_u32 = builder.ins().load(I32, MemFlags::trusted(), elem_addr, 0i32);
+        let tuple_idx = builder.ins().uextend(ptr_type, tuple_idx_u32);
 
-    let continue_block = builder.create_block();
-    let mut inner_blocks_to_seal = Vec::new();
+        // Use stable pre-fetched packed_data_ptr (non-recursive ↔ is_contiguous)
+        let packed_buf = cached_packed_buf.expect("contiguous mode implies non-recursive");
+        let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
 
-    for (col, arg) in clause.args.iter().enumerate() {
-        match arg {
-            CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
-                let actual   = load_packed_col(builder, tuple_ptr, col);
-                let expected = builder.ins().iconst(I32, *n as i64);
-                let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
-                let pass_block = builder.create_block();
-                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
-                inner_blocks_to_seal.push(pass_block);
-                builder.switch_to_block(pass_block);
+        let continue_block = builder.create_block();
+        let mut inner_blocks_to_seal = Vec::new();
+
+        for (col, arg) in clause.args.iter().enumerate() {
+            match arg {
+                CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+                    let actual   = load_packed_col(builder, tuple_ptr, col);
+                    let expected = builder.ins().iconst(I32, *n as i64);
+                    let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                    let pass_block = builder.create_block();
+                    builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                    inner_blocks_to_seal.push(pass_block);
+                    builder.switch_to_block(pass_block);
+                }
+                CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
+                    let actual   = load_packed_col(builder, tuple_ptr, col);
+                    let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
+                    let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                    let pass_block = builder.create_block();
+                    builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                    inner_blocks_to_seal.push(pass_block);
+                    builder.switch_to_block(pass_block);
+                }
+                _ => {}
             }
-            CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
-                let actual   = load_packed_col(builder, tuple_ptr, col);
-                let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
-                let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
-                let pass_block = builder.create_block();
-                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
-                inner_blocks_to_seal.push(pass_block);
-                builder.switch_to_block(pass_block);
-            }
-            _ => {}
         }
-    }
 
-    for &col in &clause.bound_cols[1..] {
-        let actual   = load_packed_col(builder, tuple_ptr, col);
-        let expected = load_bound_val_vars(builder, clause, col, vars);
-        let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
-        let pass_block = builder.create_block();
-        builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
-        inner_blocks_to_seal.push(pass_block);
-        builder.switch_to_block(pass_block);
-    }
-
-    for &(col, var_id) in &clause.fresh_cols {
-        let val = load_packed_col(builder, tuple_ptr, col);
-        def_binding(builder, vars, var_id, val);
-    }
-
-    // Emit per-clause conditions (merged from `if expr` conditions by the optimizer)
-    for cond in &clause.conditions {
-        if let CCondition::If(expr) = cond {
-            let cond_val = compile_packed_expr_vars(builder, expr, vars)
-                .expect("clause condition: supported by eligibility check");
+        for &col in &clause.bound_cols[1..] {
+            let actual   = load_packed_col(builder, tuple_ptr, col);
+            let expected = load_bound_val_vars(builder, clause, col, vars);
+            let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
             let pass_block = builder.create_block();
-            builder.ins().brif(cond_val, pass_block, &[], continue_block, &[]);
+            builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
             inner_blocks_to_seal.push(pass_block);
             builder.switch_to_block(pass_block);
         }
-    }
 
-    gen_clauses_v3(
-        builder, clauses, clause_offset + 1, recent_clause_idx,
-        rels, vars, head_rels, lookup_handles, head_dedup_handles,
-        func_refs, heads, ptr_type, next_var, conditions,
-    );
+        for &(col, var_id) in &clause.fresh_cols {
+            let val = load_packed_col(builder, tuple_ptr, col);
+            def_binding(builder, vars, var_id, val);
+        }
 
-    builder.ins().jump(continue_block, &[]);
+        for cond in &clause.conditions {
+            if let CCondition::If(expr) = cond {
+                let cond_val = compile_packed_expr_vars(builder, expr, vars)
+                    .expect("clause condition: supported by eligibility check");
+                let pass_block = builder.create_block();
+                builder.ins().brif(cond_val, pass_block, &[], continue_block, &[]);
+                inner_blocks_to_seal.push(pass_block);
+                builder.switch_to_block(pass_block);
+            }
+        }
 
-    builder.switch_to_block(continue_block);
-    for blk in inner_blocks_to_seal {
-        builder.seal_block(blk);
-    }
-    builder.seal_block(continue_block);
+        gen_clauses_v3(
+            builder, clauses, clause_offset + 1, recent_clause_idx,
+            rels, vars, head_rels, lookup_handles, head_dedup_handles,
+            func_refs, heads, ptr_type, next_var, conditions,
+        );
 
-    // Advance to next node in chain.
-    let next_ptr_val = builder.use_var(var_next_ptr);
-    builder.def_var(var_ptr, next_ptr_val);
-    builder.ins().jump(loop_header, &[]);
+        builder.ins().jump(continue_block, &[]);
+        builder.switch_to_block(continue_block);
+        for blk in inner_blocks_to_seal {
+            builder.seal_block(blk);
+        }
+        builder.seal_block(continue_block);
 
-    builder.switch_to_block(loop_exit);
-    builder.seal_block(loop_header);
-    builder.seal_block(loop_body);
-    builder.seal_block(loop_exit);
+        // j++
+        let j = builder.use_var(var_j);
+        let one_i32 = builder.ins().iconst(I32, 1);
+        let j_next  = builder.ins().iadd(j, one_i32);
+        builder.def_var(var_j, j_next);
+        builder.ins().jump(loop_header, &[]);
+
+        builder.switch_to_block(loop_exit);
+        builder.seal_block(loop_header);
+        builder.seal_block(loop_body);
+        builder.seal_block(loop_exit);
+
+    } else {
+        // ─── Inner linked-list traversal loop ─────────────────────────────────
+        // ptr starts at entry_head, advance via values_ptr[ptr*2+1] until SENTINEL.
+        let loop_header = builder.create_block();
+        let loop_body   = builder.create_block();
+        let loop_exit   = builder.create_block();
+
+        let var_ptr = Variable::new(*next_var);
+        *next_var += 1;
+        builder.declare_var(var_ptr, I32);
+        builder.def_var(var_ptr, entry_head);
+        builder.ins().jump(loop_header, &[]);
+
+        builder.switch_to_block(loop_header);
+        let ptr = builder.use_var(var_ptr);
+        let sentinel = builder.ins().iconst(I32, 0xFFFF_FFFFu32 as i64);
+        let is_done = builder.ins().icmp(IntCC::Equal, ptr, sentinel);
+        builder.ins().brif(is_done, loop_exit, &[], loop_body, &[]);
+
+        builder.switch_to_block(loop_body);
+        let ptr = builder.use_var(var_ptr);
+
+        // values layout: stride 8 bytes per node (two u32s)
+        // values_ptr[ptr*8 + 0] = tuple_idx (u32)
+        // values_ptr[ptr*8 + 4] = next_ptr  (u32)
+        let ptr_ext    = builder.ins().uextend(ptr_type, ptr);
+        let byte_off   = builder.ins().imul_imm(ptr_ext, 8_i64);
+        let node_addr  = builder.ins().iadd(values_ptr, byte_off);
+        let tuple_idx_u32 = builder.ins().load(I32, MemFlags::trusted(), node_addr, 0i32);
+        let next_ptr      = builder.ins().load(I32, MemFlags::trusted(), node_addr, 4i32);
+        let tuple_idx     = builder.ins().uextend(ptr_type, tuple_idx_u32);
+
+        // Store next_ptr in a variable so continue_block can advance the chain.
+        let var_next_ptr = Variable::new(*next_var);
+        *next_var += 1;
+        builder.declare_var(var_next_ptr, I32);
+        builder.def_var(var_next_ptr, next_ptr);
+
+        // Re-fetch packed_data_ptr for recursive rules (head insert may realloc).
+        let packed_buf = if let Some(buf) = cached_packed_buf {
+            buf
+        } else {
+            let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
+            builder.inst_results(call)[0]
+        };
+        let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
+
+        let continue_block = builder.create_block();
+        let mut inner_blocks_to_seal = Vec::new();
+
+        for (col, arg) in clause.args.iter().enumerate() {
+            match arg {
+                CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+                    let actual   = load_packed_col(builder, tuple_ptr, col);
+                    let expected = builder.ins().iconst(I32, *n as i64);
+                    let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                    let pass_block = builder.create_block();
+                    builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                    inner_blocks_to_seal.push(pass_block);
+                    builder.switch_to_block(pass_block);
+                }
+                CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
+                    let actual   = load_packed_col(builder, tuple_ptr, col);
+                    let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
+                    let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                    let pass_block = builder.create_block();
+                    builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                    inner_blocks_to_seal.push(pass_block);
+                    builder.switch_to_block(pass_block);
+                }
+                _ => {}
+            }
+        }
+
+        for &col in &clause.bound_cols[1..] {
+            let actual   = load_packed_col(builder, tuple_ptr, col);
+            let expected = load_bound_val_vars(builder, clause, col, vars);
+            let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+            let pass_block = builder.create_block();
+            builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+            inner_blocks_to_seal.push(pass_block);
+            builder.switch_to_block(pass_block);
+        }
+
+        for &(col, var_id) in &clause.fresh_cols {
+            let val = load_packed_col(builder, tuple_ptr, col);
+            def_binding(builder, vars, var_id, val);
+        }
+
+        for cond in &clause.conditions {
+            if let CCondition::If(expr) = cond {
+                let cond_val = compile_packed_expr_vars(builder, expr, vars)
+                    .expect("clause condition: supported by eligibility check");
+                let pass_block = builder.create_block();
+                builder.ins().brif(cond_val, pass_block, &[], continue_block, &[]);
+                inner_blocks_to_seal.push(pass_block);
+                builder.switch_to_block(pass_block);
+            }
+        }
+
+        gen_clauses_v3(
+            builder, clauses, clause_offset + 1, recent_clause_idx,
+            rels, vars, head_rels, lookup_handles, head_dedup_handles,
+            func_refs, heads, ptr_type, next_var, conditions,
+        );
+
+        builder.ins().jump(continue_block, &[]);
+
+        builder.switch_to_block(continue_block);
+        for blk in inner_blocks_to_seal {
+            builder.seal_block(blk);
+        }
+        builder.seal_block(continue_block);
+
+        // Advance to next node in chain.
+        let next_ptr_val = builder.use_var(var_next_ptr);
+        builder.def_var(var_ptr, next_ptr_val);
+        builder.ins().jump(loop_header, &[]);
+
+        builder.switch_to_block(loop_exit);
+        builder.seal_block(loop_header);
+        builder.seal_block(loop_body);
+        builder.seal_block(loop_exit);
+    } // end if is_contiguous / else
 }
 
 /// Emit head tuples with an inline JIT dedup probe before falling back to

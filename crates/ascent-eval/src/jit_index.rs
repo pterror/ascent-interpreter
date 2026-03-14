@@ -16,15 +16,20 @@
 ///
 /// `#[repr(C)]` layout (16 bytes):
 /// - offset  0: `key`   u32  — EMPTY_KEY = 0xFFFFFFFF means slot is empty
-/// - offset  4: `head`  u32  — index of first node in linked-list chain; SENTINEL = no entry
-/// - offset  8: `_pad0` u32
+/// - offset  4: `head`  u32  — linked-list: first node index (SENTINEL = empty);
+///   contiguous: start index in flat values array
+/// - offset  8: `count` u32  — linked-list: unused (0);
+///   contiguous: number of u32 tuple_idxs at `values[head..]`
 /// - offset 12: `_pad1` u32
+///
+/// In contiguous mode, `values[head .. head+count]` are the tuple_idxs for this key.
+/// In linked-list mode, `values[node*2+0]` = tuple_idx, `values[node*2+1]` = next node.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct JitIndexEntry {
     pub key: u32,
     pub head: u32,
-    pub _pad0: u32,
+    pub count: u32,
     pub _pad1: u32,
 }
 
@@ -35,13 +40,13 @@ const _: () = {
     assert!(std::mem::size_of::<JitIndexEntry>() == 16);
     assert!(std::mem::offset_of!(JitIndexEntry, key) == 0);
     assert!(std::mem::offset_of!(JitIndexEntry, head) == 4);
-    assert!(std::mem::offset_of!(JitIndexEntry, _pad0) == 8);
+    assert!(std::mem::offset_of!(JitIndexEntry, count) == 8);
     assert!(std::mem::offset_of!(JitIndexEntry, _pad1) == 12);
 };
 
 impl Default for JitIndexEntry {
     fn default() -> Self {
-        JitIndexEntry { key: EMPTY_KEY, head: SENTINEL, _pad0: 0, _pad1: 0 }
+        JitIndexEntry { key: EMPTY_KEY, head: SENTINEL, count: 0, _pad1: 0 }
     }
 }
 
@@ -49,9 +54,19 @@ impl Default for JitIndexEntry {
 ///
 /// The first 24 bytes are C-visible (accessible from JIT code):
 /// - offset  0: `entries_ptr` `*const JitIndexEntry` — heap-allocated entries
-/// - offset  8: `values_ptr`  `*const u32`            — flat linked-list value nodes
+/// - offset  8: `values_ptr`  `*const u32`            — flat value nodes / contiguous values
 /// - offset 16: `mask`        u32                     — capacity − 1 (power of 2)
 /// - offset 20: `len`         u32                     — occupied slots (unique keys)
+///
+/// **Linked-list mode** (is_contiguous = false, default):
+///   `values[node*2+0]` = tuple_idx, `values[node*2+1]` = next node (SENTINEL = end).
+///   `entry.head` = first node index; `entry.count` = 0 (unused).
+///
+/// **Contiguous mode** (is_contiguous = true):
+///   `values[head .. head+count]` = all tuple_idxs for this key, stored compactly.
+///   `entry.head` = start offset; `entry.count` = number of entries.
+///   Inner loop: sequential scan `j = 0..count`, load `values[head+j]`.
+///   Built once from all pairs; never updated incrementally.
 ///
 /// The `entries` and `values` fields hold ownership (Vec for resizability).
 #[repr(C)]
@@ -62,6 +77,8 @@ pub struct JitHashIndex {
     pub len: u32,
     entries: Vec<JitIndexEntry>,
     values: Vec<u32>,
+    /// Whether this index uses contiguous per-key storage (vs linked-list).
+    pub is_contiguous: bool,
 }
 
 // Safety: JitHashIndex contains raw pointers that we own and never alias.
@@ -94,6 +111,7 @@ impl Clone for JitHashIndex {
             len: self.len,
             entries,
             values,
+            is_contiguous: self.is_contiguous,
         }
     }
 }
@@ -179,6 +197,7 @@ impl JitHashIndex {
             len,
             entries,
             values,
+            is_contiguous: false,
         }
     }
 
@@ -195,6 +214,96 @@ impl JitHashIndex {
             len: 0,
             entries,
             values: Vec::new(),
+            is_contiguous: false,
+        }
+    }
+
+    /// Build a contiguous-mode index from (key, tuple_idx) pairs.
+    ///
+    /// Per-key tuple_idxs are stored compactly in the flat `values` array:
+    ///   `values[entry.head .. entry.head + entry.count]` = all tuple_idxs for that key.
+    ///
+    /// This enables sequential inner-loop scans with no pointer-chasing:
+    ///   `j = 0..entry.count` → `tuple_idx = values[entry.head + j]`
+    ///
+    /// The index is immutable after construction (no `insert` support).
+    /// For EDB/stable relations, call once before stratum start; never rebuild.
+    pub fn build_contiguous(pairs: &[(u32, u32)]) -> Self {
+        if pairs.is_empty() {
+            let entries = vec![JitIndexEntry::default(); 2];
+            let entries_ptr = entries.as_ptr();
+            return JitHashIndex {
+                entries_ptr,
+                values_ptr: std::ptr::null(),
+                mask: 0,
+                len: 0,
+                entries,
+                values: Vec::new(),
+                is_contiguous: true,
+            };
+        }
+
+        // Group by key using a temporary FxHashMap.
+        let mut groups: rustc_hash::FxHashMap<u32, Vec<u32>> =
+            rustc_hash::FxHashMap::default();
+        for &(key, tuple_idx) in pairs {
+            groups.entry(key).or_default().push(tuple_idx);
+        }
+
+        let n = groups.len();
+        let cap = (n * 2).next_power_of_two().max(4);
+        let mask = (cap - 1) as u32;
+
+        // Allocate cap + 1 entries (overflow slot at cap).
+        let mut entries: Vec<JitIndexEntry> = vec![JitIndexEntry::default(); cap + 1];
+        // Flat contiguous values array; total size = sum of group sizes.
+        let mut values: Vec<u32> = Vec::with_capacity(pairs.len());
+        let mut len: u32 = 0;
+
+        for (key, group) in &groups {
+            let start = values.len() as u32;
+            let count = group.len() as u32;
+            values.extend_from_slice(group);
+
+            if *key == EMPTY_KEY {
+                // Store in overflow slot at index cap.
+                let slot = &mut entries[cap];
+                slot.key = *key;
+                slot.head = start;
+                slot.count = count;
+                len += 1;
+            } else {
+                let hash = knuth_hash(*key);
+                let mut slot_idx = hash & (cap - 1);
+                loop {
+                    let slot = &mut entries[slot_idx];
+                    if slot.key == EMPTY_KEY {
+                        slot.key = *key;
+                        slot.head = start;
+                        slot.count = count;
+                        len += 1;
+                        break;
+                    }
+                    slot_idx = (slot_idx + 1) & (cap - 1);
+                }
+            }
+        }
+
+        let entries_ptr = entries.as_ptr();
+        let values_ptr = if values.is_empty() {
+            std::ptr::null()
+        } else {
+            values.as_ptr()
+        };
+
+        JitHashIndex {
+            entries_ptr,
+            values_ptr,
+            mask,
+            len,
+            entries,
+            values,
+            is_contiguous: true,
         }
     }
 
@@ -259,22 +368,17 @@ impl JitHashIndex {
         self.entries_ptr = self.entries.as_ptr();
     }
 
-    /// Clear all entries for a full rebuild (e.g. recent index).
+    /// Clear all entries for a full rebuild.
     ///
     /// Resets all slots to empty/sentinel, clears values (keeps capacity),
     /// resets len to 0, and updates raw pointers.
+    #[allow(dead_code)]
     pub fn clear_for_rebuild(&mut self) {
-        let total = self.entries.len();
         for e in self.entries.iter_mut() {
-            e.key = EMPTY_KEY;
-            e.head = SENTINEL;
-            e._pad0 = 0;
-            e._pad1 = 0;
+            *e = JitIndexEntry::default();
         }
         self.values.clear();
         self.len = 0;
-        // entries capacity stays; ensure pointer still valid after mutable borrow
-        let _ = total; // suppress unused warning
         self.entries_ptr = self.entries.as_ptr();
         self.values_ptr = std::ptr::null();
     }
@@ -362,7 +466,7 @@ impl JitLookupHandle {
         static EMPTY_SENTINEL: JitIndexEntry = JitIndexEntry {
             key: EMPTY_KEY,
             head: SENTINEL,
-            _pad0: 0,
+            count: 0,
             _pad1: 0,
         };
         JitLookupHandle {

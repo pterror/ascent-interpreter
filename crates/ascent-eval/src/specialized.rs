@@ -201,6 +201,13 @@ pub struct PackedStorage {
     /// Number of tuples already indexed into jit_indices (for incremental update).
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) jit_full_indexed_count: usize,
+    /// True if this relation is EDB in the current stratum (never written by any rule head).
+    ///
+    /// When true, `update_jit_indices` builds the full index contiguously ONCE and then
+    /// skips all subsequent rebuilds (the relation is stable). The recent index is also
+    /// built contiguously each iteration. Set by `eval.rs` before running a stratum.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) jit_is_edb: bool,
     /// Authoritative dedup table (inline u32 hash table, also probed by JIT code directly).
     pub(crate) jit_dedup: crate::jit_index::JitDedupTable,
 }
@@ -227,6 +234,8 @@ impl PackedStorage {
             jit_recent_indices: Vec::new(),
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_full_indexed_count: 0,
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_is_edb: false,
             jit_dedup: crate::jit_index::JitDedupTable::new(arity),
         }
     }
@@ -452,43 +461,93 @@ impl PackedStorage {
 
     /// Update `jit_indices` incrementally and rebuild `jit_recent_indices` from scratch.
     ///
-    /// Full index: only insert newly added tuples (jit_full_indexed_count..count) — O(delta).
-    /// Recent index: rebuild from the current recent set — always small.
+    /// **EDB mode** (`jit_is_edb = true`):
+    ///   Full index: built contiguously ONCE on the first call; subsequent calls are no-ops
+    ///   (the relation never changes in this stratum). This avoids O(N) rebuild overhead.
+    ///   Recent index: also built contiguously (EDB recent is typically empty; format must
+    ///   match full index since JIT uses `!is_rec[level]` uniformly for both).
+    ///
+    /// **Derived mode** (`jit_is_edb = false`, default):
+    ///   Full index: insert new tuples incrementally (linked-list, O(delta) per call).
+    ///   Recent index: rebuilt from scratch using linked-list insertion.
+    ///
+    /// The JIT code selects contiguous vs linked-list based on `!is_rec[level]`, which
+    /// equals `jit_is_edb`. Both full and recent indices MUST use the same format.
     ///
     /// Must be called after `advance()` / `advance_peek()` to keep JIT handles fresh.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) fn update_jit_indices(&mut self) {
-        // Initialize full index if needed (first call).
-        if self.jit_indices.is_empty() {
-            self.jit_indices = (0..self.arity)
-                .map(|_| crate::jit_index::JitHashIndex::empty())
-                .collect();
-        }
-        // Insert only the new tuples since last call.
-        for idx in self.jit_full_indexed_count..self.count {
-            let base = idx * self.arity;
-            for col in 0..self.arity {
-                self.jit_indices[col].insert(self.packed_data[base + col], idx as u32);
+        // ── Full index ───────────────────────────────────────────────────────
+        if self.jit_is_edb {
+            // EDB: build contiguous index ONCE, then never touch it again.
+            // Build if: never built yet, or previously built in linked-list mode.
+            let needs_build = self.count > 0
+                && (self.jit_full_indexed_count == 0
+                    || self.jit_indices.is_empty()
+                    || !self.jit_indices[0].is_contiguous);
+            if needs_build {
+                // Collect all (key, tuple_idx) pairs for each column.
+                self.jit_indices = (0..self.arity)
+                    .map(|col| {
+                        let pairs: Vec<(u32, u32)> = (0..self.count)
+                            .map(|idx| (self.packed_data[idx * self.arity + col], idx as u32))
+                            .collect();
+                        crate::jit_index::JitHashIndex::build_contiguous(&pairs)
+                    })
+                    .collect();
+                self.jit_full_indexed_count = self.count;
             }
+            // Else: already built contiguously (or empty) — skip.
+        } else {
+            // Derived: incremental linked-list insertion.
+            if self.jit_indices.is_empty() {
+                self.jit_indices = (0..self.arity)
+                    .map(|_| crate::jit_index::JitHashIndex::empty())
+                    .collect();
+            }
+            for idx in self.jit_full_indexed_count..self.count {
+                let base = idx * self.arity;
+                for col in 0..self.arity {
+                    self.jit_indices[col].insert(self.packed_data[base + col], idx as u32);
+                }
+            }
+            self.jit_full_indexed_count = self.count;
         }
-        self.jit_full_indexed_count = self.count;
 
-        // Rebuild recent index from scratch (always small — just the delta).
+        // ── Recent index: match full index format (contiguous for EDB, linked-list for derived) ──
+        // The JIT code uses `is_contiguous = !is_rec[level]` for all probes (recent or full)
+        // at a given level. `is_rec[level]` is determined by whether the relation appears in
+        // any rule head — which is the same as `!jit_is_edb`. So recent indices must use the
+        // same storage format as the full index.
         if self.jit_recent_indices.is_empty() {
             self.jit_recent_indices = (0..self.arity)
                 .map(|_| crate::jit_index::JitHashIndex::empty())
                 .collect();
         }
-        for col in 0..self.arity {
-            self.jit_recent_indices[col].clear_for_rebuild();
-        }
-        for &idx in &self.recent {
-            let base = idx * self.arity;
-            for col in 0..self.arity {
-                self.jit_recent_indices[col].insert(self.packed_data[base + col], idx as u32);
+        let recent = &self.recent;
+        let packed = &self.packed_data;
+        let arity = self.arity;
+        if self.jit_is_edb {
+            // EDB: recent is contiguous (and likely empty since EDB is stable).
+            for col in 0..arity {
+                let pairs: Vec<(u32, u32)> = recent
+                    .iter()
+                    .map(|&idx| (packed[idx * arity + col], idx as u32))
+                    .collect();
+                self.jit_recent_indices[col] = crate::jit_index::JitHashIndex::build_contiguous(&pairs);
+            }
+        } else {
+            // Derived: recent is linked-list (rebuilt from scratch each advance).
+            for col in 0..arity {
+                self.jit_recent_indices[col].clear_for_rebuild();
+            }
+            for &idx in recent {
+                let base = idx * arity;
+                for col in 0..arity {
+                    self.jit_recent_indices[col].insert(packed[base + col], idx as u32);
+                }
             }
         }
-
     }
 
     pub fn set_delta_range(&mut self, start: usize) {
