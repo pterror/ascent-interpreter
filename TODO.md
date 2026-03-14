@@ -152,6 +152,14 @@ Current JIT architecture (context for what needs to change):
 
 - [x] **Eliminate duplicate dedup tables** — unified into `JitDedupTable` as sole authoritative dedup; removed `HashTable<usize>` from PackedStorage.
 
+- [x] **Cranelift Variables for bindings (Phase 1)** — replaced heap `bindings: *mut u32` array (load/store on every inner-loop variable read/write) with Cranelift `Variable` API. All V3/Stage4 codegen declares `var_count` Variables at function entry; `def_var`/`use_var` replace `store`/`load` through a heap pointer. Removed `bindings` field from `PackedJitContextV3`; updated offsets. Added `var_count` to `JitCompiler`, set from `Engine` before each compile. Eliminates the heap store+load pairs (e.g. `store notrap v22; load notrap v6`) visible in CLIF dumps on every inner-loop binding access.
+
+- [ ] **Cache `packed_data_ptr` for recursive rules (Phase 2)** — for recursive rules, `packed_data_ptr` is re-fetched per outer-scan tuple because `packed_try_insert` may reallocate the Vec. After Phase 1, run `perf stat -e instructions` to confirm this is still prominent. If so: implement a local write-ahead buffer — collect tuples during the scan, bulk-insert after — eliminating the reallocation problem while keeping direct-insert for the common non-recursive case.
+
+- [ ] **Direct-load `packed_count` (Phase 3)** — replace `call fn1(rel, col)` (once per fixpoint iteration, full-scan path) with a direct `load.i64` at the known byte offset of `count`/`recent.len()` in `PackedStorage`. Not in the inner loop; defer until Phase 1+2 are benchmarked.
+
+- [ ] **Backend evaluation (Phase 4)** — if fibonacci jit_hot is still >1.5× slower than ascent_macro after Phase 1+2, and residual gap is in Cranelift isel/scheduling: evaluate QBE (~70% of LLVM quality, comparable compile speed) or dynasmrt (hand-written x86-64 for the inner-loop template). Do not pursue before Phase 1 benchmarks confirm structural fixes are insufficient.
+
 - [x] **Cache `packed_data_ptr` for non-recursive rules** — `gen_full_scan_v3` calls `packed_data_ptr` inside the scan loop on every iteration to handle the case where head relation == clause relation (recursive insert can reallocate). For non-recursive rules (head ∉ clause relations), the pointer is stable. Pass a `is_recursive: bool` flag through codegen; only re-fetch inside the loop when true. Applies to Stage 3 and Stage 4. Would reduce inner loop body size by one runtime call.
 
 #### Remaining inner-loop Rust calls (the real floor)
