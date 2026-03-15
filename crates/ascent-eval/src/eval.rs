@@ -330,6 +330,14 @@ struct StratumStage4Runtime {
     _tuple_sets: Vec<Box<crate::jit::storage::JitTupleSet>>,
     /// Flat pointer array parallel to handles_buf (tuple_sets_buf in ctx).
     _tuple_sets_buf: Box<[*const crate::jit::storage::JitTupleSet]>,
+    /// Owned JitHeadBuf boxes (one per (rule, head) pair).
+    _head_buf_boxes: Vec<Box<crate::jit::packed_helpers::JitHeadBuf>>,
+    /// Backing data storage for each JitHeadBuf (kept alive alongside the buf).
+    _head_buf_data: Vec<Vec<u32>>,
+    /// Flat pointer array: head_write_bufs in ctx.
+    _head_write_bufs: Box<[*mut crate::jit::packed_helpers::JitHeadBuf]>,
+    /// Flat pointer array: head_rel_ptrs in ctx.
+    _head_rel_ptrs: Box<[*mut crate::specialized::PackedStorage]>,
 }
 
 #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -959,7 +967,7 @@ impl Engine {
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     fn build_stratum_stage4_runtime(&self, rules: &[&CRule]) -> Option<StratumStage4Runtime> {
-        use crate::jit::packed_helpers::{LookupSpec, PackedJitContextV3, StratumStage4Ctx};
+        use crate::jit::packed_helpers::{JitHeadBuf, LookupSpec, PackedJitContextV3, StratumStage4Ctx};
         use crate::jit_index::JitLookupHandle;
         use crate::relation::Relation;
         use crate::specialized::PackedStorage;
@@ -1151,6 +1159,39 @@ impl Engine {
             ctx.lookup_handles = unsafe { handles_box.as_mut_ptr().add(offset) };
         }
 
+        // Build head write buffers: one JitHeadBuf per (rule_i, head_i) pair.
+        // Also build a parallel head_rel_ptrs array mapping each buf → *mut PackedStorage.
+        const HEAD_BUF_INIT_CAP: u32 = 256;
+        let mut head_buf_boxes: Vec<Box<JitHeadBuf>> = Vec::new();
+        let mut head_buf_data: Vec<Vec<u32>> = Vec::new();
+        let mut head_write_bufs_vec: Vec<*mut JitHeadBuf> = Vec::new();
+        let mut head_rel_ptrs_vec: Vec<*mut PackedStorage> = Vec::new();
+        for (rule_i, rule) in rules.iter().enumerate() {
+            for (hi, head) in rule.heads.iter().enumerate() {
+                let arity = head.args.len();
+                let cap = HEAD_BUF_INIT_CAP;
+                let mut data: Vec<u32> = vec![0u32; cap as usize * arity.max(1)];
+                let data_ptr = data.as_mut_ptr();
+                let buf = Box::new(JitHeadBuf {
+                    data: data_ptr,
+                    len: 0,
+                    cap,
+                    arity: arity as u32,
+                    _pad: 0,
+                });
+                // head_rel_ptrs[rule_head_base + hi] = per_rule_head_rels[rule_i][hi]
+                let rel_ptr = per_rule_head_rels[rule_i][hi];
+                head_buf_boxes.push(buf);
+                head_buf_data.push(data);
+                head_write_bufs_vec.push(head_buf_boxes.last_mut().unwrap().as_mut() as *mut JitHeadBuf);
+                head_rel_ptrs_vec.push(rel_ptr);
+                let _ = (rule_i, hi); // suppress unused warnings
+            }
+        }
+        let total_heads = head_write_bufs_vec.len() as u32;
+        let head_write_bufs_box: Box<[*mut JitHeadBuf]> = head_write_bufs_vec.into_boxed_slice();
+        let head_rel_ptrs_box: Box<[*mut PackedStorage]> = head_rel_ptrs_vec.into_boxed_slice();
+
         // All packed rels for advance()
         let all_rels: Vec<*mut PackedStorage> = self
             .relations
@@ -1177,6 +1218,10 @@ impl Engine {
             total_handles,
             _pad3: 0,
             tuple_sets_buf: tuple_sets_box.as_ptr(),
+            head_write_bufs: head_write_bufs_box.as_ptr(),
+            head_rel_ptrs: head_rel_ptrs_box.as_ptr(),
+            total_heads,
+            _pad4: 0,
         });
 
         Some(StratumStage4Runtime {
@@ -1191,6 +1236,10 @@ impl Engine {
             _per_rule_dedup_handles: per_rule_dedup_handles,
             _tuple_sets: tuple_set_boxes,
             _tuple_sets_buf: tuple_sets_box,
+            _head_buf_boxes: head_buf_boxes,
+            _head_buf_data: head_buf_data,
+            _head_write_bufs: head_write_bufs_box,
+            _head_rel_ptrs: head_rel_ptrs_box,
         })
     }
 

@@ -178,7 +178,7 @@ The true minimum is **zero per-iteration calls + one per rule-invocation for ins
 
 1. **O(n) existence check for fully-bound clauses** — e.g. triangle's `edge(a,c)` where both a and c are already bound. Current asm probes the column index by key `a`, then scans all values for `c` — O(n). ascent_macro does an O(1) HashSet probe. With n≈10 values per key and 7,220 outer iterations, this is ~72,000 unnecessary comparisons per fixpoint iteration.
 
-2. **`packed_try_insert` Rust call for new tuples** — one call per new tuple emitted. Dedup probe is already inline (JitDedupTable), but the actual write still goes through Rust. Need inline insert: write to `data` array directly, insert into dedup set inline, call Rust only on buffer growth (rare).
+2. [x] **`packed_try_insert` Rust call for new tuples** — eliminated via `JitHeadBuf`. At `call_insert`: JIT writes hash+tuple to dedup table slot inline; then writes tuple words to a pre-allocated `JitHeadBuf`. `jit_stratum_advance_s4` calls `jit_flush_head_bufs` before `advance()`, which batch-appends to `PackedStorage` via `insert_packed_raw_no_dedup` (bypasses dedup; guaranteed new by prior inline probe). Buffer overflow (rare) calls `jit_head_buf_grow_and_insert`. Zero Rust calls for new tuples in hot path (one call only on buffer full). Triangle n=20: ~382 µs (was 382 µs on first run after JitTupleSet probe — no regression; change stat −1% p=0.35 vs cached baseline).
 
 3. **Register allocation** — outer-loop-stable variables spill to stack slots, causing load/store on every inner iteration. Step 3a partial fix exists but callee-saved register assignment is not complete for all rule depths.
 

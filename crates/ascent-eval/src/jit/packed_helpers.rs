@@ -6,9 +6,85 @@
 //! bypassing the Value enum entirely. All bindings are flat `u32` arrays.
 //! This eliminates Value cloning, Option<Value> overhead, and enum dispatch.
 
+use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::ptr;
+
 use crate::jit::storage;
 use crate::jit_index::{JitDedupHandle, JitLookupHandle};
 use crate::specialized::PackedStorage;
+
+// ─── JIT head write buffer ────────────────────────────────────────────────
+
+/// Pre-allocated write buffer for a single head relation.
+///
+/// The JIT writes new tuples inline (after the inline dedup probe); after each
+/// stratum iteration, Rust bulk-inserts them into `PackedStorage`.
+///
+/// `repr(C)` layout on 64-bit (24 bytes):
+///   offset  0: data  *mut u32  — write destination (row-major, stride=arity)
+///   offset  8: len   u32       — current tuple count (number written so far)
+///   offset 12: cap   u32       — capacity in tuples
+///   offset 16: arity u32       — arity (compile-time known, stored for Rust flush)
+///   offset 20: _pad  u32
+#[repr(C)]
+pub struct JitHeadBuf {
+    /// Pointer to the flat tuple data (row-major, stride = arity u32s per tuple).
+    pub data: *mut u32,
+    /// Number of tuples written so far.
+    pub len: u32,
+    /// Capacity in tuples.
+    pub cap: u32,
+    /// Arity (number of u32 words per tuple).
+    pub arity: u32,
+    pub _pad: u32,
+}
+
+unsafe impl Send for JitHeadBuf {}
+unsafe impl Sync for JitHeadBuf {}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::offset_of!(JitHeadBuf, data) == 0);
+    assert!(std::mem::offset_of!(JitHeadBuf, len) == 8);
+    assert!(std::mem::offset_of!(JitHeadBuf, cap) == 12);
+    assert!(std::mem::offset_of!(JitHeadBuf, arity) == 16);
+    assert!(std::mem::size_of::<JitHeadBuf>() == 24);
+};
+
+/// Called when `JitHeadBuf` is full: doubles capacity and appends the tuple.
+///
+/// # Safety
+/// `buf` must be a valid `*mut JitHeadBuf`. `tuple` must point to `arity` valid u32s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_head_buf_grow_and_insert(
+    buf: *mut JitHeadBuf,
+    tuple: *const u32,
+    arity: u32,
+) {
+    let buf = unsafe { &mut *buf };
+    let new_cap = (buf.cap as usize * 2).max(16);
+    let layout = Layout::array::<u32>(new_cap * arity as usize).expect("JitHeadBuf layout");
+    let new_data = unsafe { alloc_zeroed(layout) } as *mut u32;
+    // Copy old data and free old allocation.
+    if !buf.data.is_null() && buf.len > 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(
+                buf.data,
+                new_data,
+                buf.len as usize * arity as usize,
+            );
+        }
+        let old_layout =
+            Layout::array::<u32>(buf.cap as usize * arity as usize).expect("JitHeadBuf layout");
+        unsafe { dealloc(buf.data as *mut u8, old_layout) };
+    }
+    buf.data = new_data;
+    buf.cap = new_cap as u32;
+    // Append the new tuple.
+    let dst = unsafe { new_data.add(buf.len as usize * arity as usize) };
+    unsafe { ptr::copy_nonoverlapping(tuple, dst, arity as usize) };
+    buf.len += 1;
+}
 
 /// Result of a packed index lookup — pointer + length to a `&[usize]`.
 #[repr(C)]
@@ -350,6 +426,12 @@ const _: () = {
 ///   offset 48: total_handles   u32                            (4 bytes)
 ///   offset 52: _pad3           u32                            (4 bytes)
 ///   offset 56: tuple_sets_buf  *const *const JitTupleSet      (8 bytes)
+///   offset 64: head_write_bufs *const *mut JitHeadBuf         (8 bytes)
+///             flat array[total_heads] — one per (rule_i, head_i) pair, in rule order.
+///   offset 72: head_rel_ptrs   *const *mut PackedStorage      (8 bytes)
+///             parallel to head_write_bufs; maps buf index → target PackedStorage.
+///   offset 80: total_heads     u32                            (4 bytes)
+///   offset 84: _pad4           u32                            (4 bytes)
 #[repr(C)]
 pub struct StratumStage4Ctx {
     /// Pointer to array of *mut PackedJitContextV3, one per rule.
@@ -370,6 +452,15 @@ pub struct StratumStage4Ctx {
     /// Flat array parallel to handles_buf; each entry is a *const JitTupleSet
     /// for the total relation of that clause, or null if not applicable.
     pub tuple_sets_buf: *const *const storage::JitTupleSet,
+    /// Flat array of `*mut JitHeadBuf`, one per (rule_i, head_i) pair.
+    /// Index = `rule_head_base[rule_i] + hi`.
+    pub head_write_bufs: *const *mut JitHeadBuf,
+    /// Flat array of `*mut PackedStorage`, parallel to `head_write_bufs`.
+    /// Maps each head buf index to its target `PackedStorage`.
+    pub head_rel_ptrs: *const *mut PackedStorage,
+    /// Total number of (rule, head) pairs (= len of head_write_bufs / head_rel_ptrs).
+    pub total_heads: u32,
+    pub _pad4: u32,
 }
 
 unsafe impl Send for StratumStage4Ctx {}
@@ -387,6 +478,9 @@ const _: () = {
     assert!(std::mem::offset_of!(StratumStage4Ctx, lookup_specs) == 40);
     assert!(std::mem::offset_of!(StratumStage4Ctx, total_handles) == 48);
     assert!(std::mem::offset_of!(StratumStage4Ctx, tuple_sets_buf) == 56);
+    assert!(std::mem::offset_of!(StratumStage4Ctx, head_write_bufs) == 64);
+    assert!(std::mem::offset_of!(StratumStage4Ctx, head_rel_ptrs) == 72);
+    assert!(std::mem::offset_of!(StratumStage4Ctx, total_heads) == 80);
 };
 
 /// Insert a packed u32 tuple directly into a relation.
@@ -425,11 +519,43 @@ pub unsafe extern "C" fn jit_stratum_advance(rels: *const *mut PackedStorage, n_
     changed as u8
 }
 
+/// Flush all head write buffers into their target `PackedStorage` relations.
+///
+/// Called once per semi-naive iteration in Stage 4, BEFORE `advance()`.
+/// For each non-empty `JitHeadBuf`, appends each tuple directly to the target
+/// `PackedStorage` without re-checking the dedup table (the JIT already did
+/// the inline probe and wrote to the dedup table).  After appending, resets
+/// `buf.len = 0`.
+///
+/// # Safety
+/// `ctx` must point to a valid `StratumStage4Ctx` with all sub-pointers valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_flush_head_bufs(ctx: *mut StratumStage4Ctx) {
+    let ctx = unsafe { &*ctx };
+    for i in 0..ctx.total_heads as usize {
+        let buf = unsafe { &mut **ctx.head_write_bufs.add(i) };
+        if buf.len == 0 {
+            continue;
+        }
+        let rel = unsafe { &mut **ctx.head_rel_ptrs.add(i) };
+        let arity = buf.arity as usize;
+        let data = unsafe { std::slice::from_raw_parts(buf.data, buf.len as usize * arity) };
+        for t in 0..buf.len as usize {
+            let packed = &data[t * arity..(t + 1) * arity];
+            rel.insert_packed_raw_no_dedup(packed);
+        }
+        buf.len = 0;
+    }
+}
+
 /// Advance all packed relations and refresh all JIT lookup handles.
 ///
 /// Replaces `jit_stratum_advance` in Stage 4: after `advance()`, `PackedStorage`
 /// rebuilds its JIT indices — this function copies the new pointers into the
 /// handle array so JIT code sees fresh data on the next iteration.
+///
+/// Flushes head write buffers first (so newly-emitted tuples enter `delta`
+/// and become `recent` for the next iteration).
 ///
 /// Returns 1 if any relation gained new tuples, 0 otherwise.
 ///
@@ -437,6 +563,8 @@ pub unsafe extern "C" fn jit_stratum_advance(rels: *const *mut PackedStorage, n_
 /// `ctx` must point to a valid `StratumStage4Ctx` with all sub-pointers valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_stratum_advance_s4(ctx: *mut StratumStage4Ctx) -> u8 {
+    // Flush head write bufs into PackedStorage delta BEFORE advance.
+    unsafe { jit_flush_head_bufs(ctx) };
     let ctx = unsafe { &*ctx };
     let changed = unsafe { jit_stratum_advance(ctx.all_rels, ctx.n_all_rels) };
     // Refresh handles — jit_stratum_advance already called advance() on all rels

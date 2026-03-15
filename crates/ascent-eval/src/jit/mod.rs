@@ -7,6 +7,7 @@
 mod codegen;
 pub(crate) mod helpers;
 pub(crate) mod layout;
+pub mod storage;
 #[cfg(feature = "specialized")]
 mod packed_codegen;
 #[cfg(feature = "specialized")]

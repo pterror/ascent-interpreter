@@ -47,7 +47,7 @@ use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi, DynamicLabel};
 use dynasmrt::x64::Assembler;
 
 use crate::compiled::{CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CUnOp};
-use crate::jit::packed_helpers::StratumStage4Fn;
+use crate::jit::packed_helpers::{StratumStage4Fn, jit_head_buf_grow_and_insert};
 use crate::jit::storage;
 use crate::value::Value;
 
@@ -277,7 +277,7 @@ fn emit_store_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
 ///
 /// # JitTupleSet layout (from storage.rs)
 /// - slots @ 0, mask @ 8, len @ 16
-/// - stride = arity + 1 = 4 words per slot (for arity 3)
+/// - stride = arity + 1 words per slot
 /// - slot[0] = hash_tag (0 = empty), slot[1..4] = tuple words
 fn emit_tuple_set_probe(
     asm: &mut Assembler,
@@ -287,12 +287,14 @@ fn emit_tuple_set_probe(
     var_locs: &[VarLoc],
 ) -> Result<(), String> {
     let arity = clause.args.len();
-    // For arity <= 2, the existing col-value contiguous path is already O(1) for
-    // fully-bound existence checks and is faster than a JitTupleSet probe.
-    // Only use the tuple-set path for arity >= 3 where no other fast path exists.
+    // For arity <= 2, the col-value contiguous path already handles fully-bound existence
+    // checks: sorted values + early exit means the scan terminates on the first comparison
+    // for dense/high-hit-rate graphs (benchmarked at n=20 complete graph). The JitTupleSet
+    // probe adds 3-pointer-dereference overhead that outweighs the hash benefit at small n.
+    // For arity >= 3, no col-value fast path exists so JitTupleSet is the only O(1) option.
     if arity < 3 {
         return Err(format!(
-            "emit_tuple_set_probe: arity {arity} skipped (existing col-value path is faster)"
+            "emit_tuple_set_probe: arity {arity} uses col-value path"
         ));
     }
     if arity > 3 {
@@ -311,7 +313,6 @@ fn emit_tuple_set_probe(
         }
     }
 
-    // arity == 3 from here on.
     let handle_idx_i32 = (handle_idx * 8) as i32;
 
     // Load JitTupleSet pointer: ctx->tuple_sets_buf[handle_idx]
@@ -321,9 +322,6 @@ fn emit_tuple_set_probe(
         ; mov rdi, [rdi + handle_idx_i32]  // *const JitTupleSet for this clause
     );
 
-    // Null check: if tuple_sets_buf slot is null, skip fast path
-    dynasm!(asm; test rdi, rdi; jz =>when_exhausted);
-
     // Load JitTupleSet fields
     // r8 = slots ptr (offset 0), r9 = mask (offset 8, u64)
     dynasm!(asm
@@ -331,8 +329,7 @@ fn emit_tuple_set_probe(
         ; mov r9, [rdi + 8]  // r9 = mask
     );
 
-    // Load args into registers: edi=arg0, esi=arg1, r11d=arg2
-    // Each arg is loaded into eax first, then moved to the target register.
+    // Load args into registers: edi=arg0, esi=arg1 (arity>=2), r11d=arg2 (arity==3).
     macro_rules! load_clause_arg {
         ($asm:expr, $idx:expr, $tgt:ident) => {
             match &clause.args[$idx] {
@@ -353,19 +350,15 @@ fn emit_tuple_set_probe(
     }
 
     load_clause_arg!(asm, 0, edi);
-    load_clause_arg!(asm, 1, esi);
-    load_clause_arg!(asm, 2, r11d);
+    if arity >= 2 { load_clause_arg!(asm, 1, esi); }
+    if arity >= 3 { load_clause_arg!(asm, 2, r11d); }
 
-    // Compute tuple_hash(words) for 3 words:
-    //   h = 0x9e3779b9
-    //   h = h * 0x9e3779b9 + arg0
-    //   h = h * 0x9e3779b9 + arg1
-    //   h = h * 0x9e3779b9 + arg2
-    //   if h == 0: h = 1
+    // Compute tuple_hash(words):
+    //   h = 0x9e3779b9; for each word w: h = h*0x9e3779b9 + w; if h==0: h=1
     dynasm!(asm; mov eax, 0x9e3779b9u32 as i32);
     dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, edi);
-    dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, esi);
-    dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, r11d);
+    if arity >= 2 { dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, esi); }
+    if arity >= 3 { dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, r11d); }
 
     let hash_ok = asm.new_dynamic_label();
     dynasm!(asm; test eax, eax; jnz =>hash_ok; mov eax, 1; =>hash_ok);
@@ -374,30 +367,36 @@ fn emit_tuple_set_probe(
     // r10 = slot index = hash & mask
     dynasm!(asm; mov r10, rax; and r10, r9);
 
-    // Probe loop: stride = 4 (arity+1=4), so rcx = r10 * 4
+    // Probe loop: stride = arity+1 words.
+    //   arity=1 → stride=2: rcx = r10*2 (lea [r10+r10])
+    //   arity=2 → stride=3: rcx = r10*3 (lea [r10+r10*2])
+    //   arity=3 → stride=4: rcx = r10*4 (lea [r10+r10*3])
     let probe_lp   = asm.new_dynamic_label();
     let probe_next = asm.new_dynamic_label();
     let probe_done = asm.new_dynamic_label();
 
     dynasm!(asm; =>probe_lp);
-    // stride=4: rcx = r10*4
-    dynasm!(asm; lea rcx, [r10 + r10*3]);  // r10 * 4
+    match arity {
+        1 => dynasm!(asm; lea rcx, [r10 + r10]),
+        2 => dynasm!(asm; lea rcx, [r10 + r10*2]),
+        _ => dynasm!(asm; lea rcx, [r10 + r10*3]),
+    }
 
     // Check hash_tag
     dynasm!(asm
-        ; mov eax, [r8 + rcx*4]   // hash_tag = slots[slot*4]
+        ; mov eax, [r8 + rcx*4]   // hash_tag
         ; test eax, eax
         ; je =>when_exhausted      // empty → not found
-        ; cmp eax, edx            // hash matches?
+        ; cmp eax, edx             // hash tag matches?
         ; jne =>probe_next
     );
 
-    // Full comparison: slots[slot*4 + 1] == arg0, +2 == arg1, +3 == arg2
-    dynasm!(asm; cmp [r8 + rcx*4 + 4], edi;  jne =>probe_next);
-    dynasm!(asm; cmp [r8 + rcx*4 + 8], esi;  jne =>probe_next);
-    dynasm!(asm; cmp [r8 + rcx*4 + 12], r11d; jne =>probe_next);
+    // Full tuple comparison
+    dynasm!(asm; cmp [r8 + rcx*4 + 4], edi; jne =>probe_next);
+    if arity >= 2 { dynasm!(asm; cmp [r8 + rcx*4 + 8], esi;   jne =>probe_next); }
+    if arity >= 3 { dynasm!(asm; cmp [r8 + rcx*4 + 12], r11d; jne =>probe_next); }
 
-    // Found!
+    // Found — fall through
     dynasm!(asm; jmp =>probe_done);
 
     dynasm!(asm; =>probe_next);
@@ -580,7 +579,16 @@ fn emit_bind_col_value(
 
 // ─── Head emission ────────────────────────────────────────────────────────
 
-/// Build and insert all heads: inline dedup probe + `packed_try_insert`.
+/// Build and insert all heads: inline dedup probe + inline buffer write.
+///
+/// When the inline dedup probe finds a new tuple (empty slot hit), we:
+///   1. Write hash + tuple words to the dedup table slot (at `rsi`).
+///   2. Write the tuple to the pre-allocated `JitHeadBuf` at
+///      `ctx->head_write_bufs[head_buf_base + hi]`.
+///
+/// The Rust flush step (post-stratum) reads the buffers and appends to
+/// `PackedStorage` directly, bypassing the dedup check (already done here).
+#[allow(clippy::too_many_arguments)]
 fn emit_heads(
     asm: &mut Assembler,
     heads: &[CHeadClause],
@@ -589,6 +597,7 @@ fn emit_heads(
     max_head_arity: usize,
     pti: usize,
     var_locs: &[VarLoc],
+    head_buf_base: usize,
 ) -> Result<(), String> {
     for (hi, head) in heads.iter().enumerate() {
         let arity = head.args.len();
@@ -599,13 +608,13 @@ fn emit_heads(
             dynasm!(asm; mov [rbp + head_col_slot(var_count, max_head_arity, col)], eax);
         }
 
-        load_rule_ctx!(asm, rule_i);
-        dynasm!(asm
-            ; mov rax, [rax + 16i8]
-            ; mov r8, [rax + hoff]
-        );
-
         if arity == 0 {
+            // Zero-arity: no dedup table in JIT; fall back to packed_try_insert.
+            load_rule_ctx!(asm, rule_i);
+            dynasm!(asm
+                ; mov rax, [rax + 16i8]
+                ; mov r8, [rax + hoff]
+            );
             dynasm!(asm; mov rdi, r8; xor rsi, rsi; xor edx, edx);
             call_abs!(asm, pti);
             continue;
@@ -613,19 +622,24 @@ fn emit_heads(
 
         let t0_off = head_col_slot(var_count, max_head_arity, 0);
 
+        // Load JitDedupHandle for this head:
+        //   rule_ctx->head_dedup_handles[hi] → *mut JitDedupHandle
+        //   JitDedupHandle: entries @ 0, cap @ 8
         load_rule_ctx!(asm, rule_i);
         dynasm!(asm
-            ; mov rax, [rax + 32i8]
-            ; mov r10, [rax + hoff]
-            ; mov r11, [r10]
-            ; mov r10d, [r10 + 8i8]
+            ; mov rax, [rax + 32i8]      // head_dedup_handles ptr
+            ; mov r10, [rax + hoff]      // *mut JitDedupHandle
+            ; mov r11, [r10]             // r11 = entries (*mut u32)
+            ; mov r10d, [r10 + 8i8]     // r10d = cap (u32)
         );
 
         let call_insert = asm.new_dynamic_label();
         let after_emit = asm.new_dynamic_label();
 
+        // If cap == 0, the dedup table is uninitialized; must insert via Rust.
         dynasm!(asm; test r10d, r10d; jz =>call_insert);
 
+        // Compute hash (same as jit_dedup_hash): h = 0; for each word: h = h*KNUTH + word
         dynasm!(asm; xor eax, eax);
         for col in 0..arity {
             dynasm!(asm
@@ -633,8 +647,10 @@ fn emit_heads(
                 ; add eax, [rbp + head_col_slot(var_count, max_head_arity, col)]
             );
         }
+        // Remap hash 0xFFFFFFFF (-1) → 0xFFFFFFFE (avoid sentinel)
         dynasm!(asm; cmp eax, -1i32; jne >no_remap; dec eax; no_remap:);
 
+        // probe: mask = cap - 1 (in rcx), slot = hash & mask (in rdx)
         dynasm!(asm
             ; lea rcx, [r10 - 1]
             ; mov edx, eax
@@ -648,13 +664,14 @@ fn emit_heads(
         dynasm!(asm; =>probe_lp);
         dynasm!(asm
             ; imul rsi, rdx, stride_d
-            ; add rsi, r11
-            ; mov edi, [rsi]
+            ; add rsi, r11              // rsi = &slot[0]
+            ; mov edi, [rsi]            // edi = slot hash
             ; cmp edi, -1i32
-            ; je =>call_insert
+            ; je =>call_insert          // empty slot → new tuple
             ; cmp edi, eax
-            ; jne =>probe_nx
+            ; jne =>probe_nx            // hash mismatch → next slot
         );
+        // Hash match: compare tuple words
         for col in 0..arity {
             dynasm!(asm
                 ; mov edi, [rsi + ((1+col)*4) as i32]
@@ -663,21 +680,99 @@ fn emit_heads(
                 ; jne =>probe_nx
             );
         }
+        // All words match → duplicate, skip
         dynasm!(asm; jmp =>after_emit);
 
         dynasm!(asm; =>probe_nx);
         dynasm!(asm; inc rdx; and rdx, rcx; jmp =>probe_lp);
 
+        // ── call_insert: new tuple found; rsi = &empty dedup slot, eax = hash ──
         dynasm!(asm; =>call_insert);
-        load_rule_ctx!(asm, rule_i);
+
+        // Step 1: write hash + tuple words to the dedup slot at rsi.
+        // (When cap == 0 path branches here, rsi is garbage — but the table is
+        //  about to be grown by packed_try_insert anyway, so we can skip the
+        //  dedup write in that case.  We detect cap==0 via r10d.)
+        let do_dedup_write = asm.new_dynamic_label();
+        let dedup_done = asm.new_dynamic_label();
+        dynasm!(asm; test r10d, r10d; jz =>do_dedup_write);
+        // cap > 0: write hash + tuple to slot
+        dynasm!(asm; mov [rsi], eax);
+        for col in 0..arity {
+            dynasm!(asm
+                ; mov edi, [rbp + head_col_slot(var_count, max_head_arity, col)]
+                ; mov [rsi + ((1+col)*4) as i32], edi
+            );
+        }
+        dynasm!(asm; jmp =>dedup_done);
+        dynasm!(asm; =>do_dedup_write);
+        // cap == 0: fall through to packed_try_insert slow path which will grow dedup table
+        // (We skip the inline buf write too; let the Rust path handle it.)
+        {
+            load_rule_ctx!(asm, rule_i);
+            dynasm!(asm
+                ; mov rax, [rax + 16i8]
+                ; mov rdi, [rax + hoff]
+                ; lea rsi, [rbp + t0_off]
+                ; mov edx, arity as i32
+            );
+            call_abs!(asm, pti);
+            dynasm!(asm; jmp =>after_emit);
+        }
+        dynasm!(asm; =>dedup_done);
+
+        // Step 2: write tuple to JitHeadBuf.
+        // ctx->head_write_bufs is at offset 64 in StratumStage4Ctx.
+        // head_buf_idx = head_buf_base + hi (compile-time constant).
+        let head_buf_idx: i32 = (head_buf_base + hi) as i32;
+
+        // rcx = ctx->head_write_bufs[head_buf_idx]  (*mut JitHeadBuf)
         dynasm!(asm
-            ; mov rax, [rax + 16i8]
-            ; mov rdi, [rax + hoff]
+            ; mov rcx, [rbp + CTX_SLOT]          // ctx
+            ; mov rcx, [rcx + 64i8]              // head_write_bufs ptr
+            ; mov rcx, [rcx + head_buf_idx * 8]  // *mut JitHeadBuf
+        );
+
+        // r8 = buf.data (@ 0), r9d = buf.len (@ 8), compare buf.cap (@ 12)
+        dynasm!(asm
+            ; mov r8, [rcx]          // r8 = buf.data
+            ; mov r9d, [rcx + 8i8]  // r9d = buf.len
+            ; cmp r9d, [rcx + 12i8] // len >= cap?
+        );
+
+        let grow_path = asm.new_dynamic_label();
+        let buf_done = asm.new_dynamic_label();
+        dynasm!(asm; jge =>grow_path);
+
+        // Fast path: buf has room — write tuple words at data + len*arity*4
+        // Compute byte offset: len * arity * 4.  For arity <= 8 use imul/lea.
+        let arity_bytes: i32 = (arity * 4) as i32;
+        dynasm!(asm; imul r9, r9, arity_bytes);       // r9 = len * arity * 4
+        dynasm!(asm; add r8, r9);                     // r8 = data + offset
+        for col in 0..arity {
+            dynasm!(asm
+                ; mov edi, [rbp + head_col_slot(var_count, max_head_arity, col)]
+                ; mov [r8 + (col*4) as i32], edi
+            );
+        }
+        // buf.len++
+        dynasm!(asm
+            ; mov r9d, [rcx + 8i8]
+            ; inc r9d
+            ; mov [rcx + 8i8], r9d
+        );
+        dynasm!(asm; jmp =>buf_done);
+
+        // Slow path: buffer full — call Rust grow+insert
+        dynasm!(asm; =>grow_path);
+        dynasm!(asm
+            ; mov rdi, rcx
             ; lea rsi, [rbp + t0_off]
             ; mov edx, arity as i32
         );
-        call_abs!(asm, pti);
+        call_abs!(asm, jit_head_buf_grow_and_insert as usize);
 
+        dynasm!(asm; =>buf_done);
         dynasm!(asm; =>after_emit);
     }
     Ok(())
@@ -706,6 +801,8 @@ struct EmitParams<'a> {
     var_locs: &'a [VarLoc],
     /// Absolute starting index of this rule in the flat handles_buf / tuple_sets_buf.
     rule_handle_base: usize,
+    /// Absolute starting index of this rule in the flat head_write_bufs array.
+    head_buf_base: usize,
 }
 
 /// Emit code for clause `level` and all deeper clauses.
@@ -791,7 +888,7 @@ fn emit_clause_level(
                 emit_expr(asm, expr, p.var_locs)?;
                 dynasm!(asm; test eax, eax; jz =>outer_continue);
             }
-            emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
+            emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.head_buf_base)?;
         } else {
             // Multi-clause: recurse into level 1.
             // The level-1 code is emitted inline here; it ends by jumping to
@@ -831,7 +928,7 @@ fn emit_clause_level(
                         emit_expr(asm, expr, p.var_locs)?;
                         dynasm!(asm; test eax, eax; jz =>when_exhausted);
                     }
-                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
+                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.head_buf_base)?;
                     dynasm!(asm; jmp =>when_exhausted);
                 } else {
                     emit_clause_level(asm, p, level + 1, outer_exit, when_exhausted)?;
@@ -1038,7 +1135,7 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.head_buf_base)?;
                 // For col-value existence checks (all cols bound, values sorted unique):
                 // at most one match can exist, so skip the remaining scan after emitting.
                 if is_col_value && clause.fresh_cols.is_empty() {
@@ -1121,7 +1218,7 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.head_buf_base)?;
                 // Fall to inner_continue
             } else {
                 // Not last: recurse to level+1.
@@ -1166,6 +1263,7 @@ fn emit_rule_variant(
     pdptr: usize,
     prptr: usize,
     rule_handle_base: usize,
+    head_buf_base: usize,
 ) -> Result<(), String> {
     let variant_exit = asm.new_dynamic_label();
 
@@ -1193,7 +1291,7 @@ fn emit_rule_variant(
             emit_expr(asm, expr, &var_locs)?;
             dynasm!(asm; test eax, eax; jz =>variant_exit);
         }
-        emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti, &var_locs)?;
+        emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti, &var_locs, head_buf_base)?;
         dynasm!(asm; =>variant_exit);
         return Ok(());
     }
@@ -1214,6 +1312,7 @@ fn emit_rule_variant(
         pcount,
         var_locs: &var_locs,
         rule_handle_base,
+        head_buf_base,
     };
 
     emit_clause_level(asm, &p, 0, variant_exit, variant_exit)?;
@@ -1310,6 +1409,18 @@ pub fn codegen_stratum_asm(
         bases
     };
 
+    // Compute per-rule base index into the flat head_write_bufs array.
+    // Each rule contributes heads.len() entries.
+    let head_buf_bases: Vec<usize> = {
+        let mut bases = Vec::with_capacity(rules.len());
+        let mut offset = 0usize;
+        for (_, heads, _) in rules.iter() {
+            bases.push(offset);
+            offset += heads.len();
+        }
+        bases
+    };
+
     // Full variants
     for (rule_i, (clauses, heads, conds)) in rules.iter().enumerate() {
         emit_rule_variant(
@@ -1318,6 +1429,7 @@ pub fn codegen_stratum_asm(
             packed_try_insert_addr, packed_count_addr,
             packed_data_ptr_addr, packed_recent_ptr_addr,
             rule_handle_bases[rule_i],
+            head_buf_bases[rule_i],
         )?;
     }
 
@@ -1338,6 +1450,7 @@ pub fn codegen_stratum_asm(
                 packed_try_insert_addr, packed_count_addr,
                 packed_data_ptr_addr, packed_recent_ptr_addr,
                 rule_handle_bases[rule_i],
+                head_buf_bases[rule_i],
             )?;
         }
     }
