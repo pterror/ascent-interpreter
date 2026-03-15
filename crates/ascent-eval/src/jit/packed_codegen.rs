@@ -43,7 +43,7 @@ pub(crate) struct FuncRefsV3 {
     pub(crate) packed_count: cranelift_codegen::ir::FuncRef,
     pub(crate) packed_data_ptr: cranelift_codegen::ir::FuncRef,
     pub(crate) packed_recent_ptr: cranelift_codegen::ir::FuncRef,
-    pub(crate) packed_try_insert: cranelift_codegen::ir::FuncRef,
+    pub(crate) packed_try_insert_jit: cranelift_codegen::ir::FuncRef,
 }
 
 /// Fields loaded from PackedJitContext at function entry.
@@ -816,7 +816,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
         packed_count: module.declare_func_in_func(helpers.packed_count, &mut ctx.func),
         packed_data_ptr: module.declare_func_in_func(helpers.packed_data_ptr, &mut ctx.func),
         packed_recent_ptr: module.declare_func_in_func(helpers.packed_recent_ptr, &mut ctx.func),
-        packed_try_insert: module.declare_func_in_func(helpers.packed_try_insert, &mut ctx.func),
+        packed_try_insert_jit: module.declare_func_in_func(helpers.packed_try_insert_jit, &mut ctx.func),
     };
 
     let mut builder = FunctionBuilder::new(&mut ctx.func, builder_ctx);
@@ -869,6 +869,26 @@ pub(crate) fn codegen_packed_rule_body_v3(
     // Loop-counter Variables start after binding Variables to avoid ID conflicts.
     let mut next_var = var_count;
 
+    // Hoist packed_data_ptr for non-recursive clause relations out of all loop nesting.
+    // For EDB (non-recursive) relations the packed buffer pointer is stable across the
+    // entire rule evaluation; compute it once here instead of once per outer-loop iteration.
+    let precomputed_packed_bufs: Vec<Option<CValue>> = clauses
+        .iter()
+        .enumerate()
+        .map(|(clause_offset, (_, clause))| {
+            let is_recursive = rule.heads.iter().any(|h| h.relation == clause.relation);
+            if !is_recursive {
+                let rel_off = builder.ins().iconst(ptr_type, (clause_offset as i64) * 8);
+                let rel_addr = builder.ins().iadd(rels, rel_off);
+                let rel_p = builder.ins().load(ptr_type, MemFlags::trusted(), rel_addr, 0);
+                let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_p]);
+                Some(builder.inst_results(call)[0])
+            } else {
+                None
+            }
+        })
+        .collect();
+
     gen_clauses_v3(
         &mut builder,
         &clauses,
@@ -884,6 +904,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
         ptr_type,
         &mut next_var,
         &conditions,
+        &precomputed_packed_bufs,
     );
 
     builder.ins().return_(&[]);
@@ -913,6 +934,7 @@ pub(crate) fn gen_clauses_v3(
     ptr_type: cranelift_codegen::ir::Type,
     next_var: &mut usize,
     conditions: &[&CExpr],
+    precomputed_packed_bufs: &[Option<CValue>],
 ) {
     if clause_offset >= clauses.len() {
         if !conditions.is_empty() {
@@ -958,14 +980,14 @@ pub(crate) fn gen_clauses_v3(
             builder, clause, rel_ptr, arity, use_recent, use_recent_val,
             clauses, clause_offset, recent_clause_idx, rels, vars, head_rels,
             lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
-            is_recursive,
+            is_recursive, precomputed_packed_bufs,
         );
     } else {
         gen_index_scan_v3(
             builder, clause, rel_ptr, arity, use_recent,
             clauses, clause_offset, recent_clause_idx, rels, vars, head_rels,
             lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
-            is_recursive,
+            is_recursive, precomputed_packed_bufs,
         );
     }
 }
@@ -991,21 +1013,17 @@ fn gen_full_scan_v3(
     ptr_type: cranelift_codegen::ir::Type,
     next_var: &mut usize,
     conditions: &[&CExpr],
-    is_recursive: bool,
+    _is_recursive: bool,
+    precomputed_packed_bufs: &[Option<CValue>],
 ) {
     let call = builder.ins().call(func_refs.packed_count, &[rel_ptr, use_recent_val]);
     let count = builder.inst_results(call)[0];
 
     // For non-recursive rules the packed_data buffer cannot be reallocated during
-    // the scan, so we fetch the pointer once here (before the loop) and reuse it.
+    // the scan, so we use the pointer hoisted before all loop nesting.
     // For recursive rules (head writes to this clause's relation) we must re-fetch
     // on every iteration because packed_try_insert may grow the Vec.
-    let cached_packed_buf = if !is_recursive {
-        let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
-        Some(builder.inst_results(call)[0])
-    } else {
-        None
-    };
+    let cached_packed_buf = precomputed_packed_bufs.get(clause_offset).copied().flatten();
 
     // For recent scans, fetch the recent-index array pointer once before the loop.
     // recent[i] is a usize (pointer-sized) stored at recent_ptr + i * ptr_size.
@@ -1099,7 +1117,7 @@ fn gen_full_scan_v3(
     gen_clauses_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
         rels, vars, head_rels, lookup_handles, head_dedup_handles,
-        func_refs, heads, ptr_type, next_var, conditions,
+        func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
     );
 
     builder.ins().jump(continue_block, &[]);
@@ -1151,6 +1169,7 @@ fn gen_index_scan_v3(
     next_var: &mut usize,
     conditions: &[&CExpr],
     is_recursive: bool,
+    precomputed_packed_bufs: &[Option<CValue>],
 ) {
     let primary_col = clause.bound_cols[0];
     let key_i32 = load_bound_val_vars(builder, clause, primary_col, vars);
@@ -1206,13 +1225,8 @@ fn gen_index_scan_v3(
         builder.append_block_param(after_probe, I32);
     }
 
-    // Cache packed_data_ptr before entering loops (stable for non-recursive rules).
-    let cached_packed_buf = if !is_recursive {
-        let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
-        Some(builder.inst_results(call)[0])
-    } else {
-        None
-    };
+    // Use the packed_data_ptr hoisted before all loop nesting (stable for non-recursive rules).
+    let cached_packed_buf = precomputed_packed_bufs.get(clause_offset).copied().flatten();
 
     builder.ins().jump(probe_loop, &[]);
 
@@ -1429,7 +1443,7 @@ fn gen_index_scan_v3(
         gen_clauses_v3(
             builder, clauses, clause_offset + 1, recent_clause_idx,
             rels, vars, head_rels, lookup_handles, head_dedup_handles,
-            func_refs, heads, ptr_type, next_var, conditions,
+            func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
         );
 
         builder.ins().jump(continue_block, &[]);
@@ -1584,7 +1598,7 @@ fn gen_index_scan_v3(
         gen_clauses_v3(
             builder, clauses, clause_offset + 1, recent_clause_idx,
             rels, vars, head_rels, lookup_handles, head_dedup_handles,
-            func_refs, heads, ptr_type, next_var, conditions,
+            func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
         );
 
         builder.ins().jump(continue_block, &[]);
@@ -1651,21 +1665,24 @@ fn gen_emit_heads_v3(
         if arity == 0 {
             let null = builder.ins().iconst(ptr_type, 0);
             let arity_val = builder.ins().iconst(I32, 0);
-            builder.ins().call(func_refs.packed_try_insert, &[head_rel, null, arity_val]);
+            builder.ins().call(func_refs.packed_try_insert_jit, &[head_rel, null, arity_val]);
             continue;
         }
 
-        // Build candidate tuple in a stack slot.
+        // Build candidate tuple in a stack slot (needed for packed_try_insert pointer).
+        // Keep computed values in col_vals to avoid redundant stack reloads.
         let slot = builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             (arity * 4) as u32,
             2,
         ));
+        let mut col_vals = Vec::with_capacity(arity);
         for (col, arg) in head.args.iter().enumerate() {
             let val = compile_packed_expr_vars(builder, arg, vars)
                 .expect("head expr: supported by eligibility check");
             let slot_addr = builder.ins().stack_addr(ptr_type, slot, (col * 4) as i32);
             builder.ins().store(MemFlags::trusted(), val, slot_addr, 0);
+            col_vals.push(val);
         }
         let slot_addr = builder.ins().stack_addr(ptr_type, slot, 0);
         let arity_val = builder.ins().iconst(I32, arity as i64);
@@ -1694,8 +1711,7 @@ fn gen_emit_heads_v3(
         // Compute polynomial hash of candidate tuple (matches `jit_dedup_hash`):
         //   h = 0; for each col: h = h * 0x9e3779b9 + val; remap FFFF_FFFF → FFFF_FFFE.
         let mut hash_val = builder.ins().iconst(I32, 0);
-        for col in 0..arity {
-            let v = builder.ins().stack_load(I32, slot, (col * 4) as i32);
+        for &v in &col_vals {
             let mult = builder.ins().imul_imm(hash_val, 0x9e3779b9u32 as i64);
             hash_val = builder.ins().iadd(mult, v);
         }
@@ -1770,12 +1786,11 @@ fn gen_emit_heads_v3(
         let entry_ptr_v = builder.ins().iadd(entries, byte_off_v);
 
         let mut mismatch_predecessors: usize = 0; // count edges into probe_next from here
-        for col in 0..arity {
+        for (col, &cand) in col_vals.iter().enumerate() {
             // stored field is at byte offset (1 + col) * 4 relative to entry_ptr
             let stored = builder.ins().load(
                 I32, MemFlags::trusted(), entry_ptr_v, ((1 + col) * 4) as i32,
             );
-            let cand = builder.ins().stack_load(I32, slot, (col * 4) as i32);
             let not_eq = builder.ins().icmp(IntCC::NotEqual, stored, cand);
             let pass_block = builder.create_block();
             builder.ins().brif(not_eq, probe_next, &[], pass_block, &[]);
@@ -1797,7 +1812,7 @@ fn gen_emit_heads_v3(
         // call_insert has two predecessors: the cap==0 branch and the empty-slot branch.
         builder.switch_to_block(call_insert);
         builder.seal_block(call_insert);
-        builder.ins().call(func_refs.packed_try_insert, &[head_rel, slot_addr, arity_val]);
+        builder.ins().call(func_refs.packed_try_insert_jit, &[head_rel, slot_addr, arity_val]);
         builder.ins().jump(after_emit, &[]);
 
         // ── after_emit ───────────────────────────────────────────────────────────

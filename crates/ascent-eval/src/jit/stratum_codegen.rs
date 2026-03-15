@@ -374,7 +374,7 @@ pub(crate) fn codegen_stratum_stage4_fn(
         packed_count: module.declare_func_in_func(helpers.packed_count, &mut codegen_ctx.func),
         packed_data_ptr: module.declare_func_in_func(helpers.packed_data_ptr, &mut codegen_ctx.func),
         packed_recent_ptr: module.declare_func_in_func(helpers.packed_recent_ptr, &mut codegen_ctx.func),
-        packed_try_insert: module.declare_func_in_func(helpers.packed_try_insert, &mut codegen_ctx.func),
+        packed_try_insert_jit: module.declare_func_in_func(helpers.packed_try_insert_jit, &mut codegen_ctx.func),
     };
 
     let mut builder = FunctionBuilder::new(&mut codegen_ctx.func, builder_ctx);
@@ -552,6 +552,23 @@ fn emit_rule_bodies(
 
         let cond_refs: Vec<&CExpr> = conditions.iter().collect();
 
+        let precomputed_packed_bufs: Vec<Option<cranelift_codegen::ir::Value>> = indexed_clauses
+            .iter()
+            .enumerate()
+            .map(|(clause_offset, (_, clause))| {
+                let is_recursive = heads.iter().any(|h| h.relation == clause.relation);
+                if !is_recursive {
+                    let rel_off = builder.ins().iconst(ptr_t, (clause_offset as i64) * 8);
+                    let rel_addr = builder.ins().iadd(rels_i, rel_off);
+                    let rel_p = builder.ins().load(ptr_t, MemFlags::trusted(), rel_addr, 0);
+                    let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_p]);
+                    Some(builder.inst_results(call)[0])
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         gen_clauses_v3(
             builder,
             &indexed_clauses,
@@ -567,6 +584,7 @@ fn emit_rule_bodies(
             ptr_t,
             next_var,
             &cond_refs,
+            &precomputed_packed_bufs,
         );
         // After gen_clauses_v3, the builder is at the loop_exit block of the
         // outermost scan. We need to connect to the next rule or the continuation.
@@ -609,6 +627,23 @@ fn emit_recent_rule_bodies(
 
         let cond_refs: Vec<&CExpr> = conditions.iter().collect();
 
+        let precomputed_packed_bufs: Vec<Option<cranelift_codegen::ir::Value>> = indexed_clauses
+            .iter()
+            .enumerate()
+            .map(|(clause_offset, (_, clause))| {
+                let is_recursive = heads.iter().any(|h| h.relation == clause.relation);
+                if !is_recursive {
+                    let rel_off = builder.ins().iconst(ptr_t, (clause_offset as i64) * 8);
+                    let rel_addr = builder.ins().iadd(rels_i, rel_off);
+                    let rel_p = builder.ins().load(ptr_t, MemFlags::trusted(), rel_addr, 0);
+                    let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_p]);
+                    Some(builder.inst_results(call)[0])
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // recent_clause_idx = the body index of the "recent" clause in this variant.
         // Since indexed_clauses uses 0-based sequential indices, recent = clause_seq.
         gen_clauses_v3(
@@ -626,6 +661,7 @@ fn emit_recent_rule_bodies(
             ptr_t,
             next_var,
             &cond_refs,
+            &precomputed_packed_bufs,
         );
 
         if emit_i + 1 < recent_emissions.len() {
