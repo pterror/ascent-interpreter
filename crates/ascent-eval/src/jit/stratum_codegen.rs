@@ -409,6 +409,11 @@ pub(crate) fn codegen_stratum_stage4_fn(
 
     builder.seal_block(entry);
 
+    let scan_info_offset = std::mem::offset_of!(
+        crate::specialized::PackedStorage,
+        scan_info
+    ) as i32;
+
     // Load StratumStage4Ctx fields
     let rule_ctxs_val = builder.ins().load(ptr_t, MemFlags::trusted(), stage4_ctx, 0i32);
 
@@ -440,6 +445,7 @@ pub(crate) fn codegen_stratum_stage4_fn(
         &vars,
         &mut next_var,
         post_full,
+        scan_info_offset,
     );
 
     // ─── post_full: initial advance ──────────────────────────────────────────
@@ -488,6 +494,7 @@ pub(crate) fn codegen_stratum_stage4_fn(
             &vars,
             &mut recent_next_var,
             post_inner,
+            scan_info_offset,
         );
     }
 
@@ -529,6 +536,7 @@ fn emit_rule_bodies(
     vars: &[Variable],
     next_var: &mut usize,
     continuation: Block,
+    scan_info_offset: i32,
 ) {
     if rules.is_empty() {
         builder.ins().jump(continuation, &[]);
@@ -561,8 +569,8 @@ fn emit_rule_bodies(
                     let rel_off = builder.ins().iconst(ptr_t, (clause_offset as i64) * 8);
                     let rel_addr = builder.ins().iadd(rels_i, rel_off);
                     let rel_p = builder.ins().load(ptr_t, MemFlags::trusted(), rel_addr, 0);
-                    let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_p]);
-                    Some(builder.inst_results(call)[0])
+                    let data_ptr = builder.ins().load(ptr_t, MemFlags::trusted(), rel_p, scan_info_offset);
+                    Some(data_ptr)
                 } else {
                     None
                 }
@@ -585,6 +593,7 @@ fn emit_rule_bodies(
             next_var,
             &cond_refs,
             &precomputed_packed_bufs,
+            Some(scan_info_offset),
         );
         // After gen_clauses_v3, the builder is at the loop_exit block of the
         // outermost scan. We need to connect to the next rule or the continuation.
@@ -612,6 +621,7 @@ fn emit_recent_rule_bodies(
     vars: &[Variable],
     next_var: &mut usize,
     continuation: Block,
+    scan_info_offset: i32,
 ) {
     for (emit_i, &(rule_i, clause_seq)) in recent_emissions.iter().enumerate() {
         let (clauses, heads, conditions) = &rules[rule_i];
@@ -636,8 +646,8 @@ fn emit_recent_rule_bodies(
                     let rel_off = builder.ins().iconst(ptr_t, (clause_offset as i64) * 8);
                     let rel_addr = builder.ins().iadd(rels_i, rel_off);
                     let rel_p = builder.ins().load(ptr_t, MemFlags::trusted(), rel_addr, 0);
-                    let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_p]);
-                    Some(builder.inst_results(call)[0])
+                    let data_ptr = builder.ins().load(ptr_t, MemFlags::trusted(), rel_p, scan_info_offset);
+                    Some(data_ptr)
                 } else {
                     None
                 }
@@ -662,6 +672,7 @@ fn emit_recent_rule_bodies(
             next_var,
             &cond_refs,
             &precomputed_packed_bufs,
+            Some(scan_info_offset),
         );
 
         if emit_i + 1 < recent_emissions.len() {

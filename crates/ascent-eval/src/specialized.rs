@@ -225,7 +225,69 @@ pub struct PackedStorage {
     pub(crate) jit_index_is_edb_fmt: bool,
     /// Authoritative dedup table (inline u32 hash table, also probed by JIT code directly).
     pub(crate) jit_dedup: crate::jit_index::JitDedupTable,
+    /// Cached scan pointers/counts for Stage 4 JIT direct access.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) scan_info: PackedScanInfo,
 }
+
+/// Cached scan pointers/counts for the Stage 4 JIT fast scan path.
+///
+/// Kept in sync after every mutation. The Stage 4 JIT reads these fields
+/// directly via `load.i64` instead of calling `packed_count`,
+/// `packed_data_ptr`, and `packed_recent_ptr`.
+#[cfg(all(feature = "jit", feature = "specialized"))]
+#[repr(C)]
+pub(crate) struct PackedScanInfo {
+    /// Pointer to `packed_data[0]`. Null when the relation is empty.
+    pub(crate) data_ptr: *const u32,
+    /// Pointer to `recent[0]`. Null when recent is empty.
+    pub(crate) recent_ptr: *const usize,
+    /// Total tuple count.
+    pub(crate) count: u64,
+    /// Recent tuple count.
+    pub(crate) recent_count: u64,
+}
+
+#[cfg(all(feature = "jit", feature = "specialized"))]
+impl std::fmt::Debug for PackedScanInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PackedScanInfo")
+            .field("data_ptr", &self.data_ptr)
+            .field("recent_ptr", &self.recent_ptr)
+            .field("count", &self.count)
+            .field("recent_count", &self.recent_count)
+            .finish()
+    }
+}
+
+/// Clone produces a zeroed-out scan_info: raw pointers must not be copied across
+/// storage instances because each storage owns its own heap buffers.
+/// Call `refresh_scan_info()` before any JIT code reads from it.
+#[cfg(all(feature = "jit", feature = "specialized"))]
+impl Clone for PackedScanInfo {
+    fn clone(&self) -> Self {
+        PackedScanInfo {
+            data_ptr: std::ptr::null(),
+            recent_ptr: std::ptr::null(),
+            count: 0,
+            recent_count: 0,
+        }
+    }
+}
+
+#[cfg(all(feature = "jit", feature = "specialized"))]
+unsafe impl Send for PackedScanInfo {}
+#[cfg(all(feature = "jit", feature = "specialized"))]
+unsafe impl Sync for PackedScanInfo {}
+
+#[cfg(all(feature = "jit", feature = "specialized", target_pointer_width = "64"))]
+const _SCAN_INFO_LAYOUT: () = {
+    assert!(std::mem::offset_of!(PackedScanInfo, data_ptr) == 0);
+    assert!(std::mem::offset_of!(PackedScanInfo, recent_ptr) == 8);
+    assert!(std::mem::offset_of!(PackedScanInfo, count) == 16);
+    assert!(std::mem::offset_of!(PackedScanInfo, recent_count) == 24);
+    assert!(std::mem::size_of::<PackedScanInfo>() == 32);
+};
 
 impl PackedStorage {
     /// Create a new packed storage with the given column types.
@@ -256,6 +318,13 @@ impl PackedStorage {
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_index_is_edb_fmt: false,
             jit_dedup: crate::jit_index::JitDedupTable::new(arity),
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            scan_info: PackedScanInfo {
+                data_ptr: std::ptr::null(),
+                recent_ptr: std::ptr::null(),
+                count: 0,
+                recent_count: 0,
+            },
         }
     }
 
@@ -306,6 +375,24 @@ impl PackedStorage {
             self.source_tags.push(SourceId::ANONYMOUS);
         }
         self.interp_synced_count = self.count;
+    }
+
+    /// Refresh the `scan_info` cache after any mutation to `packed_data`, `count`, or `recent`.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[inline]
+    fn refresh_scan_info(&mut self) {
+        self.scan_info.data_ptr = if self.packed_data.is_empty() {
+            std::ptr::null()
+        } else {
+            self.packed_data.as_ptr()
+        };
+        self.scan_info.recent_ptr = if self.recent.is_empty() {
+            std::ptr::null()
+        } else {
+            self.recent.as_ptr()
+        };
+        self.scan_info.count = self.count as u64;
+        self.scan_info.recent_count = self.recent.len() as u64;
     }
 
     /// Look up the index for a packed u32 key in column `col`.
@@ -378,6 +465,8 @@ impl PackedStorage {
         self.count += 1;
         self.interp_synced_count = self.count;
         self.delta.push(idx);
+        #[cfg(all(feature = "jit", feature = "specialized"))]
+        self.refresh_scan_info();
         Ok(true)
     }
 
@@ -411,6 +500,8 @@ impl PackedStorage {
         self.packed_data.extend_from_slice(packed);
         self.count += 1;
         self.delta.push(idx);
+        #[cfg(all(feature = "jit", feature = "specialized"))]
+        self.refresh_scan_info();
         true
     }
 
@@ -436,6 +527,8 @@ impl PackedStorage {
         self.source_tags.push(SourceId::ANONYMOUS);
         self.count += 1;
         self.delta.push(idx);
+        #[cfg(all(feature = "jit", feature = "specialized"))]
+        self.refresh_scan_info();
     }
 
     pub fn contains(&self, tuple: &[Value]) -> bool {
@@ -506,6 +599,8 @@ impl PackedStorage {
         }
         #[cfg(all(feature = "jit", feature = "specialized"))]
         self.update_jit_indices();
+        #[cfg(all(feature = "jit", feature = "specialized"))]
+        self.refresh_scan_info();
         had_delta
     }
 
@@ -519,6 +614,7 @@ impl PackedStorage {
         self.recent = std::mem::take(&mut self.delta);
         // Skip recent_col_indices rebuild — JIT uses jit_recent_indices.
         self.update_jit_indices();
+        self.refresh_scan_info();
         had_delta
     }
 
@@ -537,6 +633,8 @@ impl PackedStorage {
         }
         #[cfg(all(feature = "jit", feature = "specialized"))]
         self.update_jit_indices();
+        #[cfg(all(feature = "jit", feature = "specialized"))]
+        self.refresh_scan_info();
         had_delta
     }
 

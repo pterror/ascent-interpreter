@@ -905,6 +905,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
         &mut next_var,
         &conditions,
         &precomputed_packed_bufs,
+        None,
     );
 
     builder.ins().return_(&[]);
@@ -935,6 +936,7 @@ pub(crate) fn gen_clauses_v3(
     next_var: &mut usize,
     conditions: &[&CExpr],
     precomputed_packed_bufs: &[Option<CValue>],
+    scan_info_offset: Option<i32>,
 ) {
     if clause_offset >= clauses.len() {
         if !conditions.is_empty() {
@@ -980,14 +982,14 @@ pub(crate) fn gen_clauses_v3(
             builder, clause, rel_ptr, arity, use_recent, use_recent_val,
             clauses, clause_offset, recent_clause_idx, rels, vars, head_rels,
             lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
-            is_recursive, precomputed_packed_bufs,
+            is_recursive, precomputed_packed_bufs, scan_info_offset,
         );
     } else {
         gen_index_scan_v3(
             builder, clause, rel_ptr, arity, use_recent,
             clauses, clause_offset, recent_clause_idx, rels, vars, head_rels,
             lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
-            is_recursive, precomputed_packed_bufs,
+            is_recursive, precomputed_packed_bufs, scan_info_offset,
         );
     }
 }
@@ -1015,9 +1017,15 @@ fn gen_full_scan_v3(
     conditions: &[&CExpr],
     _is_recursive: bool,
     precomputed_packed_bufs: &[Option<CValue>],
+    scan_info_offset: Option<i32>,
 ) {
-    let call = builder.ins().call(func_refs.packed_count, &[rel_ptr, use_recent_val]);
-    let count = builder.inst_results(call)[0];
+    let count = if let Some(si_off) = scan_info_offset {
+        let field_off = si_off + if use_recent { 24i32 } else { 16i32 };
+        builder.ins().load(ptr_type, MemFlags::trusted(), rel_ptr, field_off)
+    } else {
+        let call = builder.ins().call(func_refs.packed_count, &[rel_ptr, use_recent_val]);
+        builder.inst_results(call)[0]
+    };
 
     // For non-recursive rules the packed_data buffer cannot be reallocated during
     // the scan, so we use the pointer hoisted before all loop nesting.
@@ -1029,8 +1037,13 @@ fn gen_full_scan_v3(
     // recent[i] is a usize (pointer-sized) stored at recent_ptr + i * ptr_size.
     // This replaces the per-iteration packed_recent_idx call with an inline load.
     let cached_recent_ptr = if use_recent {
-        let call = builder.ins().call(func_refs.packed_recent_ptr, &[rel_ptr]);
-        Some(builder.inst_results(call)[0])
+        let ptr = if let Some(si_off) = scan_info_offset {
+            builder.ins().load(ptr_type, MemFlags::trusted(), rel_ptr, si_off + 8i32)
+        } else {
+            let call = builder.ins().call(func_refs.packed_recent_ptr, &[rel_ptr]);
+            builder.inst_results(call)[0]
+        };
+        Some(ptr)
     } else {
         None
     };
@@ -1066,6 +1079,8 @@ fn gen_full_scan_v3(
     // Use cached pointer for non-recursive rules; re-fetch for recursive ones.
     let packed_buf = if let Some(buf) = cached_packed_buf {
         buf
+    } else if let Some(si_off) = scan_info_offset {
+        builder.ins().load(ptr_type, MemFlags::trusted(), rel_ptr, si_off)
     } else {
         let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
         builder.inst_results(call)[0]
@@ -1118,6 +1133,7 @@ fn gen_full_scan_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
         rels, vars, head_rels, lookup_handles, head_dedup_handles,
         func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
+        scan_info_offset,
     );
 
     builder.ins().jump(continue_block, &[]);
@@ -1170,6 +1186,7 @@ fn gen_index_scan_v3(
     conditions: &[&CExpr],
     is_recursive: bool,
     precomputed_packed_bufs: &[Option<CValue>],
+    scan_info_offset: Option<i32>,
 ) {
     let primary_col = clause.bound_cols[0];
     let key_i32 = load_bound_val_vars(builder, clause, primary_col, vars);
@@ -1385,7 +1402,9 @@ fn gen_index_scan_v3(
             // Tuple-index linked-list (arity > 2): v0 is tuple_idx.
             let tuple_idx = builder.ins().uextend(ptr_type, v0);
             // Re-fetch packed_data_ptr: recursive head insert may have reallocated.
-            let packed_buf = {
+            let packed_buf = if let Some(si_off) = scan_info_offset {
+                builder.ins().load(ptr_type, MemFlags::trusted(), rel_ptr, si_off)
+            } else {
                 let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
                 builder.inst_results(call)[0]
             };
@@ -1444,6 +1463,7 @@ fn gen_index_scan_v3(
             builder, clauses, clause_offset + 1, recent_clause_idx,
             rels, vars, head_rels, lookup_handles, head_dedup_handles,
             func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
+            scan_info_offset,
         );
 
         builder.ins().jump(continue_block, &[]);
@@ -1599,6 +1619,7 @@ fn gen_index_scan_v3(
             builder, clauses, clause_offset + 1, recent_clause_idx,
             rels, vars, head_rels, lookup_handles, head_dedup_handles,
             func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
+            scan_info_offset,
         );
 
         builder.ins().jump(continue_block, &[]);
