@@ -541,8 +541,16 @@ impl PackedStorage {
                 }
                 for idx in self.jit_full_indexed_count..self.count {
                     let base = idx * self.arity;
-                    for col in 0..self.arity {
-                        self.jit_indices[col].insert(self.packed_data[base + col], idx as u32);
+                    if self.arity == 2 {
+                        // Col-value linked-list for arity-2 derived: store the other
+                        // column's value directly, eliminating a packed_data_ptr call
+                        // per inner-loop match in gen_index_scan_v3.
+                        self.jit_indices[0].insert(self.packed_data[base], self.packed_data[base + 1]);
+                        self.jit_indices[1].insert(self.packed_data[base + 1], self.packed_data[base]);
+                    } else {
+                        for col in 0..self.arity {
+                            self.jit_indices[col].insert(self.packed_data[base + col], idx as u32);
+                        }
                     }
                 }
                 self.jit_index_is_edb_fmt = false;
@@ -579,8 +587,14 @@ impl PackedStorage {
             }
             for &idx in &self.recent {
                 let base = idx * arity;
-                for col in 0..arity {
-                    self.jit_recent_indices[col].insert(self.packed_data[base + col], idx as u32);
+                if arity == 2 {
+                    // Col-value linked-list for arity-2 derived (mirrors full index).
+                    self.jit_recent_indices[0].insert(self.packed_data[base], self.packed_data[base + 1]);
+                    self.jit_recent_indices[1].insert(self.packed_data[base + 1], self.packed_data[base]);
+                } else {
+                    for col in 0..arity {
+                        self.jit_recent_indices[col].insert(self.packed_data[base + col], idx as u32);
+                    }
                 }
             }
         }

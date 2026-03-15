@@ -1290,9 +1290,9 @@ fn gen_index_scan_v3(
 
     if is_recursive {
         // ─── Linked-list inner loop ───────────────────────────────────────────
-        // values layout: stride 8 bytes per node
-        //   values_ptr[ptr*8 + 0] = tuple_idx (u32)
-        //   values_ptr[ptr*8 + 4] = next_ptr  (u32; SENTINEL = end)
+        // Node layout: stride 8 bytes
+        //   arity == 2: node[0] = col_value (free col), node[4] = next_ptr
+        //   arity >  2: node[0] = tuple_idx,            node[4] = next_ptr
         let loop_header = builder.create_block();
         let loop_body   = builder.create_block();
         let loop_exit   = builder.create_block();
@@ -1314,40 +1314,35 @@ fn gen_index_scan_v3(
         let ptr_ext   = builder.ins().uextend(ptr_type, ptr);
         let byte_off  = builder.ins().imul_imm(ptr_ext, 8_i64);
         let node_addr = builder.ins().iadd(values_ptr, byte_off);
-        let tuple_idx_u32 = builder.ins().load(I32, MemFlags::trusted(), node_addr, 0i32);
-        let next_ptr      = builder.ins().load(I32, MemFlags::trusted(), node_addr, 4i32);
-        let tuple_idx     = builder.ins().uextend(ptr_type, tuple_idx_u32);
+        let v0       = builder.ins().load(I32, MemFlags::trusted(), node_addr, 0i32);
+        let next_ptr = builder.ins().load(I32, MemFlags::trusted(), node_addr, 4i32);
 
         let var_next_ptr = Variable::new(*next_var);
         *next_var += 1;
         builder.declare_var(var_next_ptr, I32);
         builder.def_var(var_next_ptr, next_ptr);
 
-        // Recursive rule: re-fetch packed_data_ptr after potential realloc.
-        let packed_buf = {
-            let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
-            builder.inst_results(call)[0]
-        };
-        let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
-
         let continue_block = builder.create_block();
         let mut inner_blocks_to_seal = Vec::new();
 
-        for (col, arg) in clause.args.iter().enumerate() {
-            match arg {
+        if arity == 2 {
+            // Col-value linked-list: v0 is the free column's value directly.
+            // No packed_data_ptr call; mirrors the contiguous is_col_value path.
+            let col_val  = v0;
+            let free_col = 1 - primary_col;
+
+            match &clause.args[free_col] {
                 CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
-                    let actual   = load_packed_col(builder, tuple_ptr, col);
                     let expected = builder.ins().iconst(I32, *n as i64);
-                    let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                    let eq = builder.ins().icmp(IntCC::Equal, col_val, expected);
                     let pass_block = builder.create_block();
                     builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
                     inner_blocks_to_seal.push(pass_block);
                     builder.switch_to_block(pass_block);
                 }
                 CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
-                    let actual   = load_packed_col(builder, tuple_ptr, col);
                     let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
-                    let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                    let eq = builder.ins().icmp(IntCC::Equal, col_val, expected);
                     let pass_block = builder.create_block();
                     builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
                     inner_blocks_to_seal.push(pass_block);
@@ -1355,19 +1350,69 @@ fn gen_index_scan_v3(
                 }
                 _ => {}
             }
-        }
-        for &col in &clause.bound_cols[1..] {
-            let actual   = load_packed_col(builder, tuple_ptr, col);
-            let expected = load_bound_val_vars(builder, clause, col, vars);
-            let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
-            let pass_block = builder.create_block();
-            builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
-            inner_blocks_to_seal.push(pass_block);
-            builder.switch_to_block(pass_block);
-        }
-        for &(col, var_id) in &clause.fresh_cols {
-            let val = load_packed_col(builder, tuple_ptr, col);
-            def_binding(builder, vars, var_id, val);
+            for &col in &clause.bound_cols[1..] {
+                if col == free_col {
+                    let expected = load_bound_val_vars(builder, clause, col, vars);
+                    let eq = builder.ins().icmp(IntCC::Equal, col_val, expected);
+                    let pass_block = builder.create_block();
+                    builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                    inner_blocks_to_seal.push(pass_block);
+                    builder.switch_to_block(pass_block);
+                    break;
+                }
+            }
+            for &(col, var_id) in &clause.fresh_cols {
+                if col == free_col {
+                    def_binding(builder, vars, var_id, col_val);
+                    break;
+                }
+            }
+        } else {
+            // Tuple-index linked-list (arity > 2): v0 is tuple_idx.
+            let tuple_idx = builder.ins().uextend(ptr_type, v0);
+            // Re-fetch packed_data_ptr: recursive head insert may have reallocated.
+            let packed_buf = {
+                let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
+                builder.inst_results(call)[0]
+            };
+            let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
+
+            for (col, arg) in clause.args.iter().enumerate() {
+                match arg {
+                    CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+                        let actual   = load_packed_col(builder, tuple_ptr, col);
+                        let expected = builder.ins().iconst(I32, *n as i64);
+                        let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                        let pass_block = builder.create_block();
+                        builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                        inner_blocks_to_seal.push(pass_block);
+                        builder.switch_to_block(pass_block);
+                    }
+                    CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
+                        let actual   = load_packed_col(builder, tuple_ptr, col);
+                        let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
+                        let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                        let pass_block = builder.create_block();
+                        builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                        inner_blocks_to_seal.push(pass_block);
+                        builder.switch_to_block(pass_block);
+                    }
+                    _ => {}
+                }
+            }
+            for &col in &clause.bound_cols[1..] {
+                let actual   = load_packed_col(builder, tuple_ptr, col);
+                let expected = load_bound_val_vars(builder, clause, col, vars);
+                let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let pass_block = builder.create_block();
+                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                inner_blocks_to_seal.push(pass_block);
+                builder.switch_to_block(pass_block);
+            }
+            for &(col, var_id) in &clause.fresh_cols {
+                let val = load_packed_col(builder, tuple_ptr, col);
+                def_binding(builder, vars, var_id, val);
+            }
         }
 
         for cond in &clause.conditions {
