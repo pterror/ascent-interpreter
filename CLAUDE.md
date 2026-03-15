@@ -50,7 +50,9 @@ cd docs && bun dev # Local docs
 
 When evaluating a JIT optimization, profile with `perf stat -e instructions,cycles,cache-misses` and compare *per-iteration* numbers against the `ascent_macro` benchmark. The gap is closed when both instruction count and cache behavior converge, not just one.
 
-Current bottleneck (2026-03-15): **116× more cache misses per iteration** for triangle (14.8% vs 1.6% miss rate). The `JitHashIndex` pointer-chased structure is the primary cause — fix that before tuning anything else.
+Current state (2026-03-16): fibonacci jit_hot/20 = 11.9µs vs ascent_macro 8.0µs (**1.49×**); triangle jit_hot/20 = 245µs vs ascent_macro 34µs (**7.2×**). The EDB contiguous index is already in place, reducing triangle cache misses from 116× to ~13× (estimated). Primary remaining bottleneck for triangle is the `JitHashIndex` pointer-chased structure — see TODO.md § "New architecture" for the compact JitColIndex replacement plan.
+
+**ABI scan callbacks (`packed_data_ptr`, `packed_count`, `packed_recent_ptr`) are NOT the bottleneck.** These functions access warm cache lines (offsets 24, 72, 112 in `PackedStorage`). Any scheme that replaces them with direct loads risks adding cache misses from `PackedScanInfo` fields at cold offsets, or disrupts the overall layout. Attempted 2026-03-16 as `PackedScanInfo` in `PackedStorage` — regressed fibonacci 1.49× → 1.56–1.73× in all configurations. Do not retry.
 
 **Parallelism must also be designed for max throughput.** When implementing parallel evaluation: zero shared state in the hot path (thread-local dedup tables, thread-local head buffers, read-only shared indices), batch merge only after all threads finish their scan. A parallel design that introduces lock contention or false sharing in the inner loop is worse than single-threaded. The test is: does the parallel version scale linearly with thread count on a join-heavy benchmark?
 
