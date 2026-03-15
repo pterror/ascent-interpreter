@@ -383,58 +383,6 @@ impl PackedStorage {
         true
     }
 
-    /// JIT-specific insert: skips interpreter-only structures (indices, value_data, source_tags).
-    /// Call `rebuild_interpreter_state` after JIT evaluation to reconstruct them.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) fn insert_packed_raw_for_jit(&mut self, packed: &[u32]) -> bool {
-        debug_assert_eq!(packed.len(), self.arity, "packed tuple arity mismatch");
-
-        if self.arity == 0 {
-            if self.count > 0 {
-                return false;
-            }
-            self.count = 1;
-            self.delta.push(0);
-            return true;
-        }
-
-        let hash = crate::jit_index::jit_dedup_hash(packed);
-        if !self.jit_dedup.insert_if_new(hash, packed) {
-            return false;
-        }
-
-        let idx = self.count;
-        self.packed_data.extend_from_slice(packed);
-        self.count += 1;
-        self.delta.push(idx);
-        true
-    }
-
-    /// Rebuild interpreter-facing structures (indices, value_data, source_tags) from packed_data.
-    /// Fills in tuples that were inserted via `insert_packed_raw_for_jit`.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) fn rebuild_interpreter_state(&mut self) {
-        let start_idx = if self.arity == 0 { self.count } else { self.value_data.len() / self.arity };
-        if start_idx >= self.count {
-            return; // already in sync
-        }
-        // Pre-allocate to avoid incremental reallocations
-        let new_tuples = self.count - start_idx;
-        self.value_data.reserve(new_tuples * self.arity);
-        self.source_tags.reserve(new_tuples);
-        for idx in start_idx..self.count {
-            let base = idx * self.arity;
-            let packed = &self.packed_data[base..base + self.arity];
-            for (col, &p) in packed.iter().enumerate() {
-                self.indices[col].entry(p).or_default().push(idx);
-            }
-            for (col, &p) in packed.iter().enumerate() {
-                self.value_data.push(self.col_types[col].unpack(p));
-            }
-            self.source_tags.push(SourceId::ANONYMOUS);
-        }
-    }
-
     /// Insert a pre-packed tuple whose dedup entry has already been written by the JIT.
     ///
     /// Skips the `jit_dedup.insert_if_new` check (the JIT wrote to the dedup table inline).

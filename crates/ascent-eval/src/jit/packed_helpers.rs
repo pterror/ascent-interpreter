@@ -501,22 +501,6 @@ pub unsafe extern "C" fn packed_try_insert(
     rel.insert_packed_raw(slice) as u8
 }
 
-/// JIT insert that skips interpreter-only structures (indices, value_data, source_tags).
-/// After JIT evaluation completes, call `rebuild_interpreter_state()` on derived relations.
-///
-/// # Safety
-/// `rel` must point to a valid `PackedStorage`, `tuple` to `arity` valid u32 values.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn packed_try_insert_jit(
-    rel: *mut PackedStorage,
-    tuple: *const u32,
-    arity: u32,
-) -> u8 {
-    let rel = unsafe { &mut *rel };
-    let slice = unsafe { std::slice::from_raw_parts(tuple, arity as usize) };
-    rel.insert_packed_raw_for_jit(slice) as u8
-}
-
 /// Advance all packed relations and return 1 if any gained new tuples.
 ///
 /// Called once per semi-naive iteration in Stage 3 (no flush step needed).

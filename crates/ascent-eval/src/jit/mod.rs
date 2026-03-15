@@ -70,10 +70,9 @@ pub(crate) struct PackedJitHelperIds {
     pub(crate) packed_lookup: FuncId,
     pub(crate) packed_push_result: FuncId,
     pub(crate) stratum_flush_advance: FuncId,
-    // Stage 3 helpers (packed_try_insert kept for asm backend symbol registration)
+    // Stage 3 helpers
     #[allow(dead_code)]
     pub(crate) packed_try_insert: FuncId,
-    pub(crate) packed_try_insert_jit: FuncId,
     pub(crate) stratum_advance: FuncId,
     // Stage 4: advance + handle refresh
     pub(crate) stratum_advance_s4: FuncId,
@@ -235,10 +234,6 @@ impl JitCompiler {
             jit_builder.symbol(
                 "packed_try_insert",
                 packed_helpers::packed_try_insert as *const u8,
-            );
-            jit_builder.symbol(
-                "packed_try_insert_jit",
-                packed_helpers::packed_try_insert_jit as *const u8,
             );
             jit_builder.symbol(
                 "jit_stratum_advance",
@@ -1241,14 +1236,6 @@ fn declare_packed_helpers(module: &mut JITModule) -> Result<PackedJitHelperIds, 
         .declare_function("packed_try_insert", Linkage::Import, &sig)
         .map_err(map_err)?;
 
-    // packed_try_insert_jit(rel: ptr, tuple: ptr, arity: i32) -> i8
-    let mut sig = Signature::new(cc);
-    sig.params = vec![AbiParam::new(ptr), AbiParam::new(ptr), AbiParam::new(I32)];
-    sig.returns = vec![AbiParam::new(I8)];
-    let packed_try_insert_jit = module
-        .declare_function("packed_try_insert_jit", Linkage::Import, &sig)
-        .map_err(map_err)?;
-
     // jit_stratum_advance(rels: ptr, n_rels: i32) -> i8
     let mut sig = Signature::new(cc);
     sig.params = vec![AbiParam::new(ptr), AbiParam::new(I32)];
@@ -1274,7 +1261,6 @@ fn declare_packed_helpers(module: &mut JITModule) -> Result<PackedJitHelperIds, 
         packed_push_result,
         stratum_flush_advance,
         packed_try_insert,
-        packed_try_insert_jit,
         stratum_advance,
         stratum_advance_s4,
     })

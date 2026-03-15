@@ -982,15 +982,6 @@ impl Engine {
         // Step 3: call the Stage 4 stratum function
         let runtime = self.stratum_stage4_cache.get_mut(&stratum_key).unwrap();
         unsafe { stage4_fn(&raw mut *runtime.stage4_ctx) };
-
-        // Rebuild interpreter-facing structures for head relations (skipped by packed_try_insert_jit).
-        for rule in rules {
-            for head in &rule.heads {
-                if let Some(crate::relation::Relation::Packed(ps)) = self.relations.get_mut(&head.relation) {
-                    ps.rebuild_interpreter_state();
-                }
-            }
-        }
         true
     }
 

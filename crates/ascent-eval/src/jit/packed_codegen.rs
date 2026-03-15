@@ -43,7 +43,7 @@ pub(crate) struct FuncRefsV3 {
     pub(crate) packed_count: cranelift_codegen::ir::FuncRef,
     pub(crate) packed_data_ptr: cranelift_codegen::ir::FuncRef,
     pub(crate) packed_recent_ptr: cranelift_codegen::ir::FuncRef,
-    pub(crate) packed_try_insert_jit: cranelift_codegen::ir::FuncRef,
+    pub(crate) packed_try_insert: cranelift_codegen::ir::FuncRef,
 }
 
 /// Fields loaded from PackedJitContext at function entry.
@@ -816,7 +816,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
         packed_count: module.declare_func_in_func(helpers.packed_count, &mut ctx.func),
         packed_data_ptr: module.declare_func_in_func(helpers.packed_data_ptr, &mut ctx.func),
         packed_recent_ptr: module.declare_func_in_func(helpers.packed_recent_ptr, &mut ctx.func),
-        packed_try_insert_jit: module.declare_func_in_func(helpers.packed_try_insert_jit, &mut ctx.func),
+        packed_try_insert: module.declare_func_in_func(helpers.packed_try_insert, &mut ctx.func),
     };
 
     let mut builder = FunctionBuilder::new(&mut ctx.func, builder_ctx);
@@ -1665,7 +1665,7 @@ fn gen_emit_heads_v3(
         if arity == 0 {
             let null = builder.ins().iconst(ptr_type, 0);
             let arity_val = builder.ins().iconst(I32, 0);
-            builder.ins().call(func_refs.packed_try_insert_jit, &[head_rel, null, arity_val]);
+            builder.ins().call(func_refs.packed_try_insert, &[head_rel, null, arity_val]);
             continue;
         }
 
@@ -1812,7 +1812,7 @@ fn gen_emit_heads_v3(
         // call_insert has two predecessors: the cap==0 branch and the empty-slot branch.
         builder.switch_to_block(call_insert);
         builder.seal_block(call_insert);
-        builder.ins().call(func_refs.packed_try_insert_jit, &[head_rel, slot_addr, arity_val]);
+        builder.ins().call(func_refs.packed_try_insert, &[head_rel, slot_addr, arity_val]);
         builder.ins().jump(after_emit, &[]);
 
         // ── after_emit ───────────────────────────────────────────────────────────

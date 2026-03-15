@@ -374,7 +374,7 @@ pub(crate) fn codegen_stratum_stage4_fn(
         packed_count: module.declare_func_in_func(helpers.packed_count, &mut codegen_ctx.func),
         packed_data_ptr: module.declare_func_in_func(helpers.packed_data_ptr, &mut codegen_ctx.func),
         packed_recent_ptr: module.declare_func_in_func(helpers.packed_recent_ptr, &mut codegen_ctx.func),
-        packed_try_insert_jit: module.declare_func_in_func(helpers.packed_try_insert_jit, &mut codegen_ctx.func),
+        packed_try_insert: module.declare_func_in_func(helpers.packed_try_insert, &mut codegen_ctx.func),
     };
 
     let mut builder = FunctionBuilder::new(&mut codegen_ctx.func, builder_ctx);
