@@ -4233,29 +4233,35 @@ mod jit_hot_tests {
 
     #[test]
     fn tc_shared_jit_external_facts() {
-        // Mirrors the bench: facts inserted via engine.insert() before run()
-        // Uses n=50 to match the bench exactly
+        // Verifies shared-JIT correctness across multiple hot runs with external facts.
+        // Use small n and few iterations to keep debug-mode runtime acceptable.
         let source = "relation edge(i32,i32);\nrelation path(i32,i32);\npath(x,y) <-- edge(x,y);\npath(x,z) <-- edge(x,y),path(y,z);\n";
         let ast: AscentProgram = syn::parse_str(source).unwrap();
         let program = Program::from_ast(ast);
-        // warmup with external facts
+        let n = 10i32;
+        // warmup
         let mut warmup = Engine::new(&program);
         warmup.enable_jit();
-        for i in 1i32..50 {
+        for i in 1..n {
             warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
         }
         warmup.run(&program);
         let jit = warmup.share_jit_compiler().unwrap();
-        // hot run many times — Criterion runs thousands of iterations during warmup
-        for _ in 0..10000 {
+        // hot runs: verify correctness across several iterations
+        for _ in 0..10 {
             let mut engine = Engine::new(&program);
             engine.with_jit_compiler(jit.clone());
-            for i in 1i32..50 {
+            for i in 1..n {
                 engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
             }
             engine.run(&program);
             let rel = engine.relation("path").unwrap();
-            assert!(!rel.is_empty(), "expected path tuples from shared jit run");
+            let expected = (n * (n - 1) / 2) as usize;
+            assert_eq!(
+                rel.len(),
+                expected,
+                "expected {expected} path tuples from shared jit run"
+            );
         }
     }
 }
