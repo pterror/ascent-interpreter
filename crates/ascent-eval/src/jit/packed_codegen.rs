@@ -905,6 +905,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
         &mut next_var,
         &conditions,
         &precomputed_packed_bufs,
+        None, // Stage 3 single-rule path: no tuple_sets_buf available
     );
 
     builder.ins().return_(&[]);
@@ -935,6 +936,7 @@ pub(crate) fn gen_clauses_v3(
     next_var: &mut usize,
     conditions: &[&CExpr],
     precomputed_packed_bufs: &[Option<CValue>],
+    tuple_sets_ptr: Option<CValue>,
 ) {
     if clause_offset >= clauses.len() {
         if !conditions.is_empty() {
@@ -961,6 +963,19 @@ pub(crate) fn gen_clauses_v3(
     let use_recent = recent_clause_idx == Some(body_idx);
     let rel_seq_idx = clause_offset;
 
+    // O(1) existence check for fully-bound inner clauses using JitTupleSet.
+    // Applies when: not clause 0, no fresh cols (all bound), and Stage 4 context
+    // provides the tuple_sets_ptr (Stage 3 single-rule path passes None).
+    if clause_offset > 0 && clause.fresh_cols.is_empty() && let Some(ts_ptr) = tuple_sets_ptr {
+        gen_tuple_set_probe_v3(
+            builder, clause, clause_offset, use_recent, ts_ptr,
+            clauses, recent_clause_idx, rels, vars, head_rels,
+            lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var,
+            conditions, precomputed_packed_bufs,
+        );
+        return;
+    }
+
     let rel_ptr_offset = builder.ins().iconst(ptr_type, (rel_seq_idx as i64) * 8);
     let rel_ptr_addr = builder.ins().iadd(rels, rel_ptr_offset);
     let rel_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), rel_ptr_addr, 0);
@@ -980,14 +995,14 @@ pub(crate) fn gen_clauses_v3(
             builder, clause, rel_ptr, arity, use_recent, use_recent_val,
             clauses, clause_offset, recent_clause_idx, rels, vars, head_rels,
             lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
-            is_recursive, precomputed_packed_bufs,
+            is_recursive, precomputed_packed_bufs, tuple_sets_ptr,
         );
     } else {
         gen_index_scan_v3(
             builder, clause, rel_ptr, arity, use_recent,
             clauses, clause_offset, recent_clause_idx, rels, vars, head_rels,
             lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
-            is_recursive, precomputed_packed_bufs,
+            is_recursive, precomputed_packed_bufs, tuple_sets_ptr,
         );
     }
 }
@@ -1015,6 +1030,7 @@ fn gen_full_scan_v3(
     conditions: &[&CExpr],
     _is_recursive: bool,
     precomputed_packed_bufs: &[Option<CValue>],
+    tuple_sets_ptr: Option<CValue>,
 ) {
     let call = builder.ins().call(func_refs.packed_count, &[rel_ptr, use_recent_val]);
     let count = builder.inst_results(call)[0];
@@ -1118,6 +1134,7 @@ fn gen_full_scan_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
         rels, vars, head_rels, lookup_handles, head_dedup_handles,
         func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
+        tuple_sets_ptr,
     );
 
     builder.ins().jump(continue_block, &[]);
@@ -1170,6 +1187,7 @@ fn gen_index_scan_v3(
     conditions: &[&CExpr],
     is_recursive: bool,
     precomputed_packed_bufs: &[Option<CValue>],
+    tuple_sets_ptr: Option<CValue>,
 ) {
     let primary_col = clause.bound_cols[0];
     let key_i32 = load_bound_val_vars(builder, clause, primary_col, vars);
@@ -1444,6 +1462,7 @@ fn gen_index_scan_v3(
             builder, clauses, clause_offset + 1, recent_clause_idx,
             rels, vars, head_rels, lookup_handles, head_dedup_handles,
             func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
+            tuple_sets_ptr,
         );
 
         builder.ins().jump(continue_block, &[]);
@@ -1599,6 +1618,7 @@ fn gen_index_scan_v3(
             builder, clauses, clause_offset + 1, recent_clause_idx,
             rels, vars, head_rels, lookup_handles, head_dedup_handles,
             func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
+            tuple_sets_ptr,
         );
 
         builder.ins().jump(continue_block, &[]);
@@ -1620,6 +1640,169 @@ fn gen_index_scan_v3(
         builder.seal_block(loop_body);
         builder.seal_block(loop_exit);
     }
+}
+
+/// Inline tuple-set probe for fully-bound inner clauses (Stage 4 only).
+///
+/// When all columns of a clause are bound (no fresh cols), we can replace the
+/// O(n) column-index scan with an O(1) hash-set existence check against the
+/// `JitTupleSet` built from the total relation before the fixpoint starts.
+///
+/// If the tuple is present → execute the rest of the rule (recursive call).
+/// If the tuple is absent → fall through (not found).
+///
+/// Block structure:
+/// ```text
+/// probe_loop → not_found | probe_check_found
+/// probe_check_found → field_check[0] | probe_miss
+/// field_check[i] → field_check[i+1] | probe_miss
+/// field_check[N-1] → body | probe_miss
+/// body → (gen_clauses_v3 recursion) → not_found
+/// probe_miss → probe_loop  (back-edge; seals probe_loop)
+/// not_found: fall through
+/// ```
+///
+/// `JitTupleSet` layout: slots @0, mask @8, len @16.
+/// Slot layout: stride = (arity+1)*4 bytes; slot[0]=hash_tag (0=empty), slot[1..N]=fields.
+/// Hash: `h = 0x9e3779b9; for w in fields: h = h*0x9e3779b9 + w; if h==0: h=1`.
+#[allow(clippy::too_many_arguments)]
+fn gen_tuple_set_probe_v3(
+    builder: &mut FunctionBuilder,
+    clause: &CClause,
+    clause_offset: usize,
+    use_recent: bool,
+    tuple_sets_ptr: CValue,
+    clauses: &[(usize, &CClause)],
+    recent_clause_idx: Option<usize>,
+    rels: CValue,
+    vars: &[Variable],
+    head_rels: CValue,
+    lookup_handles: CValue,
+    head_dedup_handles: CValue,
+    func_refs: &FuncRefsV3,
+    heads: &[CHeadClause],
+    ptr_type: cranelift_codegen::ir::Type,
+    next_var: &mut usize,
+    conditions: &[&CExpr],
+    precomputed_packed_bufs: &[Option<CValue>],
+) {
+    let arity = clause.args.len();
+
+    // Load *const JitTupleSet for this (clause_offset, use_recent) pair.
+    // Index = clause_offset * 2 + use_recent; each entry is 8 bytes (pointer).
+    let handle_byte_offset = (clause_offset * 2 + use_recent as usize) * 8;
+    let ts_ptr_addr = if handle_byte_offset == 0 {
+        tuple_sets_ptr
+    } else {
+        let off = builder.ins().iconst(ptr_type, handle_byte_offset as i64);
+        builder.ins().iadd(tuple_sets_ptr, off)
+    };
+    let ts_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), ts_ptr_addr, 0);
+
+    // Load JitTupleSet fields: slots @0, mask @8 (both pointer-sized).
+    let slots_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), ts_ptr, 0i32);
+    let mask      = builder.ins().load(ptr_type, MemFlags::trusted(), ts_ptr, 8i32);
+
+    // Load all arg values — all columns are bound (fresh_cols is empty).
+    let arg_vals: Vec<CValue> = (0..arity)
+        .map(|col| load_bound_val_vars(builder, clause, col, vars))
+        .collect();
+
+    // Compute tuple hash: h = 0x9e3779b9; for each word: h = h*0x9e3779b9 + w.
+    let mult = 0x9e3779b9u32 as i64;
+    let mut h = builder.ins().iconst(I32, 0x9e3779b9u32 as i64);
+    for &av in &arg_vals {
+        h = builder.ins().imul_imm(h, mult);
+        h = builder.ins().iadd(h, av);
+    }
+    // if h == 0: h = 1  (0 is the empty-slot sentinel)
+    let zero_i32 = builder.ins().iconst(I32, 0);
+    let one_i32  = builder.ins().iconst(I32, 1);
+    let is_zero_h = builder.ins().icmp(IntCC::Equal, h, zero_i32);
+    let hash_tag = builder.ins().select(is_zero_h, one_i32, h);
+
+    // Initial slot = hash_tag & mask.
+    let hash_ext  = builder.ins().uextend(ptr_type, hash_tag);
+    let init_slot = builder.ins().band(hash_ext, mask);
+
+    let var_slot = Variable::new(*next_var);
+    *next_var += 1;
+    builder.declare_var(var_slot, ptr_type);
+    builder.def_var(var_slot, init_slot);
+
+    let stride_bytes = (arity + 1) as i64 * 4;
+
+    // Create all blocks upfront.
+    let probe_loop        = builder.create_block();
+    let probe_check_found = builder.create_block();
+    let field_checks: Vec<cranelift_codegen::ir::Block> =
+        (0..arity).map(|_| builder.create_block()).collect();
+    let body        = builder.create_block();
+    let probe_miss  = builder.create_block();
+    let not_found   = builder.create_block();
+
+    builder.ins().jump(probe_loop, &[]);
+
+    // ─── probe_loop ───────────────────────────────────────────────────────────
+    builder.switch_to_block(probe_loop);
+    let slot = builder.use_var(var_slot);
+    let slot_byte_off = builder.ins().imul_imm(slot, stride_bytes);
+    let slot_ptr = builder.ins().iadd(slots_ptr, slot_byte_off);
+    let tag = builder.ins().load(I32, MemFlags::trusted(), slot_ptr, 0i32);
+    let is_empty = builder.ins().icmp(IntCC::Equal, tag, zero_i32);
+    builder.ins().brif(is_empty, not_found, &[], probe_check_found, &[]);
+
+    // ─── probe_check_found ────────────────────────────────────────────────────
+    // probe_loop is the unique predecessor → seal immediately.
+    builder.switch_to_block(probe_check_found);
+    builder.seal_block(probe_check_found);
+    let tag_matches = builder.ins().icmp(IntCC::Equal, tag, hash_tag);
+    let after_tag_match = if arity == 0 { body } else { field_checks[0] };
+    builder.ins().brif(tag_matches, after_tag_match, &[], probe_miss, &[]);
+
+    // ─── field check chain ────────────────────────────────────────────────────
+    // field_checks[i] has exactly one predecessor (the previous block → here).
+    for col in 0..arity {
+        builder.switch_to_block(field_checks[col]);
+        builder.seal_block(field_checks[col]);
+        let field_val = builder.ins().load(
+            I32, MemFlags::trusted(), slot_ptr, (col as i32 + 1) * 4,
+        );
+        let field_match = builder.ins().icmp(IntCC::Equal, field_val, arg_vals[col]);
+        let next = if col + 1 < arity { field_checks[col + 1] } else { body };
+        builder.ins().brif(field_match, next, &[], probe_miss, &[]);
+    }
+
+    // ─── body: recursive gen_clauses_v3 ──────────────────────────────────────
+    // Predecessors: last field_check (or probe_check_found for arity==0). One pred.
+    builder.switch_to_block(body);
+    builder.seal_block(body);
+    gen_clauses_v3(
+        builder, clauses, clause_offset + 1, recent_clause_idx,
+        rels, vars, head_rels, lookup_handles, head_dedup_handles,
+        func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
+        Some(tuple_sets_ptr),
+    );
+    builder.ins().jump(not_found, &[]);
+
+    // ─── probe_miss ───────────────────────────────────────────────────────────
+    // Predecessors: probe_check_found + all field_checks. All emitted above → seal.
+    builder.switch_to_block(probe_miss);
+    builder.seal_block(probe_miss);
+    let slot_m    = builder.use_var(var_slot);
+    let one_ptr   = builder.ins().iconst(ptr_type, 1);
+    let slot_next = builder.ins().iadd(slot_m, one_ptr);
+    let slot_wrap = builder.ins().band(slot_next, mask);
+    builder.def_var(var_slot, slot_wrap);
+    builder.ins().jump(probe_loop, &[]);
+    // probe_loop preds: initial jump (above) + probe_miss back-edge. Both done → seal.
+    builder.seal_block(probe_loop);
+
+    // ─── not_found ────────────────────────────────────────────────────────────
+    // Predecessors: probe_loop (is_empty) + body (jump). Both emitted → seal.
+    builder.switch_to_block(not_found);
+    builder.seal_block(not_found);
+    // Fall through — caller continues execution after this probe.
 }
 
 /// Emit head tuples with an inline JIT dedup probe before falling back to

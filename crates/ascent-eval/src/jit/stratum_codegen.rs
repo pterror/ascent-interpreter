@@ -410,7 +410,9 @@ pub(crate) fn codegen_stratum_stage4_fn(
     builder.seal_block(entry);
 
     // Load StratumStage4Ctx fields
-    let rule_ctxs_val = builder.ins().load(ptr_t, MemFlags::trusted(), stage4_ctx, 0i32);
+    let rule_ctxs_val  = builder.ins().load(ptr_t, MemFlags::trusted(), stage4_ctx, 0i32);
+    // tuple_sets_buf @ offset 56: *const *const JitTupleSet (flat array parallel to handles_buf)
+    let tuple_sets_buf = builder.ins().load(ptr_t, MemFlags::trusted(), stage4_ctx, 56i32);
 
     // Load per-rule ctx pointers once (they don't change during execution)
     let mut rule_ctx_vals = Vec::with_capacity(rules.len());
@@ -440,6 +442,7 @@ pub(crate) fn codegen_stratum_stage4_fn(
         &vars,
         &mut next_var,
         post_full,
+        tuple_sets_buf,
     );
 
     // ─── post_full: initial advance ──────────────────────────────────────────
@@ -488,6 +491,7 @@ pub(crate) fn codegen_stratum_stage4_fn(
             &vars,
             &mut recent_next_var,
             post_inner,
+            tuple_sets_buf,
         );
     }
 
@@ -529,11 +533,16 @@ fn emit_rule_bodies(
     vars: &[Variable],
     next_var: &mut usize,
     continuation: Block,
+    tuple_sets_buf: cranelift_codegen::ir::Value,
 ) {
     if rules.is_empty() {
         builder.ins().jump(continuation, &[]);
         return;
     }
+
+    // Track the flat handle-array offset for each rule (same layout as handles_buf in eval.rs:
+    // rule_handle_start += clauses.len() * 2 per rule).
+    let mut rule_handle_start: usize = 0;
 
     for (rule_i, (clauses, heads, conditions)) in rules.iter().enumerate() {
         let ctx_i = rule_ctx_vals[rule_i];
@@ -544,6 +553,16 @@ fn emit_rule_bodies(
         let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
         let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
         let head_dedup_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
+
+        // Compute per-rule pointer into the flat tuple_sets_buf array.
+        // Each entry is 8 bytes (pointer). Offset = rule_handle_start * 8.
+        let ts_byte_off = rule_handle_start * 8;
+        let tuple_sets_ptr_i = if ts_byte_off == 0 {
+            tuple_sets_buf
+        } else {
+            let off = builder.ins().iconst(ptr_t, ts_byte_off as i64);
+            builder.ins().iadd(tuple_sets_buf, off)
+        };
 
         // Build the (body_idx, &CClause) pairs as gen_clauses_v3 expects.
         // body_idx is the sequential clause index (0-based within the clauses slice).
@@ -585,7 +604,11 @@ fn emit_rule_bodies(
             next_var,
             &cond_refs,
             &precomputed_packed_bufs,
+            Some(tuple_sets_ptr_i),
         );
+
+        rule_handle_start += clauses.len() * 2;
+
         // After gen_clauses_v3, the builder is at the loop_exit block of the
         // outermost scan. We need to connect to the next rule or the continuation.
         // gen_clauses_v3 leaves us positioned at loop_exit — emit the bridge jump.
@@ -612,7 +635,20 @@ fn emit_recent_rule_bodies(
     vars: &[Variable],
     next_var: &mut usize,
     continuation: Block,
+    tuple_sets_buf: cranelift_codegen::ir::Value,
 ) {
+    // Precompute the per-rule handle-array start offsets (same formula as in eval.rs:
+    // rule_handle_start += clauses.len() * 2 per rule).
+    let rule_handle_starts: Vec<usize> = {
+        let mut starts = Vec::with_capacity(rules.len());
+        let mut acc = 0usize;
+        for (clauses, _, _) in rules.iter() {
+            starts.push(acc);
+            acc += clauses.len() * 2;
+        }
+        starts
+    };
+
     for (emit_i, &(rule_i, clause_seq)) in recent_emissions.iter().enumerate() {
         let (clauses, heads, conditions) = &rules[rule_i];
         let ctx_i = rule_ctx_vals[rule_i];
@@ -621,6 +657,15 @@ fn emit_recent_rule_bodies(
         let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
         let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
         let head_dedup_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
+
+        // Compute per-rule pointer into tuple_sets_buf.
+        let ts_byte_off = rule_handle_starts[rule_i] * 8;
+        let tuple_sets_ptr_i = if ts_byte_off == 0 {
+            tuple_sets_buf
+        } else {
+            let off = builder.ins().iconst(ptr_t, ts_byte_off as i64);
+            builder.ins().iadd(tuple_sets_buf, off)
+        };
 
         let indexed_clauses: Vec<(usize, &CClause)> =
             clauses.iter().enumerate().collect();
@@ -662,6 +707,7 @@ fn emit_recent_rule_bodies(
             next_var,
             &cond_refs,
             &precomputed_packed_bufs,
+            Some(tuple_sets_ptr_i),
         );
 
         if emit_i + 1 < recent_emissions.len() {
