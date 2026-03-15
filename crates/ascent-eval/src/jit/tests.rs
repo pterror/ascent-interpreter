@@ -633,6 +633,33 @@ fn test_stage4_multi_rule() {
     );
 }
 
+/// Test that the JitTupleSet fast path for fully-bound arity-3 clauses works correctly.
+///
+/// The rule `result(x) <-- triple(x, y, z), triple(y, z, x)` has:
+///   clause 0: `triple(x, y, z)` — full scan, binds x, y, z
+///   clause 1: `triple(y, z, x)` — all args bound (fresh_cols empty), arity=3
+/// The last clause triggers the JitTupleSet probe path.
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stage4_tuple_set_probe_arity3() {
+    assert_packed_jit_equivalence(
+        r#"
+            relation triple(i32, i32, i32);
+            relation result(i32);
+            result(x) <-- triple(x, y, z), triple(y, z, x);
+        "#,
+        &[(
+            "triple",
+            vec![
+                vec![Value::I32(1), Value::I32(2), Value::I32(3)],
+                vec![Value::I32(2), Value::I32(3), Value::I32(1)], // forms cycle with first
+                vec![Value::I32(4), Value::I32(5), Value::I32(6)], // no cycle partner
+            ],
+        )],
+        "result",
+    );
+}
+
 #[cfg(feature = "specialized")]
 #[test]
 fn test_stage4_conditional_recursive() {

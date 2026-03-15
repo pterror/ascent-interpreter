@@ -6,6 +6,7 @@
 //! bypassing the Value enum entirely. All bindings are flat `u32` arrays.
 //! This eliminates Value cloning, Option<Value> overhead, and enum dispatch.
 
+use crate::jit::storage;
 use crate::jit_index::{JitDedupHandle, JitLookupHandle};
 use crate::specialized::PackedStorage;
 
@@ -338,16 +339,17 @@ const _: () = {
 /// Context for Stage 4 stratum function: rule bodies inlined, no fn-ptr arrays.
 ///
 /// Layout (repr C, 64-bit):
-///   offset  0: rule_ctxs     *const *mut PackedJitContextV3 (8 bytes)
-///   offset  8: num_rules     u32                            (4 bytes)
-///   offset 12: _pad          u32                            (4 bytes)
-///   offset 16: all_rels      *const *mut PackedStorage       (8 bytes)
-///   offset 24: n_all_rels    u32                            (4 bytes)
-///   offset 28: _pad2         u32                            (4 bytes)
-///   offset 32: handles_buf   *mut JitLookupHandle           (8 bytes)
-///   offset 40: lookup_specs  *const LookupSpec              (8 bytes)
-///   offset 48: total_handles u32                            (4 bytes)
-///   offset 52: _pad3         u32                            (4 bytes)
+///   offset  0: rule_ctxs       *const *mut PackedJitContextV3 (8 bytes)
+///   offset  8: num_rules       u32                            (4 bytes)
+///   offset 12: _pad            u32                            (4 bytes)
+///   offset 16: all_rels        *const *mut PackedStorage       (8 bytes)
+///   offset 24: n_all_rels      u32                            (4 bytes)
+///   offset 28: _pad2           u32                            (4 bytes)
+///   offset 32: handles_buf     *mut JitLookupHandle           (8 bytes)
+///   offset 40: lookup_specs    *const LookupSpec              (8 bytes)
+///   offset 48: total_handles   u32                            (4 bytes)
+///   offset 52: _pad3           u32                            (4 bytes)
+///   offset 56: tuple_sets_buf  *const *const JitTupleSet      (8 bytes)
 #[repr(C)]
 pub struct StratumStage4Ctx {
     /// Pointer to array of *mut PackedJitContextV3, one per rule.
@@ -365,6 +367,9 @@ pub struct StratumStage4Ctx {
     /// Total number of handles (= sum of num_clauses * 2 over all rules).
     pub total_handles: u32,
     pub _pad3: u32,
+    /// Flat array parallel to handles_buf; each entry is a *const JitTupleSet
+    /// for the total relation of that clause, or null if not applicable.
+    pub tuple_sets_buf: *const *const storage::JitTupleSet,
 }
 
 unsafe impl Send for StratumStage4Ctx {}
@@ -381,6 +386,7 @@ const _: () = {
     assert!(std::mem::offset_of!(StratumStage4Ctx, handles_buf) == 32);
     assert!(std::mem::offset_of!(StratumStage4Ctx, lookup_specs) == 40);
     assert!(std::mem::offset_of!(StratumStage4Ctx, total_handles) == 48);
+    assert!(std::mem::offset_of!(StratumStage4Ctx, tuple_sets_buf) == 56);
 };
 
 /// Insert a packed u32 tuple directly into a relation.

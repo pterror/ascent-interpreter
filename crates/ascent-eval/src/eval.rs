@@ -326,6 +326,10 @@ struct StratumStage4Runtime {
     _lookup_specs: Box<[crate::jit::packed_helpers::LookupSpec]>,
     /// Per-rule dedup handle pointer arrays (one *mut JitDedupHandle per head relation per rule).
     _per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>>,
+    /// Owned JitTupleSet boxes (one per fully-bound inner clause).
+    _tuple_sets: Vec<Box<crate::jit::storage::JitTupleSet>>,
+    /// Flat pointer array parallel to handles_buf (tuple_sets_buf in ctx).
+    _tuple_sets_buf: Box<[*const crate::jit::storage::JitTupleSet]>,
 }
 
 #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -1095,6 +1099,51 @@ impl Engine {
         let mut handles_box: Box<[JitLookupHandle]> = handles_flat.into_boxed_slice();
         let specs_box: Box<[LookupSpec]> = specs_flat.into_boxed_slice();
 
+        // Build tuple_sets_buf: parallel to handles_buf.
+        // For fully-bound clauses (clause_offset > 0 and fresh_cols.is_empty()),
+        // store a pointer to a JitTupleSet built from the total relation's packed data.
+        // All other slots are null.
+        let mut tuple_sets_storage: Vec<*const crate::jit::storage::JitTupleSet> =
+            vec![std::ptr::null(); total_handles as usize];
+        let mut tuple_set_boxes: Vec<Box<crate::jit::storage::JitTupleSet>> = Vec::new();
+        for (rule_i, rule) in rules.iter().enumerate() {
+            let rule_handle_start = rule_handle_offsets[rule_i];
+            let rule_clauses: Vec<&crate::compiled::CClause> = rule
+                .body
+                .iter()
+                .filter_map(|item| match item {
+                    CBodyItem::Clause(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            for (clause_offset, clause) in rule_clauses.iter().enumerate() {
+                if clause_offset == 0 {
+                    // Clause 0 is always a full scan; skip.
+                    continue;
+                }
+                if !clause.fresh_cols.is_empty() {
+                    // Not fully-bound; no tuple set needed.
+                    continue;
+                }
+                // Fully-bound inner clause: build JitTupleSet from total relation.
+                let ps = match self.relations.get(&clause.relation) {
+                    Some(Relation::Packed(p)) => p,
+                    _ => continue,
+                };
+                let arity = ps.arity;
+                let ts = crate::jit::storage::JitTupleSet::build(&ps.packed_data, arity);
+                tuple_set_boxes.push(ts);
+                let ts_ptr = tuple_set_boxes.last().unwrap().as_ref() as *const crate::jit::storage::JitTupleSet;
+                // Store for both use_recent variants (the tuple set is for total, correct
+                // for existence checks regardless of which delta is being iterated).
+                let base = rule_handle_start + clause_offset * 2;
+                tuple_sets_storage[base] = ts_ptr;
+                tuple_sets_storage[base + 1] = ts_ptr;
+            }
+        }
+        let tuple_sets_box: Box<[*const crate::jit::storage::JitTupleSet]> =
+            tuple_sets_storage.into_boxed_slice();
+
         // Fix up per-rule ctx lookup_handles pointers now that handles_box is stable.
         for (rule_i, ctx) in per_rule_ctxs.iter_mut().enumerate() {
             let offset = rule_handle_offsets[rule_i];
@@ -1127,6 +1176,7 @@ impl Engine {
             lookup_specs: specs_box.as_ptr(),
             total_handles,
             _pad3: 0,
+            tuple_sets_buf: tuple_sets_box.as_ptr(),
         });
 
         Some(StratumStage4Runtime {
@@ -1139,6 +1189,8 @@ impl Engine {
             _handles_buf: handles_box,
             _lookup_specs: specs_box,
             _per_rule_dedup_handles: per_rule_dedup_handles,
+            _tuple_sets: tuple_set_boxes,
+            _tuple_sets_buf: tuple_sets_box,
         })
     }
 

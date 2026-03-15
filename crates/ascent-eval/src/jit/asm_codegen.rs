@@ -48,6 +48,7 @@ use dynasmrt::x64::Assembler;
 
 use crate::compiled::{CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CUnOp};
 use crate::jit::packed_helpers::StratumStage4Fn;
+use crate::jit::storage;
 use crate::value::Value;
 
 /// A compiled stratum function produced by the asm backend.
@@ -255,6 +256,156 @@ fn emit_store_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
         VarLoc::Reg(13)     => dynasm!(asm; mov r13d, edx),
         VarLoc::Reg(r)      => panic!("emit_store_var: unexpected reg {r}"),
     }
+}
+
+// ─── JitTupleSet probe ────────────────────────────────────────────────────
+
+/// Emit an inline `JitTupleSet` probe for a fully-bound clause (all args already bound).
+///
+/// On match (tuple found in set): fall through.
+/// On no-match (empty slot encountered): jump to `when_exhausted`.
+///
+/// # Constraints
+/// - Only supports arity == 3 (returns Err otherwise).
+///   Arity <= 2: the existing col-value contiguous path is already O(1) and faster.
+///   Arity > 3:  not yet implemented.
+/// - All clause args must be `Var`, `I32`, or `Bool`.
+///
+/// # Register protocol
+/// Clobbers: rax, rcx, rdx, rdi, rsi, r8, r9, r10, r11.
+/// Reads handle_idx entry from `ctx->tuple_sets_buf` via CTX_SLOT.
+///
+/// # JitTupleSet layout (from storage.rs)
+/// - slots @ 0, mask @ 8, len @ 16
+/// - stride = arity + 1 = 4 words per slot (for arity 3)
+/// - slot[0] = hash_tag (0 = empty), slot[1..4] = tuple words
+fn emit_tuple_set_probe(
+    asm: &mut Assembler,
+    clause: &CClause,
+    handle_idx: usize,
+    when_exhausted: DynamicLabel,
+    var_locs: &[VarLoc],
+) -> Result<(), String> {
+    let arity = clause.args.len();
+    // For arity <= 2, the existing col-value contiguous path is already O(1) for
+    // fully-bound existence checks and is faster than a JitTupleSet probe.
+    // Only use the tuple-set path for arity >= 3 where no other fast path exists.
+    if arity < 3 {
+        return Err(format!(
+            "emit_tuple_set_probe: arity {arity} skipped (existing col-value path is faster)"
+        ));
+    }
+    if arity > 3 {
+        return Err(format!(
+            "emit_tuple_set_probe: arity {arity} unsupported (only arity 3 implemented)"
+        ));
+    }
+
+    // Validate arg types
+    for arg in &clause.args {
+        match arg {
+            CClauseArg::Var(_) => {}
+            CClauseArg::Expr(CExpr::Literal(crate::value::Value::I32(_))) => {}
+            CClauseArg::Expr(CExpr::Literal(crate::value::Value::Bool(_))) => {}
+            _ => return Err(format!("emit_tuple_set_probe: unsupported arg type: {arg:?}")),
+        }
+    }
+
+    // arity == 3 from here on.
+    let handle_idx_i32 = (handle_idx * 8) as i32;
+
+    // Load JitTupleSet pointer: ctx->tuple_sets_buf[handle_idx]
+    dynasm!(asm
+        ; mov rdi, [rbp + CTX_SLOT]        // ctx
+        ; mov rdi, [rdi + 56]              // tuple_sets_buf (offset 56 in StratumStage4Ctx)
+        ; mov rdi, [rdi + handle_idx_i32]  // *const JitTupleSet for this clause
+    );
+
+    // Null check: if tuple_sets_buf slot is null, skip fast path
+    dynasm!(asm; test rdi, rdi; jz =>when_exhausted);
+
+    // Load JitTupleSet fields
+    // r8 = slots ptr (offset 0), r9 = mask (offset 8, u64)
+    dynasm!(asm
+        ; mov r8, [rdi]      // r8 = slots ptr
+        ; mov r9, [rdi + 8]  // r9 = mask
+    );
+
+    // Load args into registers: edi=arg0, esi=arg1, r11d=arg2
+    // Each arg is loaded into eax first, then moved to the target register.
+    macro_rules! load_clause_arg {
+        ($asm:expr, $idx:expr, $tgt:ident) => {
+            match &clause.args[$idx] {
+                CClauseArg::Var(var_id) => {
+                    emit_load_var($asm, var_locs, *var_id);
+                    dynasm!($asm; mov $tgt, eax);
+                }
+                CClauseArg::Expr(CExpr::Literal(crate::value::Value::I32(n))) => {
+                    dynasm!($asm; mov $tgt, *n);
+                }
+                CClauseArg::Expr(CExpr::Literal(crate::value::Value::Bool(b))) => {
+                    let v = if *b { 1i32 } else { 0i32 };
+                    dynasm!($asm; mov $tgt, v);
+                }
+                _ => return Err(format!("emit_tuple_set_probe: unsupported arg type")),
+            }
+        };
+    }
+
+    load_clause_arg!(asm, 0, edi);
+    load_clause_arg!(asm, 1, esi);
+    load_clause_arg!(asm, 2, r11d);
+
+    // Compute tuple_hash(words) for 3 words:
+    //   h = 0x9e3779b9
+    //   h = h * 0x9e3779b9 + arg0
+    //   h = h * 0x9e3779b9 + arg1
+    //   h = h * 0x9e3779b9 + arg2
+    //   if h == 0: h = 1
+    dynasm!(asm; mov eax, 0x9e3779b9u32 as i32);
+    dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, edi);
+    dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, esi);
+    dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, r11d);
+
+    let hash_ok = asm.new_dynamic_label();
+    dynasm!(asm; test eax, eax; jnz =>hash_ok; mov eax, 1; =>hash_ok);
+    dynasm!(asm; mov edx, eax);  // edx = hash_tag
+
+    // r10 = slot index = hash & mask
+    dynasm!(asm; mov r10, rax; and r10, r9);
+
+    // Probe loop: stride = 4 (arity+1=4), so rcx = r10 * 4
+    let probe_lp   = asm.new_dynamic_label();
+    let probe_next = asm.new_dynamic_label();
+    let probe_done = asm.new_dynamic_label();
+
+    dynasm!(asm; =>probe_lp);
+    // stride=4: rcx = r10*4
+    dynasm!(asm; lea rcx, [r10 + r10*3]);  // r10 * 4
+
+    // Check hash_tag
+    dynasm!(asm
+        ; mov eax, [r8 + rcx*4]   // hash_tag = slots[slot*4]
+        ; test eax, eax
+        ; je =>when_exhausted      // empty → not found
+        ; cmp eax, edx            // hash matches?
+        ; jne =>probe_next
+    );
+
+    // Full comparison: slots[slot*4 + 1] == arg0, +2 == arg1, +3 == arg2
+    dynasm!(asm; cmp [r8 + rcx*4 + 4], edi;  jne =>probe_next);
+    dynasm!(asm; cmp [r8 + rcx*4 + 8], esi;  jne =>probe_next);
+    dynasm!(asm; cmp [r8 + rcx*4 + 12], r11d; jne =>probe_next);
+
+    // Found!
+    dynasm!(asm; jmp =>probe_done);
+
+    dynasm!(asm; =>probe_next);
+    dynasm!(asm; inc r10; and r10, r9; jmp =>probe_lp);
+
+    dynasm!(asm; =>probe_done);
+
+    Ok(())
 }
 
 // ─── Expression compilation ───────────────────────────────────────────────
@@ -553,6 +704,8 @@ struct EmitParams<'a> {
     prptr: usize,
     pcount: usize,
     var_locs: &'a [VarLoc],
+    /// Absolute starting index of this rule in the flat handles_buf / tuple_sets_buf.
+    rule_handle_base: usize,
 }
 
 /// Emit code for clause `level` and all deeper clauses.
@@ -665,6 +818,29 @@ fn emit_clause_level(
         let is_rec = p.is_rec[level];
         // Contiguous mode: EDB relations (!is_rec) use sequential scan.
         let is_contiguous = !is_rec;
+
+        // Fast path for fully-bound existence checks: inline JitTupleSet probe.
+        if clause.fresh_cols.is_empty() {
+            let handle_idx_in_buf = p.rule_handle_base
+                + level * 2
+                + if use_recent { 1 } else { 0 };
+            if emit_tuple_set_probe(asm, clause, handle_idx_in_buf, when_exhausted, p.var_locs).is_ok() {
+                // Probe succeeded (emitted inline code). Fall through means found.
+                if level + 1 == p.clauses.len() {
+                    for expr in p.rule_conds {
+                        emit_expr(asm, expr, p.var_locs)?;
+                        dynasm!(asm; test eax, eax; jz =>when_exhausted);
+                    }
+                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
+                    dynasm!(asm; jmp =>when_exhausted);
+                } else {
+                    emit_clause_level(asm, p, level + 1, outer_exit, when_exhausted)?;
+                }
+                return Ok(());
+            }
+            // If emit_tuple_set_probe returned Err (e.g. unsupported arity), fall through
+            // to the existing col-index + scan path.
+        }
 
         // Compute probe key into ecx
         if clause.bound_cols.is_empty() {
@@ -989,6 +1165,7 @@ fn emit_rule_variant(
     pcount: usize,
     pdptr: usize,
     prptr: usize,
+    rule_handle_base: usize,
 ) -> Result<(), String> {
     let variant_exit = asm.new_dynamic_label();
 
@@ -1036,6 +1213,7 @@ fn emit_rule_variant(
         prptr,
         pcount,
         var_locs: &var_locs,
+        rule_handle_base,
     };
 
     emit_clause_level(asm, &p, 0, variant_exit, variant_exit)?;
@@ -1120,6 +1298,18 @@ pub fn codegen_stratum_asm(
 
     let exit_lbl = asm.new_dynamic_label();
 
+    // Compute per-rule base index into the flat handles_buf / tuple_sets_buf.
+    // Each rule contributes clause_count * 2 entries (full + recent per clause).
+    let rule_handle_bases: Vec<usize> = {
+        let mut bases = Vec::with_capacity(rules.len());
+        let mut offset = 0usize;
+        for (clauses, _, _) in rules.iter() {
+            bases.push(offset);
+            offset += clauses.len() * 2;
+        }
+        bases
+    };
+
     // Full variants
     for (rule_i, (clauses, heads, conds)) in rules.iter().enumerate() {
         emit_rule_variant(
@@ -1127,6 +1317,7 @@ pub fn codegen_stratum_asm(
             var_count, max_head_arity, max_depth,
             packed_try_insert_addr, packed_count_addr,
             packed_data_ptr_addr, packed_recent_ptr_addr,
+            rule_handle_bases[rule_i],
         )?;
     }
 
@@ -1146,6 +1337,7 @@ pub fn codegen_stratum_asm(
                 var_count, max_head_arity, max_depth,
                 packed_try_insert_addr, packed_count_addr,
                 packed_data_ptr_addr, packed_recent_ptr_addr,
+                rule_handle_bases[rule_i],
             )?;
         }
     }

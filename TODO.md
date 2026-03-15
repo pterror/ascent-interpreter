@@ -170,6 +170,71 @@ The true minimum is **zero per-iteration calls + one per rule-invocation for ins
 
 - [x] **Inline dedup probe for `packed_try_insert`** — at fixpoint, most head tuples are duplicates; `packed_try_insert` is called once per match but returns 0 (duplicate) the vast majority of the time. Implemented: `JitDedupTable` (open-addressed flat u32 hash table, stride = arity+1) embedded in `PackedStorage`, populated incrementally by `update_jit_indices()`. JIT loads `head_dedup_handles` pointer from ctx offset 40 at function entry, computes hash and probes table inline, jumps past `packed_try_insert` on duplicate (zero Rust calls for duplicates; one call for new tuples). Note: bulk-insert scratch buffer not implemented — new tuples still call `packed_try_insert` individually, but this is one call per new tuple (already minimal).
 
+### Zero-overhead JIT (from scratch)
+
+**Goal:** LLVM parity. Current gaps: triangle 12×, TC 2.6×, fibonacci 2.3×.
+
+**Root cause of all remaining gaps** — three structural problems, in priority order:
+
+1. **O(n) existence check for fully-bound clauses** — e.g. triangle's `edge(a,c)` where both a and c are already bound. Current asm probes the column index by key `a`, then scans all values for `c` — O(n). ascent_macro does an O(1) HashSet probe. With n≈10 values per key and 7,220 outer iterations, this is ~72,000 unnecessary comparisons per fixpoint iteration.
+
+2. **`packed_try_insert` Rust call for new tuples** — one call per new tuple emitted. Dedup probe is already inline (JitDedupTable), but the actual write still goes through Rust. Need inline insert: write to `data` array directly, insert into dedup set inline, call Rust only on buffer growth (rare).
+
+3. **Register allocation** — outer-loop-stable variables spill to stack slots, causing load/store on every inner iteration. Step 3a partial fix exists but callee-saved register assignment is not complete for all rule depths.
+
+**New architecture — JIT-native storage:**
+
+All data structures are `#[repr(C)]` with compile-time-verified fixed offsets, so the JIT can address them without Rust calls. Slow paths (table growth, advance/swap) call Rust; everything in the hot loop is inline.
+
+```
+JitColIndex (#[repr(C)]):
+  keys:    *mut u32  @ 0   — open-addressed hash table keys; u32::MAX = empty
+  offsets: *mut u32  @ 8   — offsets[i] = start in vals for bucket i
+  vals:    *mut u32  @ 16  — flat value array (col-values arity-2, row-idx otherwise)
+  mask:    u32       @ 24  — cap-1 (power-of-2)
+  len:     u32       @ 28  — occupied bucket count
+
+JitTupleSet (#[repr(C)]):          — full-tuple existence/dedup
+  slots:  *mut u32   @ 0   — inline storage; stride=arity; slots[i*arity]=tag (0=empty)
+  mask:   u64        @ 8   — (cap_in_tuples - 1)
+  arity:  u32        @ 16
+  len:    u32        @ 20
+
+JitRelData (#[repr(C)]):
+  data:        *mut u32        @ 0   — packed tuples, stride=arity
+  len:         u64             @ 8   — tuple count
+  cap:         u64             @ 16  — capacity in tuples
+  col_indices: *mut JitColIndex @ 24  — array[arity]
+  tuple_set:   JitTupleSet     @ 32  — for existence checks + head dedup (56 bytes? → offset 88)
+  arity:       u32             @ 88
+```
+
+**Inline operations in dynasm:**
+
+- **Col index probe** (key → vals range): FxHash(`key`) & mask → linear probe keys[] for match or empty → read offsets[i], offsets[i+1] for range. ~10 instructions.
+- **Tuple set probe** (existence check): FxHash of n u32s & mask → linear probe slots[] stride-arity. ~12 instructions for arity-2.
+- **Tuple set insert** (new tuple): probe to find empty slot → write tuple inline. Bounds-check `len < cap*0.7`; if full, call `rust_tuple_set_grow`. ~15 instructions fast path.
+- **Data write** (append to .new): write arity words at `data + len*arity`; increment len; if `len == cap`, call `rust_data_grow`. ~5 instructions.
+
+**Hot loop for triangle rule** with new architecture (zero Rust calls until growth):
+```
+outer: for i in 0..edge_delta.len:
+  a, b = edge_delta.data[i*2 .. i*2+2]
+  probe edge_total.col_indices[0] for key=b → (vals_start, count)
+  inner: for j in 0..count:
+    c = edge_total.col_indices[0].vals[vals_start+j]
+    probe edge_total.tuple_set for (a,c) → exists?    // O(1)!
+    if !exists:
+      write (a,c) to triangle_new.data, insert into triangle_new.tuple_set
+advance: call rust_advance(ctx)   // once per fixpoint iter
+```
+
+**Implementation plan:**
+
+1. `jit_storage.rs` — new structs, Rust-side build/populate functions, offset assertions
+2. `asm_codegen.rs` — inline probe/insert emitters using new structs; remove all Rust calls from hot path
+3. `eval.rs` — new stratum fast path using `JitRelData`; old path as fallback
+
 ### Near-native performance roadmap
 
 **Goal:** within ~1.5× of `ascent_macro` on join-heavy queries. Current gaps: triangle 12×, connected_components 6.7×, TC 2.6×, fibonacci 2.3×.
@@ -297,18 +362,26 @@ existence-check clauses. Updated both asm and Cranelift backends + specialized.r
    vs ascent_macro's O(1) HashSet probe; (b) 6,840 `packed_try_insert` calls.
 3. TC inner loop is linked-list (IDB recursive, not col-value eligible).
 
-**Next high-value option: O(1) existence check for fully-bound EDB clauses**
-When all clause cols are bound (e.g., `tc(x,z)` where both x and z already bound), the
-current asm path probes tc's JitHashIndex by x, then scans ~n/2 values for z — O(n).
-ascent_macro uses an O(1) HashSet. Fixing this would collapse 7,220 × ~10-iter scans to
-7,220 × 1 dedup probe, closing ~60% of the remaining triangle gap. Implementation requires
-adding EDB input dedup handles to the rule context and a direct dedup-probe code path in
-asm_codegen for fully-bound EDB clauses.
+**O(1) existence check for fully-bound clauses — implemented for arity 3**
+`JitTupleSet` added to `storage.rs` (open-addressed set, stride=arity+1). Added
+`tuple_sets_buf: *const *const JitTupleSet` field at offset 56 in `StratumStage4Ctx`
+(flat parallel array to `handles_buf`). `emit_tuple_set_probe` in `asm_codegen.rs`
+emits inline arity-3 probes (full 3-word hash + comparison, ~15 instructions, zero Rust
+calls). `eval.rs` populates `tuple_sets_buf` for all fully-bound inner clauses.
+Coverage: arity ≤ 2 falls back to existing col-value path (already O(1) amortized);
+arity = 3 uses JitTupleSet; arity > 3 falls back (not yet implemented).
 
-**Residual gap:** triangle ~12×, TC ~2.5×. Steps 3a (register assignment, `14c60f1`) and 3b
-(N-clause asm, `cec22d0`) are already done. Steps 3c–3e would expand asm coverage but not
-close the structural gap. Primary remaining options: (a) O(1) existence check (above);
-(b) inline `packed_try_insert` to eliminate function-call overhead for head emission;
+**Impact on triangle benchmark (arity-2 edge, n=20):** ~0% change — triangle uses
+arity-2 edge relation for all clauses, so the JitTupleSet path is not triggered. The
+existing col-value contiguous path already handles arity-2 fully-bound existence checks
+efficiently. The JitTupleSet path will benefit programs with arity-3+ relations and
+fully-bound inner clauses.
+
+**Residual gap:** triangle ~11×, TC ~2.5×. The triangle gap is dominated by: (a) arity-2
+fully-bound clause already fast via col-value path but still slower than ascent_macro
+due to extra hash+scan vs direct HashSet::contains; (b) 6,840 `packed_try_insert` calls.
+Primary remaining options: (a) extend JitTupleSet to arity 2 (requires profiling proof
+that it's faster than current path); (b) inline `packed_try_insert` for head emission;
 (c) accept gap and move to other features.
 
 ### Relation storage optimizations

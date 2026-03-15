@@ -1,0 +1,604 @@
+//! Zero-callback JIT storage layer.
+//!
+//! Provides `#[repr(C)]` structs with fixed, asserted offsets that
+//! dynasm-generated x86-64 code can address directly without any Rust
+//! function calls in the inner loop.
+//!
+//! All heap allocations use `alloc_zeroed` / `dealloc` directly so that
+//! `Drop` can recover them by reconstructing the original `Layout`.
+
+// Not all storage types/methods are used yet — dead_code allowed intentionally.
+#![allow(dead_code)]
+
+use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::ptr;
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+/// Sentinel key value meaning "empty bucket" in `JitColIndex`.
+pub const EMPTY_KEY: u32 = u32::MAX;
+
+/// Sentinel tag value meaning "empty slot" in `JitTupleSet`.
+pub const EMPTY_TAG: u32 = 0;
+
+// ─── Hash helpers ───────────────────────────────────────────────────────────
+
+/// 32-bit Knuth multiplicative hash — must match what the JIT emits.
+#[inline(always)]
+fn col_hash(key: u32) -> u32 {
+    key.wrapping_mul(0x9e3779b9)
+}
+
+/// Multiply-accumulate tuple hash — must match what the JIT emits.
+/// Returns a value != 0 (0 is reserved as `EMPTY_TAG`).
+#[inline(always)]
+fn tuple_hash(words: &[u32]) -> u32 {
+    let mut h: u32 = 0x9e3779b9;
+    for &w in words {
+        h = h.wrapping_mul(0x9e3779b9).wrapping_add(w);
+    }
+    if h == 0 { 1 } else { h }
+}
+
+// ─── Raw allocation helpers ──────────────────────────────────────────────────
+
+/// Allocate `count` zeroed `u32` values and return the raw pointer.
+///
+/// The returned pointer must be freed by calling `free_u32_slice(ptr, count)`.
+/// For `count == 0` returns a dangling non-null pointer (no allocation).
+fn alloc_u32_zeroed(count: usize) -> *mut u32 {
+    if count == 0 {
+        return ptr::NonNull::dangling().as_ptr();
+    }
+    let layout = Layout::array::<u32>(count).expect("layout overflow");
+    let ptr = unsafe { alloc_zeroed(layout) } as *mut u32;
+    assert!(!ptr.is_null(), "allocation failed");
+    ptr
+}
+
+/// Allocate `count` zeroed `u64` values and return the raw pointer.
+fn alloc_u64_zeroed(count: usize) -> *mut u64 {
+    if count == 0 {
+        return ptr::NonNull::dangling().as_ptr();
+    }
+    let layout = Layout::array::<u64>(count).expect("layout overflow");
+    let ptr = unsafe { alloc_zeroed(layout) } as *mut u64;
+    assert!(!ptr.is_null(), "allocation failed");
+    ptr
+}
+
+/// Free a `u32` slice previously allocated with `alloc_u32_zeroed`.
+/// No-op for `count == 0`.
+unsafe fn free_u32_slice(ptr: *mut u32, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let layout = Layout::array::<u32>(count).expect("layout overflow");
+    unsafe { dealloc(ptr as *mut u8, layout) };
+}
+
+/// Free a `u64` slice previously allocated with `alloc_u64_zeroed`.
+/// No-op for `count == 0`.
+unsafe fn free_u64_slice(ptr: *mut u64, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let layout = Layout::array::<u64>(count).expect("layout overflow");
+    unsafe { dealloc(ptr as *mut u8, layout) };
+}
+
+/// Next power of two >= `n`, minimum 16.
+fn next_pow2_min16(n: usize) -> usize {
+    let mut cap = 16usize;
+    while cap < n {
+        cap <<= 1;
+    }
+    cap
+}
+
+// ─── JitColIndex ────────────────────────────────────────────────────────────
+
+/// Per-column open-addressed hash map.
+///
+/// Maps a `u32` column value to a contiguous slice of `u32` values in `vals`.
+/// For arity-2 relations the stored values are the *other* column's values;
+/// for higher arities they are row indices.
+///
+/// Field offsets are fixed and verified by static assertions below.
+#[repr(C)]
+pub struct JitColIndex {
+    /// Hash-table key array; `EMPTY_KEY` (0xFFFF_FFFF) = empty bucket.
+    /// offset 0
+    pub keys: *mut u32,
+    /// Range array: `ranges[i] = start | (count << 32)`.
+    /// offset 8
+    pub ranges: *mut u64,
+    /// Flat value array (values for all keys, grouped by key).
+    /// offset 16
+    pub vals: *mut u32,
+    /// `capacity - 1`; capacity is always a power of 2.
+    /// offset 24
+    pub mask: u32,
+    /// Number of occupied buckets.
+    /// offset 28
+    pub len: u32,
+}
+
+// Safety: JitColIndex is only used from a single JIT-callback thread.
+unsafe impl Send for JitColIndex {}
+unsafe impl Sync for JitColIndex {}
+
+impl JitColIndex {
+    /// Returns a zeroed, unallocated struct.  Must not be dereferenced until
+    /// `build` has been called.
+    pub fn new_empty() -> Self {
+        JitColIndex {
+            keys: ptr::null_mut(),
+            ranges: ptr::null_mut(),
+            vals: ptr::null_mut(),
+            mask: 0,
+            len: 0,
+        }
+    }
+
+    /// Build a column index from a flat row-major tuple slice.
+    ///
+    /// `data[i * arity + col]` is the `col`-th field of tuple `i`.
+    ///
+    /// Stored values:
+    /// - arity == 2 → the *other* column's value
+    /// - arity != 2 → row index (`i as u32`)
+    ///
+    /// Values within each key group are sorted ascending (binary-search compatible).
+    pub fn build(data: &[u32], arity: usize, col: usize) -> Box<Self> {
+        assert!(arity >= 1);
+        assert!(col < arity);
+        let n_tuples = data.len() / arity;
+
+        // ── pass 1: collect (key, value) pairs ──────────────────────────
+        let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(n_tuples);
+        for i in 0..n_tuples {
+            let key = data[i * arity + col];
+            let val = if arity == 2 {
+                data[i * arity + (1 - col)] // other column
+            } else {
+                i as u32 // row index
+            };
+            pairs.push((key, val));
+        }
+        // Sort by key then value for grouping + binary-search compatibility.
+        pairs.sort_unstable();
+
+        // ── pass 2: build key→(start, count) groups ──────────────────────
+        let mut groups: Vec<(u32, u32, u32)> = Vec::new(); // (key, start, count)
+        {
+            let mut i = 0usize;
+            while i < pairs.len() {
+                let key = pairs[i].0;
+                let start = i as u32;
+                while i < pairs.len() && pairs[i].0 == key {
+                    i += 1;
+                }
+                let count = (i as u32) - start;
+                groups.push((key, start, count));
+            }
+        }
+        let n_keys = groups.len();
+        let n_vals = pairs.len();
+
+        // ── allocate hash table ──────────────────────────────────────────
+        // Target load factor < 0.7; we need room for n_keys with that constraint.
+        let cap = next_pow2_min16((n_keys * 10 / 7) + 1);
+        let mask = (cap - 1) as u32;
+
+        let keys_ptr = alloc_u32_zeroed(cap);
+        // Fill with EMPTY_KEY.
+        for i in 0..cap {
+            unsafe { *keys_ptr.add(i) = EMPTY_KEY };
+        }
+
+        let ranges_ptr = alloc_u64_zeroed(cap);
+        let vals_ptr = alloc_u32_zeroed(n_vals.max(1));
+
+        // ── write vals array ─────────────────────────────────────────────
+        for (idx, &(_, val)) in pairs.iter().enumerate() {
+            unsafe { *vals_ptr.add(idx) = val };
+        }
+
+        // ── insert groups into hash table (linear probing) ───────────────
+        for &(key, start, count) in &groups {
+            let mut slot = (col_hash(key) & mask) as usize;
+            loop {
+                let existing = unsafe { *keys_ptr.add(slot) };
+                if existing == EMPTY_KEY {
+                    unsafe {
+                        *keys_ptr.add(slot) = key;
+                        *ranges_ptr.add(slot) = (start as u64) | ((count as u64) << 32);
+                    }
+                    break;
+                }
+                slot = (slot + 1) & (mask as usize);
+            }
+        }
+
+        Box::new(JitColIndex {
+            keys: keys_ptr,
+            ranges: ranges_ptr,
+            vals: vals_ptr,
+            mask,
+            len: n_keys as u32,
+        })
+    }
+
+    /// Capacity (number of hash-table slots).
+    #[inline]
+    pub fn cap(&self) -> usize {
+        (self.mask as usize) + 1
+    }
+
+    /// Total number of values stored across all key groups.
+    ///
+    /// Computed by summing `count` fields from all occupied buckets.
+    pub fn vals_len(&self) -> usize {
+        if self.keys.is_null() {
+            return 0;
+        }
+        let cap = self.cap();
+        let mut total = 0usize;
+        for i in 0..cap {
+            let k = unsafe { *self.keys.add(i) };
+            if k != EMPTY_KEY {
+                let r = unsafe { *self.ranges.add(i) };
+                let count = (r >> 32) as u32;
+                total += count as usize;
+            }
+        }
+        total
+    }
+}
+
+impl Drop for JitColIndex {
+    fn drop(&mut self) {
+        if self.keys.is_null() {
+            return;
+        }
+        let cap = self.cap();
+        let n_vals = self.vals_len();
+        unsafe {
+            free_u32_slice(self.keys, cap);
+            free_u64_slice(self.ranges, cap);
+            free_u32_slice(self.vals, n_vals.max(1));
+        }
+        self.keys = ptr::null_mut();
+        self.ranges = ptr::null_mut();
+        self.vals = ptr::null_mut();
+    }
+}
+
+// ─── JitTupleSet ────────────────────────────────────────────────────────────
+
+/// Full-tuple open-addressed hash set.
+///
+/// Each slot is `arity + 1` consecutive `u32` words:
+/// `[hash_tag, col0, col1, …, colN]`. `hash_tag == 0` (`EMPTY_TAG`) means empty.
+///
+/// Field offsets are fixed and verified by static assertions below.
+#[repr(C)]
+pub struct JitTupleSet {
+    /// Inline storage; stride = arity + 1 words.
+    /// offset 0
+    pub slots: *mut u32,
+    /// `(cap_in_slots - 1)` where cap_in_slots is a power of 2.
+    /// offset 8
+    pub mask: u64,
+    /// Number of occupied slots.
+    /// offset 16
+    pub len: u64,
+}
+
+// Safety: only used from the JIT-callback thread.
+unsafe impl Send for JitTupleSet {}
+unsafe impl Sync for JitTupleSet {}
+
+impl JitTupleSet {
+    /// Returns a zeroed, unallocated struct.
+    pub fn new_empty() -> Self {
+        JitTupleSet {
+            slots: ptr::null_mut(),
+            mask: 0,
+            len: 0,
+        }
+    }
+
+    /// Build a `JitTupleSet` from a flat row-major tuple slice.
+    pub fn build(data: &[u32], arity: usize) -> Box<Self> {
+        let n_tuples = if arity == 0 { 0 } else { data.len() / arity };
+        let stride = arity + 1;
+
+        let cap = next_pow2_min16((n_tuples * 10 / 7) + 1);
+        let mask = (cap - 1) as u64;
+
+        // Zeroed allocation → all hash_tags are 0 == EMPTY_TAG.
+        let slots_ptr = alloc_u32_zeroed(cap * stride);
+
+        let mut occupied = 0u64;
+        for i in 0..n_tuples {
+            let tuple = &data[i * arity..(i + 1) * arity];
+            let h = tuple_hash(tuple);
+            let mut slot = (h as u64 & mask) as usize;
+            loop {
+                let tag = unsafe { *slots_ptr.add(slot * stride) };
+                if tag == EMPTY_TAG {
+                    // Write into empty slot.
+                    unsafe {
+                        *slots_ptr.add(slot * stride) = h;
+                        for (j, &v) in tuple.iter().enumerate() {
+                            *slots_ptr.add(slot * stride + 1 + j) = v;
+                        }
+                    }
+                    occupied += 1;
+                    break;
+                }
+                // Check for duplicate tuple (dedup).
+                let existing_matches = {
+                    let mut m = true;
+                    for (j, &tv) in tuple.iter().enumerate() {
+                        if unsafe { *slots_ptr.add(slot * stride + 1 + j) } != tv {
+                            m = false;
+                            break;
+                        }
+                    }
+                    m
+                };
+                if existing_matches {
+                    break; // already present — skip
+                }
+                slot = ((slot as u64 + 1) & mask) as usize;
+            }
+        }
+
+        Box::new(JitTupleSet {
+            slots: slots_ptr,
+            mask,
+            len: occupied,
+        })
+    }
+
+    /// Probe the set (Rust-side correctness checks).
+    ///
+    /// # Safety
+    /// `self` must have been built via `build` and not yet dropped.
+    pub unsafe fn contains(&self, tuple: &[u32]) -> bool {
+        if self.slots.is_null() {
+            return false;
+        }
+        let arity = tuple.len();
+        let stride = arity + 1;
+        let h = tuple_hash(tuple);
+        let mut slot = (h as u64 & self.mask) as usize;
+        loop {
+            let tag = unsafe { *self.slots.add(slot * stride) };
+            if tag == EMPTY_TAG {
+                return false;
+            }
+            if tag == h {
+                let mut matches = true;
+                for (j, &tv) in tuple.iter().enumerate() {
+                    if unsafe { *self.slots.add(slot * stride + 1 + j) } != tv {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    return true;
+                }
+            }
+            slot = ((slot as u64 + 1) & self.mask) as usize;
+        }
+    }
+
+    /// Capacity in slots.
+    #[inline]
+    pub fn cap_in_slots(&self) -> usize {
+        (self.mask + 1) as usize
+    }
+}
+
+// JitTupleSet does NOT implement Drop for freeing slots — the owner
+// (JitRelData) holds the arity and is responsible for freeing slots.
+// Dropping a standalone JitTupleSet built via `build` will leak.
+// This is intentional: JitTupleSet is always embedded in JitRelData.
+impl Drop for JitTupleSet {
+    fn drop(&mut self) {
+        // Intentional no-op: JitRelData::drop handles freeing slots.
+        // Direct use of JitTupleSet::build (outside JitRelData) leaks the
+        // slots allocation; that is acceptable for the current use case.
+    }
+}
+
+// ─── JitRelData ─────────────────────────────────────────────────────────────
+
+/// One relation version (total, delta, or new).
+///
+/// The `tuple_set` embedded at offset 32 is 24 bytes, bringing `arity` to
+/// offset 56 and the total C-visible size to 64 bytes, as verified below.
+///
+/// The Rust struct has additional private fields after the 64-byte C region
+/// that are NOT visible to JIT code.
+#[repr(C)]
+pub struct JitRelData {
+    /// Packed tuples, row-major, stride = arity.
+    /// offset 0
+    pub data: *mut u32,
+    /// Tuple count.
+    /// offset 8
+    pub len: u64,
+    /// Capacity in tuples.
+    /// offset 16
+    pub cap: u64,
+    /// `array[arity]` of pointers to `JitColIndex` (null per column if not built).
+    /// offset 24
+    pub col_indices: *mut *mut JitColIndex,
+    /// Full-tuple membership set.
+    /// offset 32  (JitTupleSet is 24 bytes → ends at 56)
+    pub tuple_set: JitTupleSet,
+    /// Relation arity.
+    /// offset 56
+    pub arity: u32,
+    #[doc(hidden)]
+    pub _pad: u32,
+    // ── private fields beyond the 64-byte C region ───────────────────────
+    // Total words allocated in tuple_set.slots (cap_in_slots * (arity + 1)).
+    // Used by Drop to reconstruct the layout for dealloc.
+    _ts_slots_words: usize,
+}
+
+// Safety: only used from the JIT-callback thread.
+unsafe impl Send for JitRelData {}
+unsafe impl Sync for JitRelData {}
+
+impl JitRelData {
+    /// Returns a zeroed, unallocated `Box<JitRelData>`.
+    pub fn new_empty(arity: usize) -> Box<Self> {
+        Box::new(JitRelData {
+            data: ptr::null_mut(),
+            len: 0,
+            cap: 0,
+            col_indices: ptr::null_mut(),
+            tuple_set: JitTupleSet::new_empty(),
+            arity: arity as u32,
+            _pad: 0,
+            _ts_slots_words: 0,
+        })
+    }
+
+    /// Build from a flat row-major packed tuple slice.
+    ///
+    /// If `build_indices` is true, column indices are built for all `arity` columns.
+    pub fn build_from_packed(data: &[u32], arity: usize, build_indices: bool) -> Box<Self> {
+        let n_tuples = if arity == 0 { 0 } else { data.len() / arity };
+
+        // ── data array ───────────────────────────────────────────────────
+        let data_words = n_tuples * arity.max(1);
+        let data_cap = n_tuples.max(1); // capacity in tuples
+        let data_ptr = alloc_u32_zeroed(data_cap * arity.max(1));
+        if !data.is_empty() {
+            unsafe { ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data_words) };
+        }
+
+        // ── tuple set ────────────────────────────────────────────────────
+        // Build, then manually decompose so we can store the slots_words for Drop.
+        let ts = JitTupleSet::build(data, arity);
+        let stride = arity + 1;
+        let ts_cap = ts.cap_in_slots();
+        let ts_slots_words = ts_cap * stride;
+        let ts_slots = ts.slots;
+        let ts_mask = ts.mask;
+        let ts_len = ts.len;
+        // Suppress the (no-op) drop — we own the memory.
+        std::mem::forget(ts);
+
+        // ── column index pointer array ────────────────────────────────────
+        // We allocate an array of `arity` raw pointers.  `*mut *mut JitColIndex`
+        // has the same size as `*mut usize` on the target, so we allocate
+        // enough bytes and cast.
+        let ptr_bytes = arity * std::mem::size_of::<*mut JitColIndex>();
+        let col_indices_ptr: *mut *mut JitColIndex = if arity > 0 {
+            // Allocate as bytes via a u8 layout for exact sizing.
+            let layout =
+                Layout::array::<*mut JitColIndex>(arity).expect("layout overflow");
+            let raw = unsafe { alloc_zeroed(layout) } as *mut *mut JitColIndex;
+            assert!(!raw.is_null(), "allocation failed");
+            if build_indices {
+                for col in 0..arity {
+                    let idx = JitColIndex::build(data, arity, col);
+                    unsafe { *raw.add(col) = Box::into_raw(idx) };
+                }
+            }
+            raw
+        } else {
+            ptr::null_mut()
+        };
+        let _ = ptr_bytes; // used only for documentation
+
+        Box::new(JitRelData {
+            data: data_ptr,
+            len: n_tuples as u64,
+            cap: data_cap as u64,
+            col_indices: col_indices_ptr,
+            tuple_set: JitTupleSet {
+                slots: ts_slots,
+                mask: ts_mask,
+                len: ts_len,
+            },
+            arity: arity as u32,
+            _pad: 0,
+            _ts_slots_words: ts_slots_words,
+        })
+    }
+}
+
+impl Drop for JitRelData {
+    fn drop(&mut self) {
+        let arity = self.arity as usize;
+
+        // Free data array.
+        if !self.data.is_null() {
+            unsafe { free_u32_slice(self.data, (self.cap as usize) * arity.max(1)) };
+            self.data = ptr::null_mut();
+        }
+
+        // Free column indices (and the pointer array itself).
+        if !self.col_indices.is_null() {
+            for col in 0..arity {
+                let idx_ptr = unsafe { *self.col_indices.add(col) };
+                if !idx_ptr.is_null() {
+                    // Reconstruct Box so JitColIndex::drop runs.
+                    drop(unsafe { Box::from_raw(idx_ptr) });
+                }
+            }
+            // Free the pointer array.
+            let layout = Layout::array::<*mut JitColIndex>(arity).expect("layout overflow");
+            unsafe { dealloc(self.col_indices as *mut u8, layout) };
+            self.col_indices = ptr::null_mut();
+        }
+
+        // Free tuple_set slots.
+        if !self.tuple_set.slots.is_null() && self._ts_slots_words > 0 {
+            unsafe { free_u32_slice(self.tuple_set.slots, self._ts_slots_words) };
+            self.tuple_set.slots = ptr::null_mut();
+        }
+    }
+}
+
+// ─── Static offset assertions ────────────────────────────────────────────────
+//
+// JIT code hardcodes these byte offsets — they must never change.
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+
+    // ── JitColIndex (32 bytes) ────────────────────────────────────────────
+    assert!(offset_of!(JitColIndex, keys) == 0);
+    assert!(offset_of!(JitColIndex, ranges) == 8);
+    assert!(offset_of!(JitColIndex, vals) == 16);
+    assert!(offset_of!(JitColIndex, mask) == 24);
+    assert!(offset_of!(JitColIndex, len) == 28);
+    assert!(size_of::<JitColIndex>() == 32);
+
+    // ── JitTupleSet (24 bytes) ────────────────────────────────────────────
+    assert!(offset_of!(JitTupleSet, slots) == 0);
+    assert!(offset_of!(JitTupleSet, mask) == 8);
+    assert!(offset_of!(JitTupleSet, len) == 16);
+    assert!(size_of::<JitTupleSet>() == 24);
+
+    // ── JitRelData C-visible region (first 64 bytes) ──────────────────────
+    assert!(offset_of!(JitRelData, data) == 0);
+    assert!(offset_of!(JitRelData, len) == 8);
+    assert!(offset_of!(JitRelData, cap) == 16);
+    assert!(offset_of!(JitRelData, col_indices) == 24);
+    assert!(offset_of!(JitRelData, tuple_set) == 32);
+    assert!(offset_of!(JitRelData, arity) == 56);
+    // Total struct size is 64 (C region) + size_of::<usize>() (private field).
+    assert!(size_of::<JitRelData>() == 64 + size_of::<usize>());
+};
