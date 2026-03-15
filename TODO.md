@@ -174,9 +174,30 @@ The true minimum is **zero per-iteration calls + one per rule-invocation for ins
 
 **Goal:** LLVM parity. Current gaps: triangle ~10.2× (333µs / 32.6µs), TC ~2.5×, fibonacci ~2.3×.
 
+**Profiling results (2026-03-15, perf stat, n=20 triangle):**
+
+| | JIT | ascent_macro | ratio |
+|---|---|---|---|
+| Instructions/iter | ~9.0M | ~1.0M | 9× |
+| Cache misses/iter | ~13,100 | ~113 | **116×** |
+| Cache miss rate | 14.8% | 1.6% | 9× |
+| IPC | 1.97 | 2.21 | |
+
+**Primary bottleneck is cache misses (116× gap), not instruction count.** The JIT's `JitHashIndex`
+structure scatters each column index across 3 separate heap allocations (entries/ranges/values), and
+edge has 4 indices (full+recent × col0+col1) = 12 separate tiny allocations that thrash the cache.
+ascent_macro uses one compact open-addressed `HashMap` per join key — all data fits in 1-2 cache
+lines per probe. Closing the cache-miss gap is the highest-value remaining work.
+
 **Root cause of all remaining gaps** — three structural problems, in priority order:
 
-1. **O(n) existence check for fully-bound clauses** — e.g. triangle's `edge(a,c)` where both a and c are already bound. Current asm probes the column index by key `a`, then scans all values for `c` — O(n). ascent_macro does an O(1) HashSet probe. With n≈10 values per key and 7,220 outer iterations, this is ~72,000 unnecessary comparisons per fixpoint iteration.
+1. **Cache-hostile index structure (PRIMARY)** — `JitHashIndex` with pointer-chased entries/ranges/values
+   arrays causes 116× more cache misses per iteration than ascent_macro. Replace with a compact
+   open-addressed hash map where each column's keys+ranges+values are stored in a single flat allocation
+   (interleaved or packed), so a probe touches at most 2 cache lines. This is the JitColIndex struct
+   in the "new architecture" section below.
+
+2. **O(n) existence check for fully-bound clauses** — e.g. triangle's `edge(a,c)` where both a and c are already bound. Current asm probes the column index by key `a`, then scans all values for `c` — O(n). ascent_macro does an O(1) HashSet probe. With n≈10 values per key and 7,220 outer iterations, this is ~72,000 unnecessary comparisons per fixpoint iteration.
 
 2. [x] **`packed_try_insert` Rust call for new tuples** — eliminated via `JitHeadBuf`. At `call_insert`: JIT writes hash+tuple to dedup table slot inline; then writes tuple words to a pre-allocated `JitHeadBuf`. `jit_stratum_advance_s4` calls `jit_flush_head_bufs` before `advance()`, which batch-appends to `PackedStorage` via `insert_packed_raw_no_dedup` (bypasses dedup; guaranteed new by prior inline probe). Buffer overflow (rare) calls `jit_head_buf_grow_and_insert`. Zero Rust calls for new tuples in hot path (one call only on buffer full). Triangle n=20: ~382 µs (was 382 µs on first run after JitTupleSet probe — no regression; change stat −1% p=0.35 vs cached baseline).
 
