@@ -44,6 +44,14 @@ cd docs && bun dev # Local docs
 
 **Do the work properly.** Don't leave workarounds or hacks undocumented. When asked to analyze X, actually read X — don't synthesize from conversation.
 
+## Performance Goal
+
+**The JIT target is wall-clock parity with `ascent_macro` (LLVM-compiled Datalog).** This means optimizing for actual runtime, not a proxy metric. Instruction count matters, but so do cache misses, stall cycles, and memory layout. A change that reduces instructions while increasing cache pressure can be a regression.
+
+When evaluating a JIT optimization, profile with `perf stat -e instructions,cycles,cache-misses` and compare *per-iteration* numbers against the `ascent_macro` benchmark. The gap is closed when both instruction count and cache behavior converge, not just one.
+
+Current bottleneck (2026-03-15): **116× more cache misses per iteration** for triangle (14.8% vs 1.6% miss rate). The `JitHashIndex` pointer-chased structure is the primary cause — fix that before tuning anything else.
+
 ## JIT Design Rule
 
 **Before implementing any JIT stage, trace the full hot-path and count Rust callbacks.**
