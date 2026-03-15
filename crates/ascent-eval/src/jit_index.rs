@@ -260,7 +260,8 @@ impl JitHashIndex {
         let mut values: Vec<u32> = Vec::with_capacity(pairs.len());
         let mut len: u32 = 0;
 
-        for (key, group) in &groups {
+        for (key, group) in &mut groups {
+            group.sort_unstable();
             let start = values.len() as u32;
             let count = group.len() as u32;
             values.extend_from_slice(group);

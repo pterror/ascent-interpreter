@@ -1342,7 +1342,9 @@ fn gen_index_scan_v3(
         let is_done = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, j, entry_count);
         builder.ins().brif(is_done, loop_exit, &[], loop_body, &[]);
 
-        // Loop body: load values_ptr[head + j] as tuple_idx
+        // Loop body: load values_ptr[head + j]
+        // For arity-2 EDB: values[head+j] = free_col_val directly (col-value mode).
+        // For arity != 2: values[head+j] = tuple_idx (standard path).
         builder.switch_to_block(loop_body);
         let j = builder.use_var(var_j);
 
@@ -1352,31 +1354,29 @@ fn gen_index_scan_v3(
         let idx_in_values = builder.ins().iadd(head_ext, j_ext);
         let byte_off = builder.ins().imul_imm(idx_in_values, 4_i64);
         let elem_addr = builder.ins().iadd(values_ptr, byte_off);
-        let tuple_idx_u32 = builder.ins().load(I32, MemFlags::trusted(), elem_addr, 0i32);
-        let tuple_idx = builder.ins().uextend(ptr_type, tuple_idx_u32);
-
-        // Use stable pre-fetched packed_data_ptr (non-recursive ↔ is_contiguous)
-        let packed_buf = cached_packed_buf.expect("contiguous mode implies non-recursive");
-        let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
 
         let continue_block = builder.create_block();
         let mut inner_blocks_to_seal = Vec::new();
 
-        for (col, arg) in clause.args.iter().enumerate() {
-            match arg {
+        let is_col_value = arity == 2;
+        if is_col_value {
+            // Col-value mode: the loaded value IS the free column's actual value.
+            let col_val = builder.ins().load(I32, MemFlags::trusted(), elem_addr, 0i32);
+            let free_col = 1 - primary_col;
+
+            // Literal check on free col
+            match &clause.args[free_col] {
                 CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
-                    let actual   = load_packed_col(builder, tuple_ptr, col);
                     let expected = builder.ins().iconst(I32, *n as i64);
-                    let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                    let eq = builder.ins().icmp(IntCC::Equal, col_val, expected);
                     let pass_block = builder.create_block();
                     builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
                     inner_blocks_to_seal.push(pass_block);
                     builder.switch_to_block(pass_block);
                 }
                 CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
-                    let actual   = load_packed_col(builder, tuple_ptr, col);
                     let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
-                    let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                    let eq = builder.ins().icmp(IntCC::Equal, col_val, expected);
                     let pass_block = builder.create_block();
                     builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
                     inner_blocks_to_seal.push(pass_block);
@@ -1384,21 +1384,72 @@ fn gen_index_scan_v3(
                 }
                 _ => {}
             }
-        }
+            // Secondary bound col check (free_col in bound_cols[1..])
+            for &col in &clause.bound_cols[1..] {
+                if col == free_col {
+                    let expected = load_bound_val_vars(builder, clause, col, vars);
+                    let eq = builder.ins().icmp(IntCC::Equal, col_val, expected);
+                    let pass_block = builder.create_block();
+                    builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                    inner_blocks_to_seal.push(pass_block);
+                    builder.switch_to_block(pass_block);
+                    break;
+                }
+            }
+            // Fresh col bind
+            for &(col, var_id) in &clause.fresh_cols {
+                if col == free_col {
+                    def_binding(builder, vars, var_id, col_val);
+                    break;
+                }
+            }
+        } else {
+            // Standard path: load tuple_idx, dereference through data_ptr.
+            let tuple_idx_u32 = builder.ins().load(I32, MemFlags::trusted(), elem_addr, 0i32);
+            let tuple_idx = builder.ins().uextend(ptr_type, tuple_idx_u32);
 
-        for &col in &clause.bound_cols[1..] {
-            let actual   = load_packed_col(builder, tuple_ptr, col);
-            let expected = load_bound_val_vars(builder, clause, col, vars);
-            let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
-            let pass_block = builder.create_block();
-            builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
-            inner_blocks_to_seal.push(pass_block);
-            builder.switch_to_block(pass_block);
-        }
+            // Use stable pre-fetched packed_data_ptr (non-recursive ↔ is_contiguous)
+            let packed_buf = cached_packed_buf.expect("contiguous mode implies non-recursive");
+            let tuple_ptr = compute_tuple_ptr(builder, packed_buf, tuple_idx, arity);
 
-        for &(col, var_id) in &clause.fresh_cols {
-            let val = load_packed_col(builder, tuple_ptr, col);
-            def_binding(builder, vars, var_id, val);
+            for (col, arg) in clause.args.iter().enumerate() {
+                match arg {
+                    CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+                        let actual   = load_packed_col(builder, tuple_ptr, col);
+                        let expected = builder.ins().iconst(I32, *n as i64);
+                        let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                        let pass_block = builder.create_block();
+                        builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                        inner_blocks_to_seal.push(pass_block);
+                        builder.switch_to_block(pass_block);
+                    }
+                    CClauseArg::Expr(CExpr::Literal(Value::Bool(b))) => {
+                        let actual   = load_packed_col(builder, tuple_ptr, col);
+                        let expected = builder.ins().iconst(I32, if *b { 1 } else { 0 });
+                        let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                        let pass_block = builder.create_block();
+                        builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                        inner_blocks_to_seal.push(pass_block);
+                        builder.switch_to_block(pass_block);
+                    }
+                    _ => {}
+                }
+            }
+
+            for &col in &clause.bound_cols[1..] {
+                let actual   = load_packed_col(builder, tuple_ptr, col);
+                let expected = load_bound_val_vars(builder, clause, col, vars);
+                let eq       = builder.ins().icmp(IntCC::Equal, actual, expected);
+                let pass_block = builder.create_block();
+                builder.ins().brif(eq, pass_block, &[], continue_block, &[]);
+                inner_blocks_to_seal.push(pass_block);
+                builder.switch_to_block(pass_block);
+            }
+
+            for &(col, var_id) in &clause.fresh_cols {
+                let val = load_packed_col(builder, tuple_ptr, col);
+                def_binding(builder, vars, var_id, val);
+            }
         }
 
         for cond in &clause.conditions {

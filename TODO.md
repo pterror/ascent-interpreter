@@ -278,10 +278,38 @@ load-use serialization argument only applies when chains are long (n>100+). The 
 at benchmark sizes is dominated by Cranelift vs LLVM code quality. TC has a slight regression
 from EDB detection and index-format conversion overhead on each stratum run.
 
-**Residual gap:** triangle 11.5×, TC 2.6×. Steps 3a (register assignment, `14c60f1`) and 3b
-(N-clause asm, `cec22d0`) are already done. Remaining options: (a) evaluate larger n where
-contiguous gains are measurable; (b) Step 3c–3e to expand asm coverage; (c) accept the gap
-as a Cranelift vs LLVM quality ceiling and move on to other features.
+**Step 5 — Dynasm col-value optimization** ✅ DONE (2026-03-15)
+
+Arity-2 EDB contiguous indices now store the free column value directly (not tuple_idx),
+eliminating `imul + add + data_ptr` dereference per inner iteration. Additional micro-opts:
+pre-compute `values_base` before inner loop; keep count in `rbx` instead of stack slot;
+sort per-key values during `build_contiguous`; early exit after emit_heads for fully-bound
+existence-check clauses. Updated both asm and Cranelift backends + specialized.rs index build.
+
+**Benchmark results after Step 5 (2026-03-15):**
+- triangle `jit_hot/20`: ~372µs → ratio ~11.6×  (was 421µs / 13.1× before Steps 4–5)
+- TC `jit_hot/50`: ~260µs → ratio ~2.5×  (Step 4 regression recovered; was 271µs)
+- TC `jit_hot/100`: ~1.10ms → ratio ~2.7×  (was 1.18ms)
+
+**Assessment:** ~8-10% improvement. Smaller than expected because:
+1. Inner loop is L1-cache bound at n≤30; OOO execution already hides most load latency.
+2. Triangle's dominant remaining costs: (a) level-2 existence check is O(n) sequential scan
+   vs ascent_macro's O(1) HashSet probe; (b) 6,840 `packed_try_insert` calls.
+3. TC inner loop is linked-list (IDB recursive, not col-value eligible).
+
+**Next high-value option: O(1) existence check for fully-bound EDB clauses**
+When all clause cols are bound (e.g., `tc(x,z)` where both x and z already bound), the
+current asm path probes tc's JitHashIndex by x, then scans ~n/2 values for z — O(n).
+ascent_macro uses an O(1) HashSet. Fixing this would collapse 7,220 × ~10-iter scans to
+7,220 × 1 dedup probe, closing ~60% of the remaining triangle gap. Implementation requires
+adding EDB input dedup handles to the rule context and a direct dedup-probe code path in
+asm_codegen for fully-bound EDB clauses.
+
+**Residual gap:** triangle ~12×, TC ~2.5×. Steps 3a (register assignment, `14c60f1`) and 3b
+(N-clause asm, `cec22d0`) are already done. Steps 3c–3e would expand asm coverage but not
+close the structural gap. Primary remaining options: (a) O(1) existence check (above);
+(b) inline `packed_try_insert` to eliminate function-call overhead for head emission;
+(c) accept gap and move to other features.
 
 ### Relation storage optimizations
 

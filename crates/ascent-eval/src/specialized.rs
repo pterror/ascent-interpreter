@@ -486,11 +486,21 @@ impl PackedStorage {
                     || self.jit_indices.is_empty()
                     || !self.jit_indices[0].is_contiguous);
             if needs_build {
-                // Collect all (key, tuple_idx) pairs for each column.
+                // Collect all (key, val) pairs for each column.
+                // For arity-2: val = free column's actual value (col-value mode).
+                // For other arities: val = tuple_idx (standard mode).
                 self.jit_indices = (0..self.arity)
                     .map(|col| {
                         let pairs: Vec<(u32, u32)> = (0..self.count)
-                            .map(|idx| (self.packed_data[idx * self.arity + col], idx as u32))
+                            .map(|idx| {
+                                let key = self.packed_data[idx * self.arity + col];
+                                let val = if self.arity == 2 {
+                                    self.packed_data[idx * 2 + (1 - col)]
+                                } else {
+                                    idx as u32
+                                };
+                                (key, val)
+                            })
                             .collect();
                         crate::jit_index::JitHashIndex::build_contiguous(&pairs)
                     })
@@ -529,10 +539,20 @@ impl PackedStorage {
         let arity = self.arity;
         if self.jit_is_edb {
             // EDB: recent is contiguous (and likely empty since EDB is stable).
+            // For arity-2: val = free column's actual value (col-value mode).
+            // For other arities: val = tuple_idx (standard mode).
             for col in 0..arity {
                 let pairs: Vec<(u32, u32)> = recent
                     .iter()
-                    .map(|&idx| (packed[idx * arity + col], idx as u32))
+                    .map(|&idx| {
+                        let key = packed[idx * arity + col];
+                        let val = if arity == 2 {
+                            packed[idx * 2 + (1 - col)]
+                        } else {
+                            idx as u32
+                        };
+                        (key, val)
+                    })
                     .collect();
                 self.jit_recent_indices[col] = crate::jit_index::JitHashIndex::build_contiguous(&pairs);
             }
