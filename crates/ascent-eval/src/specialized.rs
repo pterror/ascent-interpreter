@@ -511,30 +511,43 @@ impl PackedStorage {
             return;
         }
         // ── Full index ───────────────────────────────────────────────────────
-        // Build or rebuild when new tuples have been added since last index build.
-        // EDB: count stabilises after first advance → built once.
-        // Derived: count grows each advance → rebuilt each time.
+        // EDB: one-time build using contiguous mode (col-value for arity-2).
+        // Derived: incremental linked-list insertion (O(delta) per advance).
         if self.jit_full_indexed_count < self.count {
-            self.jit_indices = (0..self.arity)
-                .map(|col| {
-                    let pairs: Vec<(u32, u32)> = (0..self.count)
-                        .map(|idx| {
-                            let key = self.packed_data[idx * self.arity + col];
-                            let val = if self.jit_is_edb && self.arity == 2 {
-                                // EDB arity-2: col-value mode (free col data directly).
-                                self.packed_data[idx * 2 + (1 - col)]
-                            } else {
-                                idx as u32
-                            };
-                            (key, val)
-                        })
+            if self.jit_is_edb {
+                self.jit_indices = (0..self.arity)
+                    .map(|col| {
+                        let pairs: Vec<(u32, u32)> = (0..self.count)
+                            .map(|idx| {
+                                let key = self.packed_data[idx * self.arity + col];
+                                let val = if self.arity == 2 {
+                                    // EDB arity-2: col-value mode (free col data directly).
+                                    self.packed_data[idx * 2 + (1 - col)]
+                                } else {
+                                    idx as u32
+                                };
+                                (key, val)
+                            })
+                            .collect();
+                        crate::jit_index::JitHashIndex::build_contiguous(&pairs)
+                    })
+                    .collect();
+                self.jit_index_is_edb_fmt = true;
+            } else {
+                if self.jit_indices.is_empty() {
+                    self.jit_indices = (0..self.arity)
+                        .map(|_| crate::jit_index::JitHashIndex::empty())
                         .collect();
-                    crate::jit_index::JitHashIndex::build_contiguous(&pairs)
-                })
-                .collect();
+                }
+                for idx in self.jit_full_indexed_count..self.count {
+                    let base = idx * self.arity;
+                    for col in 0..self.arity {
+                        self.jit_indices[col].insert(self.packed_data[base + col], idx as u32);
+                    }
+                }
+                self.jit_index_is_edb_fmt = false;
+            }
             self.jit_full_indexed_count = self.count;
-            // Record the format used so eval.rs can detect stale indices.
-            self.jit_index_is_edb_fmt = self.jit_is_edb;
         }
 
         // ── Recent index: always rebuild from current recent set ─────────────
@@ -543,20 +556,33 @@ impl PackedStorage {
         if self.jit_recent_indices.len() != arity {
             self.jit_recent_indices.resize_with(arity, crate::jit_index::JitHashIndex::empty);
         }
-        for col in 0..arity {
-            let pairs: Vec<(u32, u32)> = self.recent
-                .iter()
-                .map(|&idx| {
-                    let key = self.packed_data[idx * arity + col];
-                    let val = if is_edb && arity == 2 {
-                        self.packed_data[idx * 2 + (1 - col)]
-                    } else {
-                        idx as u32
-                    };
-                    (key, val)
-                })
-                .collect();
-            self.jit_recent_indices[col] = crate::jit_index::JitHashIndex::build_contiguous(&pairs);
+        if is_edb {
+            for col in 0..arity {
+                let pairs: Vec<(u32, u32)> = self.recent
+                    .iter()
+                    .map(|&idx| {
+                        let key = self.packed_data[idx * arity + col];
+                        let val = if arity == 2 {
+                            self.packed_data[idx * 2 + (1 - col)]
+                        } else {
+                            idx as u32
+                        };
+                        (key, val)
+                    })
+                    .collect();
+                self.jit_recent_indices[col] =
+                    crate::jit_index::JitHashIndex::build_contiguous(&pairs);
+            }
+        } else {
+            for col in 0..arity {
+                self.jit_recent_indices[col].clear_for_rebuild();
+            }
+            for &idx in &self.recent {
+                let base = idx * arity;
+                for col in 0..arity {
+                    self.jit_recent_indices[col].insert(self.packed_data[base + col], idx as u32);
+                }
+            }
         }
     }
 

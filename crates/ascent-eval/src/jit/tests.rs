@@ -578,6 +578,29 @@ fn test_stage4_transitive_closure() {
 
 #[cfg(feature = "specialized")]
 #[test]
+fn test_stage4_tc_edge_first() {
+    // TC with edge first, path second — exercises linked-list index scan (is_recursive=true).
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation path(i32, i32);
+            path(x, y) <-- edge(x, y);
+            path(x, z) <-- edge(x, y), path(y, z);
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(4)],
+            ],
+        )],
+        "path",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
 fn test_stage4_triangle() {
     // Triangle detection: 3-clause body rule.
     assert_packed_jit_equivalence(
