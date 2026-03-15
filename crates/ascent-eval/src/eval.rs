@@ -320,8 +320,8 @@ struct StratumStage4Runtime {
     _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContextV3>>,
     _rule_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContextV3]>,
     _all_rels: Box<[*mut crate::specialized::PackedStorage]>,
-    /// Flat buffer of all JitColHandle for all rules (handles_buf in ctx).
-    _handles_buf: Box<[crate::jit_index::JitColHandle]>,
+    /// Flat buffer of all JitLookupHandle for all rules (handles_buf in ctx).
+    _handles_buf: Box<[crate::jit_index::JitLookupHandle]>,
     /// Parallel spec array for handle refresh (lookup_specs in ctx).
     _lookup_specs: Box<[crate::jit::packed_helpers::LookupSpec]>,
     /// Per-rule dedup handle pointer arrays (one *mut JitDedupHandle per head relation per rule).
@@ -991,7 +991,7 @@ impl Engine {
     #[cfg(all(feature = "jit", feature = "specialized"))]
     fn build_stratum_stage4_runtime(&self, rules: &[&CRule]) -> Option<StratumStage4Runtime> {
         use crate::jit::packed_helpers::{JitHeadBuf, LookupSpec, PackedJitContextV3, StratumStage4Ctx};
-        use crate::jit_index::JitColHandle;
+        use crate::jit_index::JitLookupHandle;
         use crate::relation::Relation;
         use crate::specialized::PackedStorage;
 
@@ -1003,7 +1003,7 @@ impl Engine {
         let mut rule_ctx_ptrs_vec: Vec<*mut PackedJitContextV3> = Vec::new();
 
         // Flat handles and specs (all rules concatenated).
-        let mut handles_flat: Vec<JitColHandle> = Vec::new();
+        let mut handles_flat: Vec<JitLookupHandle> = Vec::new();
         let mut specs_flat: Vec<LookupSpec> = Vec::new();
         // Starting handle index for each rule (for setting lookup_handles ptr later).
         let mut rule_handle_offsets: Vec<usize> = Vec::new();
@@ -1068,7 +1068,7 @@ impl Engine {
                 for use_recent_flag in [0u32, 1u32] {
                     if clause.bound_cols.is_empty() {
                         // Full-scan clause — null handle (never accessed by inline probe)
-                        handles_flat.push(JitColHandle::null());
+                        handles_flat.push(JitLookupHandle::null());
                         specs_flat.push(LookupSpec {
                             rel: rel_ptr,
                             col: 0,
@@ -1083,8 +1083,8 @@ impl Engine {
                             ps.jit_indices.get(col)
                         };
                         let handle = match idx {
-                            Some(i) => i.to_handle(),
-                            None => JitColHandle::null(),
+                            Some(i) => JitLookupHandle::from_index(i),
+                            None => JitLookupHandle::null(),
                         };
                         handles_flat.push(handle);
                         specs_flat.push(LookupSpec {
@@ -1127,7 +1127,7 @@ impl Engine {
         }
 
         let total_handles = handles_flat.len() as u32;
-        let mut handles_box: Box<[JitColHandle]> = handles_flat.into_boxed_slice();
+        let mut handles_box: Box<[JitLookupHandle]> = handles_flat.into_boxed_slice();
         let specs_box: Box<[LookupSpec]> = specs_flat.into_boxed_slice();
 
         // Build tuple_sets_buf: parallel to handles_buf.

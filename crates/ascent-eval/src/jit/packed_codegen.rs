@@ -20,7 +20,7 @@
 use cranelift_codegen::entity::EntityRef;
 use cranelift_codegen::ir::Value as CValue;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::{I32, I64};
+use cranelift_codegen::ir::types::I32;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Module};
@@ -1121,17 +1121,15 @@ fn gen_full_scan_v3(
 /// Inline hash-probe index scan (Stage 3 / Stage 4).
 ///
 /// Replaces the old `call packed_lookup` with a direct open-addressed probe
-/// into the `JitColIndex` stored in `lookup_handles[clause_offset * 2 + use_recent]`.
+/// into the `JitHashIndex` stored in `lookup_handles[clause_offset * 2 + use_recent]`.
 ///
-/// Handle layout (`JitColHandle`, 32 bytes):
-/// - offset  0: keys_ptr   *const u32  — compact key array (EMPTY_KEY = vacant)
-/// - offset  8: ranges_ptr *const u64  — per-slot range (lo=start:u32, hi=count:u32)
-/// - offset 16: vals_ptr   *const u32  — flat contiguous values
-/// - offset 24: mask       u32         — capacity − 1
+/// Handle layout (`JitLookupHandle`, 24 bytes):
+/// - offset  0: entries_ptr  *const JitIndexEntry
+/// - offset  8: values_ptr   *const u32
+/// - offset 16: mask         u32   (capacity - 1)
 ///
-/// Probe loop touches only the compact keys array (4 bytes/slot). After a hit,
-/// loads the range from ranges_ptr[slot] to get (start, count), then iterates
-/// vals_ptr[start..start+count] sequentially.
+/// All relations use contiguous mode: entry.head = start index in values array,
+/// entry.count = number of u32 values at values[head..head+count].
 #[allow(clippy::too_many_arguments)]
 fn gen_index_scan_v3(
     builder: &mut FunctionBuilder,
@@ -1158,8 +1156,8 @@ fn gen_index_scan_v3(
     let key_i32 = load_bound_val_vars(builder, clause, primary_col, vars);
 
     // ─── Load handle (compile-time constant byte offset) ────────────────────
-    // handle index = clause_offset * 2 + use_recent; handle stride = 32 bytes
-    let handle_byte_offset = (clause_offset * 2 + use_recent as usize) * 32;
+    // handle index = clause_offset * 2 + use_recent; handle stride = 24 bytes
+    let handle_byte_offset = (clause_offset * 2 + use_recent as usize) * 24;
     let handle_ptr = if handle_byte_offset == 0 {
         lookup_handles
     } else {
@@ -1167,11 +1165,10 @@ fn gen_index_scan_v3(
         builder.ins().iadd(lookup_handles, off)
     };
 
-    let keys_ptr   = builder.ins().load(ptr_type, MemFlags::trusted(), handle_ptr,  0i32);
-    let ranges_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), handle_ptr,  8i32);
-    let vals_ptr   = builder.ins().load(ptr_type, MemFlags::trusted(), handle_ptr, 16i32);
-    let mask_i32   = builder.ins().load(I32,      MemFlags::trusted(), handle_ptr, 24i32);
-    let mask       = builder.ins().uextend(ptr_type, mask_i32);
+    let entries_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), handle_ptr,  0i32);
+    let values_ptr  = builder.ins().load(ptr_type, MemFlags::trusted(), handle_ptr,  8i32);
+    let mask_i32    = builder.ins().load(I32,      MemFlags::trusted(), handle_ptr, 16i32);
+    let mask        = builder.ins().uextend(ptr_type, mask_i32);
 
     // ─── Hash probe ──────────────────────────────────────────────────────────
     let key_ext  = builder.ins().uextend(ptr_type, key_i32);
@@ -1190,9 +1187,9 @@ fn gen_index_scan_v3(
     //   probe_loop → empty_exit | probe_check_found
     //   probe_check_found → probe_found | probe_miss
     //   probe_miss → probe_loop (back-edge)
-    //   probe_found → after_probe(start, count)
-    //   empty_exit → after_probe(start, count)
-    //   after_probe(start: I32, count: I32) → sequential value scan
+    //   probe_found → after_probe(head, count)
+    //   empty_exit → after_probe(head, count)
+    //   after_probe(head: I32, count: I32) → sequential value scan
     let probe_loop        = builder.create_block();
     let probe_check_found = builder.create_block();
     let probe_found       = builder.create_block();
@@ -1200,7 +1197,7 @@ fn gen_index_scan_v3(
     let empty_exit        = builder.create_block();
     let after_probe       = builder.create_block();
 
-    // after_probe always receives (start: I32, count: I32).
+    // after_probe always receives (head: I32, count: I32).
     builder.append_block_param(after_probe, I32);
     builder.append_block_param(after_probe, I32);
 
@@ -1217,10 +1214,10 @@ fn gen_index_scan_v3(
     // ─── probe_loop ──────────────────────────────────────────────────────────
     builder.switch_to_block(probe_loop);
     let slot = builder.use_var(var_slot);
-    // key = keys_ptr[slot * 4]  (u32, 4 bytes each)
-    let key_byte_off    = builder.ins().imul_imm(slot, 4_i64);
-    let key_addr        = builder.ins().iadd(keys_ptr, key_byte_off);
-    let entry_key_probe = builder.ins().load(I32, MemFlags::trusted(), key_addr, 0i32);
+    // entry_ptr = entries_ptr + slot * 16  (sizeof JitIndexEntry = 16)
+    let entry_byte_off  = builder.ins().imul_imm(slot, 16_i64);
+    let entry_ptr_probe = builder.ins().iadd(entries_ptr, entry_byte_off);
+    let entry_key_probe = builder.ins().load(I32, MemFlags::trusted(), entry_ptr_probe, 0i32);
 
     let empty_sentinel = builder.ins().iconst(I32, 0xFFFF_FFFFu32 as i64);
     let is_empty = builder.ins().icmp(IntCC::Equal, entry_key_probe, empty_sentinel);
@@ -1246,44 +1243,38 @@ fn gen_index_scan_v3(
     // ─── probe_found ─────────────────────────────────────────────────────────
     builder.switch_to_block(probe_found);
     builder.seal_block(probe_found);
-    let slot_found        = builder.use_var(var_slot);
-    let range_byte_off    = builder.ins().imul_imm(slot_found, 8_i64);
-    let range_addr        = builder.ins().iadd(ranges_ptr, range_byte_off);
-    let range             = builder.ins().load(I64, MemFlags::trusted(), range_addr, 0i32);
-    let found_start       = builder.ins().ireduce(I32, range);
-    let range_hi          = builder.ins().ushr_imm(range, 32);
-    let found_count       = builder.ins().ireduce(I32, range_hi);
-    builder.ins().jump(after_probe, &[found_start, found_count]);
+    let slot_found      = builder.use_var(var_slot);
+    let ebo_found       = builder.ins().imul_imm(slot_found, 16_i64);
+    let entry_ptr_found = builder.ins().iadd(entries_ptr, ebo_found);
+    let found_head  = builder.ins().load(I32, MemFlags::trusted(), entry_ptr_found, 4i32);
+    let found_count = builder.ins().load(I32, MemFlags::trusted(), entry_ptr_found, 8i32);
+    builder.ins().jump(after_probe, &[found_head, found_count]);
 
     // ─── empty_exit ──────────────────────────────────────────────────────────
     // Check overflow slot at index mask+1 for key == EMPTY_KEY (value -1).
     builder.switch_to_block(empty_exit);
     builder.seal_block(empty_exit);
-    let mask_plus_one     = builder.ins().iadd_imm(mask, 1);
-    let ovf_key_byte_off  = builder.ins().imul_imm(mask_plus_one, 4_i64);
-    let ovf_key_addr      = builder.ins().iadd(keys_ptr, ovf_key_byte_off);
-    let ovf_key           = builder.ins().load(I32, MemFlags::trusted(), ovf_key_addr, 0i32);
-    let ovf_match         = builder.ins().icmp(IntCC::Equal, ovf_key, key_i32);
-    let ovf_range_byte_off= builder.ins().imul_imm(mask_plus_one, 8_i64);
-    let ovf_range_addr    = builder.ins().iadd(ranges_ptr, ovf_range_byte_off);
-    let ovf_range         = builder.ins().load(I64, MemFlags::trusted(), ovf_range_addr, 0i32);
-    let ovf_start         = builder.ins().ireduce(I32, ovf_range);
-    let ovf_range_hi      = builder.ins().ushr_imm(ovf_range, 32);
-    let ovf_count         = builder.ins().ireduce(I32, ovf_range_hi);
-    let sentinel_i32      = builder.ins().iconst(I32, 0xFFFF_FFFFu32 as i64);
-    let zero_i32          = builder.ins().iconst(I32, 0);
-    let sel_start         = builder.ins().select(ovf_match, ovf_start, sentinel_i32);
-    let sel_count         = builder.ins().select(ovf_match, ovf_count, zero_i32);
-    builder.ins().jump(after_probe, &[sel_start, sel_count]);
+    let mask_plus_one = builder.ins().iadd_imm(mask, 1);
+    let ovf_byte_off  = builder.ins().imul_imm(mask_plus_one, 16_i64);
+    let ovf_entry_ptr = builder.ins().iadd(entries_ptr, ovf_byte_off);
+    let ovf_key       = builder.ins().load(I32, MemFlags::trusted(), ovf_entry_ptr, 0i32);
+    let ovf_match     = builder.ins().icmp(IntCC::Equal, ovf_key, key_i32);
+    let ovf_head      = builder.ins().load(I32, MemFlags::trusted(), ovf_entry_ptr, 4i32);
+    let sentinel_i32  = builder.ins().iconst(I32, 0xFFFF_FFFFu32 as i64);
+    let sel_head      = builder.ins().select(ovf_match, ovf_head, sentinel_i32);
+    let ovf_count     = builder.ins().load(I32, MemFlags::trusted(), ovf_entry_ptr, 8i32);
+    let zero_i32      = builder.ins().iconst(I32, 0);
+    let sel_count     = builder.ins().select(ovf_match, ovf_count, zero_i32);
+    builder.ins().jump(after_probe, &[sel_head, sel_count]);
 
-    // ─── after_probe(entry_start: I32, entry_count: I32) ────────────────────
+    // ─── after_probe(entry_head: I32, entry_count: I32) ─────────────────────
     builder.switch_to_block(after_probe);
     builder.seal_block(after_probe);
-    let entry_start = builder.block_params(after_probe)[0];
+    let entry_head  = builder.block_params(after_probe)[0];
     let entry_count = builder.block_params(after_probe)[1];
 
     // ─── Sequential value scan loop ──────────────────────────────────────────
-    // vals_ptr[entry_start .. entry_start+entry_count]:
+    // values_ptr[entry_head .. entry_head+entry_count]:
     //   EDB arity-2 (!is_recursive): col-value mode — value IS free column data.
     //   All other cases: tuple_idx mode — value IS a tuple index into packed_data.
     let loop_header = builder.create_block();
@@ -1304,12 +1295,12 @@ fn gen_index_scan_v3(
 
     builder.switch_to_block(loop_body);
     let j = builder.use_var(var_j);
-    // byte_offset = (entry_start + j) * 4
+    // byte_offset = (entry_head + j) * 4
     let j_ext          = builder.ins().uextend(ptr_type, j);
-    let start_ext      = builder.ins().uextend(ptr_type, entry_start);
+    let start_ext      = builder.ins().uextend(ptr_type, entry_head);
     let idx_in_vals    = builder.ins().iadd(start_ext, j_ext);
     let byte_off       = builder.ins().imul_imm(idx_in_vals, 4_i64);
-    let elem_addr      = builder.ins().iadd(vals_ptr, byte_off);
+    let elem_addr      = builder.ins().iadd(values_ptr, byte_off);
 
     let continue_block = builder.create_block();
     let mut inner_blocks_to_seal = Vec::new();

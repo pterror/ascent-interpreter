@@ -31,8 +31,8 @@
 //!   r12 = outer loop count  (level 0 only)
 //!   r13 = recent_ptr for outer clause  (only if use_recent0)
 //!   r14 = outer loop counter i  (level 0 only)
-//!   r15 = innermost active linked-list node (current; zero-extended u32)
-//!   rbx = innermost active data_ptr
+//!   r15 = innermost active value-scan counter j (zero-extended u32)
+//!   rbx = innermost active data_ptr (or count in col-value mode)
 //!
 //! When descending from level L to level L+1:
 //!   - level L's r15 (next_node) is saved to level_node_save_slot(L)
@@ -901,19 +901,16 @@ fn emit_clause_level(
     } else {
         // ── Level >= 1: hash probe + inner scan ────────────────────────────
         //
-        // Contiguous mode (!is_rec): values array holds tuple_idxs sequentially.
-        //   Inner loop: j = 0..count, load values[head + j]
-        //   No pointer-chasing — sequential scan enables CPU speculation/prefetch.
-        //
-        // Linked-list mode (is_rec): values are stride-2 nodes (tuple_idx, next).
-        //   Inner loop: follow next-pointers until SENTINEL.
+        // All relations use contiguous mode: values array holds tuple_idxs sequentially.
+        // Inner loop: j = 0..count, load values[head + j]
+        // No pointer-chasing — sequential scan enables CPU speculation/prefetch.
 
         let arity = clause.args.len();
         let stride = (arity * 4) as i32;
         let use_recent = p.use_recent[level];
         let is_rec = p.is_rec[level];
-        // Contiguous mode: EDB relations (!is_rec) use sequential scan.
-        let is_contiguous = !is_rec;
+        // All relations now use contiguous mode.
+        let is_contiguous = true;
 
         // Fast path for fully-bound existence checks: inline JitTupleSet probe.
         if clause.fresh_cols.is_empty() {
@@ -970,16 +967,15 @@ fn emit_clause_level(
             );
         }
 
-        // Probe: handle_off uses (clause_seq * 2 + use_recent) * 32 (JitColHandle stride)
-        let handle_off: i32 = ((level * 2 + if use_recent { 1 } else { 0 }) * 32) as i32;
+        // Probe: handle_off uses (clause_seq * 2 + use_recent) * 24 (JitLookupHandle stride)
+        let handle_off: i32 = ((level * 2 + if use_recent { 1 } else { 0 }) * 24) as i32;
         load_rule_ctx!(asm, p.rule_i);
         dynasm!(asm
             ; mov rax, [rax + 24i8]   // lookup_handles ptr
             ; add rax, handle_off
-            ; mov r8,  [rax]          // keys_ptr   (offset  0)
-            ; mov r9,  [rax + 8i8]   // ranges_ptr (offset  8)
-            ; mov r11, [rax + 16i8]  // vals_ptr   (offset 16)
-            ; mov r10d, [rax + 24i8] // mask       (offset 24)
+            ; mov r8,  [rax]          // entries_ptr (offset  0)
+            ; mov r11, [rax + 8i8]   // values_ptr  (offset  8)
+            ; mov r10d, [rax + 16i8] // mask        (offset 16)
         );
 
         // Hash: slot = (key * KNUTH32) & mask  (ecx = key)
@@ -995,10 +991,15 @@ fn emit_clause_level(
         let probe_ovf = asm.new_dynamic_label();
         let after_probe = asm.new_dynamic_label();
 
-        // probe_loop: load keys_ptr[slot] as u32 (4 bytes/slot)
+        // probe_loop: load entries_ptr[slot*16].key (offset 0, u32)
+        // JitIndexEntry: key@0, head@4, count@8, _pad@12 (16 bytes total)
+        // x86 doesn't support *16 scale; use shl+add to compute slot*16.
         dynasm!(asm; =>probe_lp);
         dynasm!(asm
-            ; mov esi, [r8 + rdx*4]  // keys_ptr[slot]
+            ; mov rax, rdx
+            ; shl rax, 4              // rax = slot * 16
+            ; add rax, r8             // rax = entries_ptr + slot*16
+            ; mov esi, [rax]          // esi = entry.key (offset 0)
             ; cmp esi, -1i32
             ; je =>probe_ovf
             ; cmp esi, ecx
@@ -1008,41 +1009,41 @@ fn emit_clause_level(
             ; jmp =>probe_lp
         );
 
-        // probe_ok: load range as u64 from ranges_ptr[slot*8]
-        // range = (start:u32) | ((count:u32) << 32)
+        // probe_ok: entry.head @ offset 4, entry.count @ offset 8
         dynasm!(asm; =>probe_ok);
         dynasm!(asm
-            ; mov rax, [r9 + rdx*8]  // ranges_ptr[slot] as u64
-            ; mov esi, eax            // esi = start (low 32)
-            ; shr rax, 32
-            ; mov eax, eax            // eax = count (high 32)
+            ; mov rax, rdx
+            ; shl rax, 4
+            ; add rax, r8             // rax = entries_ptr + slot*16
+            ; mov esi, [rax + 4i8]   // esi = entry.head (start)
+            ; mov eax, [rax + 8i8]   // eax = entry.count
             ; jmp =>after_probe
         );
 
-        // probe_ovf: overflow slot at keys_ptr[mask+1]
+        // probe_ovf: overflow slot at entries_ptr[(mask+1)*16]
         dynasm!(asm; =>probe_ovf);
         dynasm!(asm
             ; lea rdx, [r10 + 1]     // overflow slot index = mask + 1
-            ; mov esi, [r8 + rdx*4]  // keys_ptr[mask+1]
+            ; mov rax, rdx
+            ; shl rax, 4
+            ; add rax, r8             // rax = entries_ptr + (mask+1)*16
+            ; mov esi, [rax]          // entry.key
             ; cmp esi, ecx
             ; jne =>when_exhausted   // key not found → exhaust this level
-            // load range from ranges_ptr[mask+1]
-            ; mov rax, [r9 + rdx*8]  // ranges_ptr[mask+1] as u64
-            ; mov esi, eax            // esi = start (low 32)
-            ; shr rax, 32
-            ; mov eax, eax            // eax = count (high 32)
+            ; mov esi, [rax + 4i8]   // entry.head (start)
+            ; mov eax, [rax + 8i8]   // entry.count
         );
 
         dynasm!(asm; =>after_probe);
 
-        // All modes use sequential scan now (JitColIndex always contiguous).
-        //   esi = start (index into vals array)
+        // All modes use sequential scan (JitHashIndex contiguous mode).
+        //   esi = head (start index into values array)
         //   eax = count
-        //   r11 = vals_ptr
+        //   r11 = values_ptr
         //   r15d = j counter (0..count)
         //
-        // For arity-2 EDB (!is_rec): col-value mode — vals[start+j] IS free column data.
-        // For all other cases: vals[start+j] IS tuple_idx.
+        // For arity-2 EDB (!is_rec): col-value mode — values[head+j] IS free column data.
+        // For all other cases: values[head+j] IS tuple_idx.
         let is_col_value = arity == 2 && is_contiguous; // is_contiguous = !is_rec
 
         let vs = level_vptr_slot(level, p.var_count, p.max_head_arity);
@@ -1052,7 +1053,7 @@ fn emit_clause_level(
             ; jz =>when_exhausted
             ; xor r15d, r15d         // j = 0
         );
-        // Pre-compute vals_base = vals_ptr + start*4.
+        // Pre-compute vals_base = values_ptr + head*4.
         // For col_value: keep count in rbx.
         // For standard: spill count to cnt_slot, load data_ptr into rbx.
         if is_col_value {

@@ -194,10 +194,10 @@ pub struct PackedStorage {
     pub(crate) source_tags: Vec<SourceId>,
     /// Per-column JIT hash index (full data). Updated incrementally.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) jit_indices: Vec<crate::jit_index::JitColIndex>,
+    pub(crate) jit_indices: Vec<crate::jit_index::JitHashIndex>,
     /// Per-column JIT hash index (recent data). Rebuilt from scratch each iteration.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) jit_recent_indices: Vec<crate::jit_index::JitColIndex>,
+    pub(crate) jit_recent_indices: Vec<crate::jit_index::JitHashIndex>,
     /// Number of tuples already indexed into jit_indices (for incremental update).
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) jit_full_indexed_count: usize,
@@ -498,20 +498,11 @@ impl PackedStorage {
         had_delta
     }
 
-    /// Update `jit_indices` incrementally and rebuild `jit_recent_indices` from scratch.
+    /// Update `jit_indices` and rebuild `jit_recent_indices` using contiguous mode for all relations.
     ///
-    /// **EDB mode** (`jit_is_edb = true`):
-    ///   Full index: built contiguously ONCE on the first call; subsequent calls are no-ops
-    ///   (the relation never changes in this stratum). This avoids O(N) rebuild overhead.
-    ///   Recent index: also built contiguously (EDB recent is typically empty; format must
-    ///   match full index since JIT uses `!is_rec[level]` uniformly for both).
-    ///
-    /// **Derived mode** (`jit_is_edb = false`, default):
-    ///   Full index: insert new tuples incrementally (linked-list, O(delta) per call).
-    ///   Recent index: rebuilt from scratch using linked-list insertion.
-    ///
-    /// The JIT code selects contiguous vs linked-list based on `!is_rec[level]`, which
-    /// equals `jit_is_edb`. Both full and recent indices MUST use the same format.
+    /// All relations (EDB and derived) now use `build_contiguous`, eliminating linked-list
+    /// pointer chasing in the value loop. The full index is rebuilt whenever new tuples
+    /// have been added since the last build.
     ///
     /// Must be called after `advance()` / `advance_peek()` to keep JIT handles fresh.
     #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -538,7 +529,7 @@ impl PackedStorage {
                             (key, val)
                         })
                         .collect();
-                    crate::jit_index::JitColIndex::build_contiguous(&pairs)
+                    crate::jit_index::JitHashIndex::build_contiguous(&pairs)
                 })
                 .collect();
             self.jit_full_indexed_count = self.count;
@@ -549,23 +540,24 @@ impl PackedStorage {
         // ── Recent index: always rebuild from current recent set ─────────────
         let arity = self.arity;
         let is_edb = self.jit_is_edb;
-        self.jit_recent_indices = (0..arity)
-            .map(|col| {
-                let pairs: Vec<(u32, u32)> = self.recent
-                    .iter()
-                    .map(|&idx| {
-                        let key = self.packed_data[idx * arity + col];
-                        let val = if is_edb && arity == 2 {
-                            self.packed_data[idx * 2 + (1 - col)]
-                        } else {
-                            idx as u32
-                        };
-                        (key, val)
-                    })
-                    .collect();
-                crate::jit_index::JitColIndex::build_contiguous(&pairs)
-            })
-            .collect();
+        if self.jit_recent_indices.len() != arity {
+            self.jit_recent_indices.resize_with(arity, crate::jit_index::JitHashIndex::empty);
+        }
+        for col in 0..arity {
+            let pairs: Vec<(u32, u32)> = self.recent
+                .iter()
+                .map(|&idx| {
+                    let key = self.packed_data[idx * arity + col];
+                    let val = if is_edb && arity == 2 {
+                        self.packed_data[idx * 2 + (1 - col)]
+                    } else {
+                        idx as u32
+                    };
+                    (key, val)
+                })
+                .collect();
+            self.jit_recent_indices[col] = crate::jit_index::JitHashIndex::build_contiguous(&pairs);
+        }
     }
 
     pub fn set_delta_range(&mut self, start: usize) {
