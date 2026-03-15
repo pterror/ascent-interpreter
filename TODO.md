@@ -172,7 +172,7 @@ The true minimum is **zero per-iteration calls + one per rule-invocation for ins
 
 ### Zero-overhead JIT (from scratch)
 
-**Goal:** LLVM parity. Current gaps: triangle 12×, TC 2.6×, fibonacci 2.3×.
+**Goal:** LLVM parity. Current gaps: triangle ~10.2× (333µs / 32.6µs), TC ~2.5×, fibonacci ~2.3×.
 
 **Root cause of all remaining gaps** — three structural problems, in priority order:
 
@@ -377,14 +377,27 @@ existing col-value contiguous path already handles arity-2 fully-bound existence
 efficiently. The JitTupleSet path will benefit programs with arity-3+ relations and
 fully-bound inner clauses.
 
-**Residual gap:** triangle ~11×, TC ~2.5×. The triangle gap is dominated by: (a) arity-2
-fully-bound clause already fast via col-value path but still slower than ascent_macro
-due to extra hash+scan vs direct HashSet::contains; (b) 6,840 `packed_try_insert` calls.
-Primary remaining options: (a) extend JitTupleSet to arity 2 (requires profiling proof
-that it's faster than current path); (b) inline `packed_try_insert` for head emission;
-(c) accept gap and move to other features.
+**`jit_is_sink` optimization — implemented 2026-03-15** ✅
+
+Added `jit_is_sink: bool` flag to `PackedStorage`. `update_jit_indices()` returns early when
+true, skipping all JIT column index building for relations that appear only in heads and never
+in any body clause of the entire program. Set per-stratum via program-wide body-relation
+analysis in `try_run_stratum_stage4`. **Triangle `jit_hot/20`: ~333 µs (was ~390 µs) — ~14%
+improvement.** Eliminates ~20,520 hash insertions per advance() call (3 cols × 6,840 tuples).
+
+**Residual gap:** triangle ~10.2×, TC ~2.5×. The triangle gap is still dominated by: (a) arity-2
+fully-bound clause uses col-value scan, slower than ascent_macro's O(1) HashSet probe; (b)
+`packed_try_insert` call per-iteration overhead (JitHeadBuf reduced this but doesn't eliminate).
+Primary remaining options: (a) extend JitTupleSet to arity 2; (b) profile residual to confirm
+remaining cost breakdown.
+
+**Pre-existing bug:** `tc_shared_jit` test hangs infinitely with `jit-asm` feature. Existed
+before 2026-03-15 changes. Root cause unknown — dynasm TC path. Does not affect `jit+specialized`
+(Cranelift backend).
 
 ### Relation storage optimizations
+
+- [x] **Skip JIT index building for program-wide sink relations** — `jit_is_sink` flag on `PackedStorage`; `update_jit_indices()` returns early when set. 14% improvement on triangle. See above.
 
 - [ ] **Lazy `recent_col_indices` rebuild** — `advance()` in both `PackedStorage` (`specialized.rs`) and `RelationStorage` (`relation.rs`) unconditionally rebuilds recent indices even for sink relations (head-only, never body clauses). The right implementation is a new `ensure_recent_indices(&mut self)` called at eval-loop level only for relations that are body clauses in the current stratum — avoids the `&self`/`RefCell` tangle. Impact limited to programs with head-only output relations; benchmarks (TC, triangles) don't benefit.
 
