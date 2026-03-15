@@ -52,6 +52,8 @@ When evaluating a JIT optimization, profile with `perf stat -e instructions,cycl
 
 Current bottleneck (2026-03-15): **116× more cache misses per iteration** for triangle (14.8% vs 1.6% miss rate). The `JitHashIndex` pointer-chased structure is the primary cause — fix that before tuning anything else.
 
+**Parallelism must also be designed for max throughput.** When implementing parallel evaluation: zero shared state in the hot path (thread-local dedup tables, thread-local head buffers, read-only shared indices), batch merge only after all threads finish their scan. A parallel design that introduces lock contention or false sharing in the inner loop is worse than single-threaded. The test is: does the parallel version scale linearly with thread count on a join-heavy benchmark?
+
 ## JIT Design Rule
 
 **Before implementing any JIT stage, trace the full hot-path and count Rust callbacks.**
