@@ -10,7 +10,7 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ptr;
 
 use crate::jit::storage;
-use crate::jit_index::{JitDedupHandle, JitLookupHandle};
+use crate::jit_index::{JitColHandle, JitDedupHandle};
 use crate::specialized::PackedStorage;
 
 // ─── JIT head write buffer ────────────────────────────────────────────────
@@ -321,7 +321,7 @@ pub type StratumMetaFn = unsafe extern "C" fn(*mut StratumMetaCtx);
 ///   rels_len           (u32)  @ offset  8
 ///   _pad               (u32)  @ offset 12
 ///   head_rels          (ptr)  @ offset 16
-///   lookup_handles     (ptr)  @ offset 24  ← flat array of JitLookupHandle
+///   lookup_handles     (ptr)  @ offset 24  ← flat array of JitColHandle
 ///   head_dedup_handles (ptr)  @ offset 32  ← one *mut JitDedupHandle per head
 #[repr(C)]
 pub struct PackedJitContextV3 {
@@ -331,8 +331,8 @@ pub struct PackedJitContextV3 {
     pub _pad: u32,
     /// Array of *mut PackedStorage, one per head relation (direct insert target).
     pub head_rels: *const *mut PackedStorage,
-    /// Pointer to flat array of JitLookupHandle, indexed by `clause_offset * 2 + use_recent`.
-    pub lookup_handles: *const JitLookupHandle,
+    /// Pointer to flat array of JitColHandle, indexed by `clause_offset * 2 + use_recent`.
+    pub lookup_handles: *const JitColHandle,
     /// Array of *mut JitDedupHandle, one per head relation.
     /// Points into the `jit_dedup.handle` field of each head's PackedStorage.
     /// Used by the JIT to probe the dedup snapshot before calling packed_try_insert.
@@ -421,7 +421,7 @@ const _: () = {
 ///   offset 16: all_rels        *const *mut PackedStorage       (8 bytes)
 ///   offset 24: n_all_rels      u32                            (4 bytes)
 ///   offset 28: _pad2           u32                            (4 bytes)
-///   offset 32: handles_buf     *mut JitLookupHandle           (8 bytes)
+///   offset 32: handles_buf     *mut JitColHandle               (8 bytes)
 ///   offset 40: lookup_specs    *const LookupSpec              (8 bytes)
 ///   offset 48: total_handles   u32                            (4 bytes)
 ///   offset 52: _pad3           u32                            (4 bytes)
@@ -443,7 +443,7 @@ pub struct StratumStage4Ctx {
     pub n_all_rels: u32,
     pub _pad2: u32,
     /// Flat array of all lookup handles (all rules concatenated).
-    pub handles_buf: *mut JitLookupHandle,
+    pub handles_buf: *mut JitColHandle,
     /// One spec per handle, parallel to handles_buf.
     pub lookup_specs: *const LookupSpec,
     /// Total number of handles (= sum of num_clauses * 2 over all rules).
@@ -572,16 +572,13 @@ pub unsafe extern "C" fn jit_stratum_advance_s4(ctx: *mut StratumStage4Ctx) -> u
     for i in 0..ctx.total_handles as usize {
         let spec = unsafe { &*ctx.lookup_specs.add(i) };
         let ps = unsafe { &*spec.rel };
-        let idx: &crate::jit_index::JitHashIndex = if spec.use_recent != 0 {
+        let idx: &crate::jit_index::JitColIndex = if spec.use_recent != 0 {
             &ps.jit_recent_indices[spec.col as usize]
         } else {
             &ps.jit_indices[spec.col as usize]
         };
         let handle = unsafe { &mut *ctx.handles_buf.add(i) };
-        handle.entries = idx.entries_ptr;
-        handle.values = idx.values_ptr;
-        handle.mask = idx.mask;
-        handle._pad = 0;
+        *handle = idx.to_handle();
     }
     changed
 }

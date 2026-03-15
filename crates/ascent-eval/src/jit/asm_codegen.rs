@@ -48,7 +48,6 @@ use dynasmrt::x64::Assembler;
 
 use crate::compiled::{CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CUnOp};
 use crate::jit::packed_helpers::{StratumStage4Fn, jit_head_buf_grow_and_insert};
-use crate::jit::storage;
 use crate::value::Value;
 
 /// A compiled stratum function produced by the asm backend.
@@ -971,15 +970,16 @@ fn emit_clause_level(
             );
         }
 
-        // Probe: handle_off uses (clause_seq * 2 + use_recent) * 24
-        let handle_off: i32 = ((level * 2 + if use_recent { 1 } else { 0 }) * 24) as i32;
+        // Probe: handle_off uses (clause_seq * 2 + use_recent) * 32 (JitColHandle stride)
+        let handle_off: i32 = ((level * 2 + if use_recent { 1 } else { 0 }) * 32) as i32;
         load_rule_ctx!(asm, p.rule_i);
         dynasm!(asm
             ; mov rax, [rax + 24i8]   // lookup_handles ptr
             ; add rax, handle_off
-            ; mov r8,  [rax]          // entries_ptr
-            ; mov r9,  [rax + 8i8]   // values_ptr
-            ; mov r10d, [rax + 16i8] // mask
+            ; mov r8,  [rax]          // keys_ptr   (offset  0)
+            ; mov r9,  [rax + 8i8]   // ranges_ptr (offset  8)
+            ; mov r11, [rax + 16i8]  // vals_ptr   (offset 16)
+            ; mov r10d, [rax + 24i8] // mask       (offset 24)
         );
 
         // Hash: slot = (key * KNUTH32) & mask  (ecx = key)
@@ -995,12 +995,10 @@ fn emit_clause_level(
         let probe_ovf = asm.new_dynamic_label();
         let after_probe = asm.new_dynamic_label();
 
+        // probe_loop: load keys_ptr[slot] as u32 (4 bytes/slot)
         dynasm!(asm; =>probe_lp);
         dynasm!(asm
-            ; lea rax, [rdx + rdx]
-            ; shl rax, 3
-            ; add rax, r8
-            ; mov esi, [rax]
+            ; mov esi, [r8 + rdx*4]  // keys_ptr[slot]
             ; cmp esi, -1i32
             ; je =>probe_ovf
             ; cmp esi, ecx
@@ -1009,236 +1007,142 @@ fn emit_clause_level(
             ; and rdx, r10
             ; jmp =>probe_lp
         );
-        // probe_ok: rax = entry_ptr, load head at +4, and count at +8 (contiguous mode)
-        dynasm!(asm; =>probe_ok);
-        if is_contiguous {
-            dynasm!(asm
-                ; mov esi, [rax + 4i8]    // esi = head (start offset)
-                ; mov eax, [rax + 8i8]    // eax = count
-                ; jmp =>after_probe
-            );
-        } else {
-            dynasm!(asm; mov esi, [rax + 4i8]; jmp =>after_probe);
-        }
 
+        // probe_ok: load range as u64 from ranges_ptr[slot*8]
+        // range = (start:u32) | ((count:u32) << 32)
+        dynasm!(asm; =>probe_ok);
+        dynasm!(asm
+            ; mov rax, [r9 + rdx*8]  // ranges_ptr[slot] as u64
+            ; mov esi, eax            // esi = start (low 32)
+            ; shr rax, 32
+            ; mov eax, eax            // eax = count (high 32)
+            ; jmp =>after_probe
+        );
+
+        // probe_ovf: overflow slot at keys_ptr[mask+1]
         dynasm!(asm; =>probe_ovf);
         dynasm!(asm
-            ; lea rax, [r10 + 1]
-            ; lea rax, [rax + rax]
-            ; shl rax, 3
-            ; add rax, r8
-            ; mov esi, [rax]
+            ; lea rdx, [r10 + 1]     // overflow slot index = mask + 1
+            ; mov esi, [r8 + rdx*4]  // keys_ptr[mask+1]
             ; cmp esi, ecx
-            ; jne =>when_exhausted    // key not found → exhaust this level
+            ; jne =>when_exhausted   // key not found → exhaust this level
+            // load range from ranges_ptr[mask+1]
+            ; mov rax, [r9 + rdx*8]  // ranges_ptr[mask+1] as u64
+            ; mov esi, eax            // esi = start (low 32)
+            ; shr rax, 32
+            ; mov eax, eax            // eax = count (high 32)
         );
-        if is_contiguous {
-            dynasm!(asm
-                ; mov esi, [rax + 4i8]    // esi = head
-                ; mov eax, [rax + 8i8]    // eax = count
-            );
-        } else {
-            dynasm!(asm; mov esi, [rax + 4i8]);
-        }
 
         dynasm!(asm; =>after_probe);
 
+        // All modes use sequential scan now (JitColIndex always contiguous).
+        //   esi = start (index into vals array)
+        //   eax = count
+        //   r11 = vals_ptr
+        //   r15d = j counter (0..count)
+        //
+        // For arity-2 EDB (!is_rec): col-value mode — vals[start+j] IS free column data.
+        // For all other cases: vals[start+j] IS tuple_idx.
+        let is_col_value = arity == 2 && is_contiguous; // is_contiguous = !is_rec
+
         let vs = level_vptr_slot(level, p.var_count, p.max_head_arity);
 
-        if is_contiguous {
-            // Contiguous mode:
-            //   esi = head (start index in flat values array)
-            //   eax = count
-            //   r15d = j counter (starts at 0)
-            //
-            // For arity-2 EDB relations, values[head+j] stores the free column value
-            // directly (not tuple_idx), eliminating the data_ptr dereference.
-            // In col-value mode, count lives in rbx (callee-saved, preserved by
-            // existing dptr_slot save/restore when descending into sub-levels).
-            let is_col_value = arity == 2;
-
+        dynasm!(asm
+            ; test eax, eax
+            ; jz =>when_exhausted
+            ; xor r15d, r15d         // j = 0
+        );
+        // Pre-compute vals_base = vals_ptr + start*4.
+        // For col_value: keep count in rbx.
+        // For standard: spill count to cnt_slot, load data_ptr into rbx.
+        if is_col_value {
             dynasm!(asm
-                ; test eax, eax
-                ; jz =>when_exhausted
-                ; xor r15d, r15d         // j = 0
+                ; mov rbx, rax                    // rbx = count
+                ; lea r11, [r11 + rsi*4]          // r11 = vals_base
+                ; mov [rbp + vs], r11             // save vals_base
             );
-            // Pre-compute values_base = values_ptr + head*4 (saves one lea per inner iter).
-            // For col_value: keep count in rbx (no cnt_slot stack store/load).
-            // For standard: spill count to cnt_slot, load data_ptr into rbx.
-            if is_col_value {
-                dynasm!(asm
-                    ; mov rbx, rax                    // rbx = count (callee-saved)
-                    ; lea r9, [r9 + rsi*4]            // r9 = values_base
-                    ; mov [rbp + vs], r9              // save values_base
-                );
-            } else {
-                let cnt_slot = level_count_slot(level, p.var_count, p.max_head_arity, p.max_depth);
-                dynasm!(asm
-                    ; mov [rbp + cnt_slot], eax       // save count to stack
-                    ; lea r9, [r9 + rsi*4]            // r9 = values_base
-                    ; mov [rbp + vs], r9              // save values_base
-                );
-                load_rel_rdi!(asm, p.rule_i, level);
-                call_abs!(asm, p.pdptr);
-                dynasm!(asm; mov rbx, rax);
-            }
-
-            // ── Inner contiguous scan loop ────────────────────────────────────
-            let inner_hdr = asm.new_dynamic_label();
-            let inner_continue = asm.new_dynamic_label();
-
-            dynasm!(asm; =>inner_hdr);
-            if is_col_value {
-                // Count in rbx: no stack load needed.
-                dynasm!(asm; cmp r15d, ebx; jge =>when_exhausted);
-            } else {
-                let cnt_slot = level_count_slot(level, p.var_count, p.max_head_arity, p.max_depth);
-                dynasm!(asm
-                    ; mov eax, [rbp + cnt_slot]
-                    ; cmp r15d, eax
-                    ; jge =>when_exhausted
-                );
-            }
-
-            // Load values_base[j] into ecx (= col_value for arity-2, or tuple_idx otherwise).
-            dynasm!(asm
-                ; mov rax, [rbp + vs]                   // values_base
-                ; mov ecx, [rax + r15*4]                // values_base[j]
-                ; inc r15d                              // j++
-            );
-
-            if is_col_value {
-                // Col-value mode: ecx = free column value; no tuple_ptr needed.
-                let primary_col = clause.bound_cols[0];
-                let free_col = 1 - primary_col;
-                emit_bind_col_value(asm, clause, free_col, inner_continue, p.var_locs)?;
-            } else {
-                // Standard: ecx = tuple_idx → compute tuple_ptr via data_ptr (rbx).
-                dynasm!(asm
-                    ; imul rcx, rcx, stride
-                    ; add rcx, rbx
-                    ; mov rax, rcx
-                );
-                // Bind cols (rax = tuple_ptr)
-                emit_bind_cols(asm, clause, inner_continue, p.var_locs)?;
-            }
-
-            // Clause conditions
-            for cond in &clause.conditions {
-                if let CCondition::If(expr) = cond {
-                    emit_expr(asm, expr, p.var_locs)?;
-                    dynasm!(asm; test eax, eax; jz =>inner_continue);
-                }
-            }
-
-            if level + 1 == p.clauses.len() {
-                for expr in p.rule_conds {
-                    emit_expr(asm, expr, p.var_locs)?;
-                    dynasm!(asm; test eax, eax; jz =>inner_continue);
-                }
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.head_buf_base)?;
-                // For col-value existence checks (all cols bound, values sorted unique):
-                // at most one match can exist, so skip the remaining scan after emitting.
-                if is_col_value && clause.fresh_cols.is_empty() {
-                    dynasm!(asm; jmp =>when_exhausted);
-                }
-            } else {
-                let sub_exhausted = asm.new_dynamic_label();
-                emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
-
-                dynasm!(asm; =>sub_exhausted);
-                let node_slot = level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
-                let dptr_slot = level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
-                dynasm!(asm
-                    ; mov r15, [rbp + node_slot]
-                    ; mov rbx, [rbp + dptr_slot]
-                );
-            }
-
-            dynasm!(asm; =>inner_continue);
-            dynasm!(asm; jmp =>inner_hdr);
-
         } else {
-            // Linked-list mode:
-            //   esi = head node index; SENTINEL = -1u32
-            dynasm!(asm; mov [rbp + vs], r9);  // save values_ptr for inner loop
-            dynasm!(asm; cmp esi, -1i32; je =>when_exhausted; mov r15d, esi);
-
-            // Pre-fetch data_ptr into rbx (if non-recursive — always false here since is_rec=true)
-            // Actually for linked-list we keep the existing behaviour: re-fetch inside loop.
-
-            // ── Inner linked-list loop ──────────────────────────────────────
-            let inner_hdr = asm.new_dynamic_label();
-            let inner_continue = asm.new_dynamic_label();
-
-            dynasm!(asm; =>inner_hdr);
-            dynasm!(asm; cmp r15d, -1i32; je =>when_exhausted);
-
-            // Load tuple_idx (ecx) and next_node (r15) from values_ptr[r15*8]
+            let cnt_slot = level_count_slot(level, p.var_count, p.max_head_arity, p.max_depth);
             dynasm!(asm
-                ; mov rax, [rbp + vs]
-                ; mov ecx, [rax + r15*8]
-                ; mov esi, [rax + r15*8 + 4i8]
-                ; mov r15d, esi            // advance r15 to next node
-                ; mov eax, ecx             // rax = tuple_idx
-            );
-
-            // Re-fetch data_ptr (recursive: head insert can reallocate)
-            dynasm!(asm
-                ; push rax
-                ; sub rsp, 8
+                ; mov [rbp + cnt_slot], eax       // save count to stack
+                ; lea r11, [r11 + rsi*4]          // r11 = vals_base
+                ; mov [rbp + vs], r11             // save vals_base
             );
             load_rel_rdi!(asm, p.rule_i, level);
             call_abs!(asm, p.pdptr);
-            dynasm!(asm
-                ; mov rbx, rax
-                ; add rsp, 8
-                ; pop rax
-            );
+            dynasm!(asm; mov rbx, rax);
+        }
 
-            // tuple_ptr = data_ptr + tuple_idx * stride
-            dynasm!(asm
-                ; imul rax, rax, stride
-                ; add rax, rbx
-            );
+        // ── Inner sequential scan loop ────────────────────────────────────────
+        let inner_hdr = asm.new_dynamic_label();
+        let inner_continue = asm.new_dynamic_label();
 
-            // Bind cols (rax = tuple_ptr)
+        dynasm!(asm; =>inner_hdr);
+        if is_col_value {
+            dynasm!(asm; cmp r15d, ebx; jge =>when_exhausted);
+        } else {
+            let cnt_slot = level_count_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+            dynasm!(asm
+                ; mov eax, [rbp + cnt_slot]
+                ; cmp r15d, eax
+                ; jge =>when_exhausted
+            );
+        }
+
+        // Load vals_base[j] into ecx.
+        dynasm!(asm
+            ; mov rax, [rbp + vs]                   // vals_base
+            ; mov ecx, [rax + r15*4]                // vals_base[j]
+            ; inc r15d                              // j++
+        );
+
+        if is_col_value {
+            // Col-value mode: ecx = free column value.
+            let primary_col = clause.bound_cols[0];
+            let free_col = 1 - primary_col;
+            emit_bind_col_value(asm, clause, free_col, inner_continue, p.var_locs)?;
+        } else {
+            // Standard: ecx = tuple_idx → compute tuple_ptr via data_ptr (rbx).
+            dynasm!(asm
+                ; imul rcx, rcx, stride
+                ; add rcx, rbx
+                ; mov rax, rcx
+            );
             emit_bind_cols(asm, clause, inner_continue, p.var_locs)?;
+        }
 
-            // Clause conditions
-            for cond in &clause.conditions {
-                if let CCondition::If(expr) = cond {
-                    emit_expr(asm, expr, p.var_locs)?;
-                    dynasm!(asm; test eax, eax; jz =>inner_continue);
-                }
+        // Clause conditions
+        for cond in &clause.conditions {
+            if let CCondition::If(expr) = cond {
+                emit_expr(asm, expr, p.var_locs)?;
+                dynasm!(asm; test eax, eax; jz =>inner_continue);
             }
+        }
 
-            if level + 1 == p.clauses.len() {
-                // Last clause: emit rule-level conditions and heads
-                for expr in p.rule_conds {
-                    emit_expr(asm, expr, p.var_locs)?;
-                    dynasm!(asm; test eax, eax; jz =>inner_continue);
-                }
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.head_buf_base)?;
-                // Fall to inner_continue
-            } else {
-                // Not last: recurse to level+1.
-                let sub_exhausted = asm.new_dynamic_label();
-                emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
-
-                // sub_exhausted: level+1 is done; restore level's r15 and rbx.
-                dynasm!(asm; =>sub_exhausted);
-                let node_slot = level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
-                let dptr_slot = level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
-                dynasm!(asm
-                    ; mov r15, [rbp + node_slot]
-                    ; mov rbx, [rbp + dptr_slot]
-                );
-                // Fall to inner_continue → jmp inner_hdr
+        if level + 1 == p.clauses.len() {
+            for expr in p.rule_conds {
+                emit_expr(asm, expr, p.var_locs)?;
+                dynasm!(asm; test eax, eax; jz =>inner_continue);
             }
+            emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.head_buf_base)?;
+            if is_col_value && clause.fresh_cols.is_empty() {
+                dynasm!(asm; jmp =>when_exhausted);
+            }
+        } else {
+            let sub_exhausted = asm.new_dynamic_label();
+            emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
 
-            dynasm!(asm; =>inner_continue);
-            dynasm!(asm; jmp =>inner_hdr);
-        } // end else (linked-list branch)
+            dynasm!(asm; =>sub_exhausted);
+            let node_slot = level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+            let dptr_slot = level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+            dynasm!(asm
+                ; mov r15, [rbp + node_slot]
+                ; mov rbx, [rbp + dptr_slot]
+            );
+        }
+
+        dynasm!(asm; =>inner_continue);
+        dynasm!(asm; jmp =>inner_hdr);
     } // end else (level >= 1)
 
     Ok(())

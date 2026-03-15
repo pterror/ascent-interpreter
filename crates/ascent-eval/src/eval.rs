@@ -320,8 +320,8 @@ struct StratumStage4Runtime {
     _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContextV3>>,
     _rule_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContextV3]>,
     _all_rels: Box<[*mut crate::specialized::PackedStorage]>,
-    /// Flat buffer of all JitLookupHandle for all rules (handles_buf in ctx).
-    _handles_buf: Box<[crate::jit_index::JitLookupHandle]>,
+    /// Flat buffer of all JitColHandle for all rules (handles_buf in ctx).
+    _handles_buf: Box<[crate::jit_index::JitColHandle]>,
     /// Parallel spec array for handle refresh (lookup_specs in ctx).
     _lookup_specs: Box<[crate::jit::packed_helpers::LookupSpec]>,
     /// Per-rule dedup handle pointer arrays (one *mut JitDedupHandle per head relation per rule).
@@ -932,23 +932,26 @@ impl Engine {
                 }
             }
 
-            // If an EDB relation already has a linked-list JIT index (built by a
-            // prior fact stratum that ran with `jit_is_edb = false`), rebuild it
-            // contiguously NOW — before `build_stratum_stage4_runtime` reads the
-            // index pointers.  The JIT code uses contiguous mode for EDB; stale
-            // linked-list entries have `count == 0` and the inner loop would find
-            // nothing.
+            // If an EDB relation already has a JIT index that was built with
+            // `jit_is_edb = false` (tuple-index vals, from a prior fact stratum),
+            // rebuild it contiguously NOW in EDB col-value mode before
+            // `build_stratum_stage4_runtime` reads the index pointers.
             //
-            // Specifically: only rebuild when the index is non-empty AND linked-list.
-            // If `jit_indices` is empty (relation never advanced; data lives in delta),
-            // skip — `jit_stratum_advance_s4` will build the correct contiguous index
-            // on the first advance and refresh the handles.
+            // The index format depends on `jit_is_edb` at build time:
+            //   jit_is_edb=false → vals are tuple indices (standard mode)
+            //   jit_is_edb=true  → vals are column values (EDB col-value mode)
+            // The ASM/Cranelift JIT selects the mode by `!is_rec[level]`, which must
+            // match the index format.  If the index was built before `jit_is_edb` was
+            // set, the format is wrong and must be rebuilt.
+            //
+            // We detect the stale format by checking `jit_index_is_edb_fmt`:
+            // false = index was last built with jit_is_edb=false (or not built yet).
             for (_, rel) in self.relations.iter_mut() {
                 if let Relation::Packed(ps) = rel
                     && ps.jit_is_edb
-                    && !ps.jit_indices.is_empty()
-                    && !ps.jit_indices[0].is_contiguous
+                    && !ps.jit_index_is_edb_fmt
                 {
+                    ps.jit_full_indexed_count = 0;
                     ps.update_jit_indices();
                 }
             }
@@ -988,7 +991,7 @@ impl Engine {
     #[cfg(all(feature = "jit", feature = "specialized"))]
     fn build_stratum_stage4_runtime(&self, rules: &[&CRule]) -> Option<StratumStage4Runtime> {
         use crate::jit::packed_helpers::{JitHeadBuf, LookupSpec, PackedJitContextV3, StratumStage4Ctx};
-        use crate::jit_index::JitLookupHandle;
+        use crate::jit_index::JitColHandle;
         use crate::relation::Relation;
         use crate::specialized::PackedStorage;
 
@@ -1000,7 +1003,7 @@ impl Engine {
         let mut rule_ctx_ptrs_vec: Vec<*mut PackedJitContextV3> = Vec::new();
 
         // Flat handles and specs (all rules concatenated).
-        let mut handles_flat: Vec<JitLookupHandle> = Vec::new();
+        let mut handles_flat: Vec<JitColHandle> = Vec::new();
         let mut specs_flat: Vec<LookupSpec> = Vec::new();
         // Starting handle index for each rule (for setting lookup_handles ptr later).
         let mut rule_handle_offsets: Vec<usize> = Vec::new();
@@ -1065,7 +1068,7 @@ impl Engine {
                 for use_recent_flag in [0u32, 1u32] {
                     if clause.bound_cols.is_empty() {
                         // Full-scan clause — null handle (never accessed by inline probe)
-                        handles_flat.push(JitLookupHandle::null());
+                        handles_flat.push(JitColHandle::null());
                         specs_flat.push(LookupSpec {
                             rel: rel_ptr,
                             col: 0,
@@ -1080,8 +1083,8 @@ impl Engine {
                             ps.jit_indices.get(col)
                         };
                         let handle = match idx {
-                            Some(i) => JitLookupHandle::from_index(i),
-                            None => JitLookupHandle::null(),
+                            Some(i) => i.to_handle(),
+                            None => JitColHandle::null(),
                         };
                         handles_flat.push(handle);
                         specs_flat.push(LookupSpec {
@@ -1124,7 +1127,7 @@ impl Engine {
         }
 
         let total_handles = handles_flat.len() as u32;
-        let mut handles_box: Box<[JitLookupHandle]> = handles_flat.into_boxed_slice();
+        let mut handles_box: Box<[JitColHandle]> = handles_flat.into_boxed_slice();
         let specs_box: Box<[LookupSpec]> = specs_flat.into_boxed_slice();
 
         // Build tuple_sets_buf: parallel to handles_buf.

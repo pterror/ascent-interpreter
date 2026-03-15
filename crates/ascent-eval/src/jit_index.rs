@@ -123,6 +123,7 @@ fn knuth_hash(key: u32) -> usize {
     h as usize
 }
 
+#[allow(dead_code)]
 impl JitHashIndex {
     /// Build an index from (key, tuple_idx) pairs.
     ///
@@ -449,6 +450,7 @@ const _: () = {
     assert!(std::mem::offset_of!(JitLookupHandle, _pad) == 20);
 };
 
+#[allow(dead_code)]
 impl JitLookupHandle {
     /// Build a handle from an existing index.
     pub fn from_index(idx: &JitHashIndex) -> Self {
@@ -476,6 +478,202 @@ impl JitLookupHandle {
             mask: 0,
             _pad: 0,
         }
+    }
+}
+
+// ─── JitColIndex: compact single-allocation column index ─────────────────────
+
+/// 32-byte C-visible handle for probing a `JitColIndex`.
+///
+/// `#[repr(C)]` layout:
+/// - offset  0: `keys`   `*const u32`   — hash-slot keys (EMPTY_KEY = vacant)
+/// - offset  8: `ranges` `*const u64`   — per-slot range packed as `lo=start:u32 | hi=count:u32`
+/// - offset 16: `vals`   `*const u32`   — flat contiguous values array
+/// - offset 24: `mask`   u32            — capacity − 1
+/// - offset 28: `_pad`   u32
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct JitColHandle {
+    pub keys: *const u32,
+    pub ranges: *const u64,
+    pub vals: *const u32,
+    pub mask: u32,
+    pub _pad: u32,
+}
+
+unsafe impl Send for JitColHandle {}
+unsafe impl Sync for JitColHandle {}
+
+const _: () = {
+    assert!(std::mem::size_of::<JitColHandle>() == 32);
+    assert!(std::mem::offset_of!(JitColHandle, keys) == 0);
+    assert!(std::mem::offset_of!(JitColHandle, ranges) == 8);
+    assert!(std::mem::offset_of!(JitColHandle, vals) == 16);
+    assert!(std::mem::offset_of!(JitColHandle, mask) == 24);
+    assert!(std::mem::offset_of!(JitColHandle, _pad) == 28);
+};
+
+impl JitColHandle {
+    /// Null handle — all probes find no match.
+    pub fn null() -> Self {
+        static NULL_KEYS: [u32; 2] = [EMPTY_KEY, EMPTY_KEY];
+        static NULL_RANGES: [u64; 2] = [0, 0];
+        JitColHandle {
+            keys: NULL_KEYS.as_ptr(),
+            ranges: NULL_RANGES.as_ptr(),
+            vals: std::ptr::null(),
+            mask: 0,
+            _pad: 0,
+        }
+    }
+}
+
+/// Compact single-allocation open-addressed hash index.
+///
+/// All arrays (keys, ranges, vals) reside in a single `Vec<u64>` allocation:
+///
+///   `[keys: (cap+1) u32s][ranges: (cap+1) u64s][vals: vals_len u32s]`
+///
+/// - `keys[slot]`  = u32 hash key; `EMPTY_KEY` marks vacant slots.
+/// - `ranges[slot]` = `(start as u64) | ((count as u64) << 32)`.
+/// - `vals[start..start+count]` = u32 values for the key at this slot.
+/// - Slot `cap` is the overflow slot for key == `EMPTY_KEY`.
+///
+/// Keys are 4 bytes/slot (vs 16 bytes/slot in `JitHashIndex`), reducing
+/// cache pressure during linear probing.
+pub struct JitColIndex {
+    /// 8-byte-aligned backing storage.
+    buf: Vec<u64>,
+    /// Number of regular hash slots (power of 2); overflow slot at `cap`.
+    cap: usize,
+    pub mask: u32,
+    pub len: u32,
+    /// u64 offset into `buf` where the ranges array starts.
+    ranges_off: usize,
+    /// u64 offset into `buf` where the vals array starts.
+    vals_off: usize,
+}
+
+unsafe impl Send for JitColIndex {}
+unsafe impl Sync for JitColIndex {}
+
+impl std::fmt::Debug for JitColIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitColIndex")
+            .field("mask", &self.mask)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl Clone for JitColIndex {
+    fn clone(&self) -> Self {
+        JitColIndex {
+            buf: self.buf.clone(),
+            cap: self.cap,
+            mask: self.mask,
+            len: self.len,
+            ranges_off: self.ranges_off,
+            vals_off: self.vals_off,
+        }
+    }
+}
+
+impl JitColIndex {
+    /// Number of u64 words needed to hold `n` u32 values (ceiling division by 2).
+    fn u64s_for_u32s(n: usize) -> usize {
+        n.div_ceil(2)
+    }
+
+    /// Allocate a zeroed `Vec<u64>` with keys, ranges, and vals regions.
+    ///
+    /// Returns `(buf, ranges_off, vals_off)`.
+    fn alloc_buf(cap: usize, vals_len: usize) -> (Vec<u64>, usize, usize) {
+        let keys_u64 = Self::u64s_for_u32s(cap + 1);
+        let ranges_off = keys_u64;
+        let ranges_u64 = cap + 1;
+        let vals_off = ranges_off + ranges_u64;
+        let vals_u64 = Self::u64s_for_u32s(vals_len);
+        let total = vals_off + vals_u64;
+        let mut buf = vec![0u64; total.max(ranges_off + ranges_u64)];
+        // Initialize keys to EMPTY_KEY (each u64 = two EMPTY_KEY u32s).
+        for w in buf[..keys_u64].iter_mut() {
+            *w = 0xFFFF_FFFF_FFFF_FFFFu64;
+        }
+        (buf, ranges_off, vals_off)
+    }
+
+    /// Empty index — all probes find nothing.
+    pub fn empty() -> Self {
+        let cap = 1;
+        let (buf, ranges_off, vals_off) = Self::alloc_buf(cap, 0);
+        JitColIndex { buf, cap, mask: 0, len: 0, ranges_off, vals_off }
+    }
+
+    /// Build a contiguous index from `(key, value)` pairs.
+    ///
+    /// For EDB arity-2 relations, `value` is the free column's data (col-value mode).
+    /// For all other cases, `value` is a tuple index.
+    pub fn build_contiguous(pairs: &[(u32, u32)]) -> Self {
+        if pairs.is_empty() {
+            return Self::empty();
+        }
+        let mut groups: rustc_hash::FxHashMap<u32, Vec<u32>> = rustc_hash::FxHashMap::default();
+        for &(key, val) in pairs {
+            groups.entry(key).or_default().push(val);
+        }
+        let n = groups.len();
+        let cap = (n * 2).next_power_of_two().max(2);
+        let mask = (cap - 1) as u32;
+        let total_vals = pairs.len();
+        let (mut buf, ranges_off, vals_off) = Self::alloc_buf(cap, total_vals);
+
+        let keys_ptr = buf.as_mut_ptr() as *mut u32;
+        let ranges_ptr = unsafe { buf.as_mut_ptr().add(ranges_off) };
+        let vals_ptr = unsafe { buf.as_mut_ptr().add(vals_off) as *mut u32 };
+
+        let mut vals_cursor = 0u32;
+        let mut len = 0u32;
+        for (key, group) in &groups {
+            let key = *key;
+            let start = vals_cursor;
+            let count = group.len() as u32;
+            for &v in group {
+                unsafe { *vals_ptr.add(vals_cursor as usize) = v; }
+                vals_cursor += 1;
+            }
+            let range: u64 = (start as u64) | ((count as u64) << 32);
+            if key == EMPTY_KEY {
+                unsafe {
+                    *keys_ptr.add(cap) = key;
+                    *ranges_ptr.add(cap) = range;
+                }
+                len += 1;
+            } else {
+                let hash = (key as u64).wrapping_mul(2_654_435_761) as usize;
+                let mut slot = hash & (cap - 1);
+                loop {
+                    if unsafe { *keys_ptr.add(slot) } == EMPTY_KEY {
+                        unsafe {
+                            *keys_ptr.add(slot) = key;
+                            *ranges_ptr.add(slot) = range;
+                        }
+                        len += 1;
+                        break;
+                    }
+                    slot = (slot + 1) & (cap - 1);
+                }
+            }
+        }
+        JitColIndex { buf, cap, mask, len, ranges_off, vals_off }
+    }
+
+    /// Build a `JitColHandle` pointing into this index's single allocation.
+    pub fn to_handle(&self) -> JitColHandle {
+        let keys_ptr = self.buf.as_ptr() as *const u32;
+        let ranges_ptr = unsafe { self.buf.as_ptr().add(self.ranges_off) };
+        let vals_ptr = unsafe { self.buf.as_ptr().add(self.vals_off) as *const u32 };
+        JitColHandle { keys: keys_ptr, ranges: ranges_ptr, vals: vals_ptr, mask: self.mask, _pad: 0 }
     }
 }
 
