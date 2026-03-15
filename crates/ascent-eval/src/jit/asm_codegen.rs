@@ -265,9 +265,7 @@ fn emit_store_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
 /// On no-match (empty slot encountered): jump to `when_exhausted`.
 ///
 /// # Constraints
-/// - Only supports arity == 3 (returns Err otherwise).
-///   Arity <= 2: the existing col-value contiguous path is already O(1) and faster.
-///   Arity > 3:  not yet implemented.
+/// - Supports arity 1–3 (returns Err for arity 0 or > 3).
 /// - All clause args must be `Var`, `I32`, or `Bool`.
 ///
 /// # Register protocol
@@ -277,7 +275,7 @@ fn emit_store_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
 /// # JitTupleSet layout (from storage.rs)
 /// - slots @ 0, mask @ 8, len @ 16
 /// - stride = arity + 1 words per slot
-/// - slot[0] = hash_tag (0 = empty), slot[1..4] = tuple words
+/// - slot[0] = hash_tag (0 = empty), slot[1..N] = tuple words
 fn emit_tuple_set_probe(
     asm: &mut Assembler,
     clause: &CClause,
@@ -286,19 +284,9 @@ fn emit_tuple_set_probe(
     var_locs: &[VarLoc],
 ) -> Result<(), String> {
     let arity = clause.args.len();
-    // For arity <= 2, the col-value contiguous path already handles fully-bound existence
-    // checks: sorted values + early exit means the scan terminates on the first comparison
-    // for dense/high-hit-rate graphs (benchmarked at n=20 complete graph). The JitTupleSet
-    // probe adds 3-pointer-dereference overhead that outweighs the hash benefit at small n.
-    // For arity >= 3, no col-value fast path exists so JitTupleSet is the only O(1) option.
-    if arity < 3 {
+    if arity == 0 || arity > 3 {
         return Err(format!(
-            "emit_tuple_set_probe: arity {arity} uses col-value path"
-        ));
-    }
-    if arity > 3 {
-        return Err(format!(
-            "emit_tuple_set_probe: arity {arity} unsupported (only arity 3 implemented)"
+            "emit_tuple_set_probe: arity {arity} unsupported (supported: 1–3)"
         ));
     }
 
