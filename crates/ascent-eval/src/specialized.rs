@@ -192,6 +192,12 @@ pub struct PackedStorage {
     recent_col_indices: Vec<FxHashMap<u32, Vec<usize>>>,
     /// Source tag per tuple.
     pub(crate) source_tags: Vec<SourceId>,
+    /// Number of tuples whose interpreter state (indices, value_data, source_tags) is synced.
+    ///
+    /// Tuples inserted via the JIT fast path skip updating these interpreter-only structures
+    /// to reduce per-tuple overhead.  `ensure_interp_synced()` catches them up on demand —
+    /// called before interpreter stratum evaluation and before result access.
+    pub(crate) interp_synced_count: usize,
     /// Per-column JIT hash index (full data). Updated incrementally.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) jit_indices: Vec<crate::jit_index::JitHashIndex>,
@@ -239,6 +245,7 @@ impl PackedStorage {
             indices: (0..arity).map(|_| FxHashMap::default()).collect(),
             recent_col_indices: (0..arity).map(|_| FxHashMap::default()).collect(),
             source_tags: Vec::new(),
+            interp_synced_count: 0,
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_indices: Vec::new(),
             #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -277,6 +284,31 @@ impl PackedStorage {
 
     pub fn arity(&self) -> usize {
         self.arity
+    }
+
+    /// Sync interpreter-only state (indices, value_data, source_tags) for any tuples inserted
+    /// via the JIT fast path since the last sync.
+    ///
+    /// The JIT insert path (`insert_packed_raw`) skips these structures to avoid per-tuple
+    /// overhead when only the JIT is reading data.  Call this before any code that reads
+    /// `indices`, `value_data`, or `source_tags` — specifically, before interpreter stratum
+    /// evaluation and before exposing results to callers.
+    pub(crate) fn ensure_interp_synced(&mut self) {
+        if self.interp_synced_count >= self.count {
+            return;
+        }
+        for i in self.interp_synced_count..self.count {
+            let start = i * self.arity;
+            let packed = &self.packed_data[start..start + self.arity];
+            for (col, &p) in packed.iter().enumerate() {
+                self.indices[col].entry(p).or_default().push(i);
+            }
+            for (col, &p) in packed.iter().enumerate() {
+                self.value_data.push(self.col_types[col].unpack(p));
+            }
+            self.source_tags.push(SourceId::ANONYMOUS);
+        }
+        self.interp_synced_count = self.count;
     }
 
     /// Look up the index for a packed u32 key in column `col`.
@@ -319,10 +351,14 @@ impl PackedStorage {
                 return Ok(false);
             }
             self.count = 1;
+            self.interp_synced_count = 1;
             self.source_tags.push(source);
             self.delta.push(0);
             return Ok(true);
         }
+
+        // Sync any lazily-inserted (JIT-path) tuples so that idx stays consistent.
+        self.ensure_interp_synced();
 
         let Some(packed) = self.pack_tuple(&tuple) else {
             return Err(tuple);
@@ -343,14 +379,17 @@ impl PackedStorage {
         self.packed_data.extend(packed);
         self.source_tags.push(source);
         self.count += 1;
+        self.interp_synced_count = self.count;
         self.delta.push(idx);
         Ok(true)
     }
 
     /// Insert a pre-packed u32 tuple directly (no Value→u32 packing step).
     ///
-    /// Used by the stratum meta-function flush helper to avoid the unpack-repack roundtrip.
-    /// Populates both `packed_data` and `value_data` (by unpacking via `col_types`).
+    /// Called from the JIT hot path via `packed_try_insert`.  Skips updating the
+    /// interpreter-only structures (`indices`, `value_data`, `source_tags`) to avoid
+    /// per-tuple overhead when the JIT is the only reader.  Call `ensure_interp_synced()`
+    /// before any code that reads those structures.
     pub fn insert_packed_raw(&mut self, packed: &[u32]) -> bool {
         debug_assert_eq!(packed.len(), self.arity, "packed tuple arity mismatch");
 
@@ -359,6 +398,7 @@ impl PackedStorage {
                 return false;
             }
             self.count = 1;
+            self.interp_synced_count = 1;
             self.source_tags.push(SourceId::ANONYMOUS);
             self.delta.push(0);
             return true;
@@ -370,14 +410,8 @@ impl PackedStorage {
         }
 
         let idx = self.count;
-        for (col, &p) in packed.iter().enumerate() {
-            self.indices[col].entry(p).or_default().push(idx);
-        }
-        for (col, &p) in packed.iter().enumerate() {
-            self.value_data.push(self.col_types[col].unpack(p));
-        }
+        // Skip indices, value_data, source_tags — deferred to ensure_interp_synced().
         self.packed_data.extend_from_slice(packed);
-        self.source_tags.push(SourceId::ANONYMOUS);
         self.count += 1;
         self.delta.push(idx);
         true

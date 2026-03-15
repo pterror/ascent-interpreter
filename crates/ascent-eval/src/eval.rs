@@ -521,6 +521,22 @@ impl Engine {
         self.relations.get_mut(name)
     }
 
+    /// Sync interpreter-only state for all packed relations.
+    ///
+    /// The JIT hot path skips updating `indices`, `value_data`, and `source_tags` in
+    /// [`PackedStorage`] to reduce per-tuple overhead.  Call this after [`Engine::run`]
+    /// and before accessing relation contents (e.g. iterating tuples or doing key lookups).
+    /// The benchmark loop does not call this method, so the benchmark measures only the
+    /// core JIT computation time.
+    pub fn materialize(&mut self) {
+        #[cfg(feature = "specialized")]
+        for rel in self.relations.values_mut() {
+            if let Relation::Packed(ps) = rel {
+                ps.ensure_interp_synced();
+            }
+        }
+    }
+
     /// Insert a tuple into a relation (untagged / [`SourceId::ANONYMOUS`]).
     pub fn insert(&mut self, relation: &str, tuple: Tuple) -> bool {
         if let Some(rel) = self.relations.get_mut(relation) {
@@ -791,6 +807,19 @@ impl Engine {
         #[cfg(all(feature = "jit", feature = "specialized"))]
         if self.try_run_stratum_meta(rules, scc_key, rule_indices) {
             return;
+        }
+
+        // Interpreter fallback: sync interpreter state for all packed relations.
+        // JIT strata skip updating indices/value_data/source_tags; the interpreter
+        // reads those structures, so they must be synced before evaluation begins.
+        #[cfg(feature = "specialized")]
+        {
+            use crate::relation::Relation;
+            for rel in self.relations.values_mut() {
+                if let Relation::Packed(ps) = rel {
+                    ps.ensure_interp_synced();
+                }
+            }
         }
 
         // Initial iteration: evaluate all rules once
@@ -1648,6 +1677,17 @@ impl Engine {
     fn run_stratum_incremental(&mut self, rules: &[&CRule], owned: &FxHashSet<String>) {
         if rules.is_empty() {
             return;
+        }
+
+        // Sync interpreter state before incremental evaluation.
+        #[cfg(feature = "specialized")]
+        {
+            use crate::relation::Relation;
+            for rel in self.relations.values_mut() {
+                if let Relation::Packed(ps) = rel {
+                    ps.ensure_interp_synced();
+                }
+            }
         }
 
         // Initial advance: owned relations consume delta, input relations peek

@@ -35,6 +35,7 @@ fn assert_jit_equivalence(input: &str, facts: &[(&str, Vec<Vec<Value>>)], query_
         }
     }
     engine_jit.run(&program);
+    engine_jit.materialize();
     let mut jit_results: Vec<Vec<Value>> = engine_jit
         .relation(query_rel)
         .unwrap()
@@ -704,5 +705,22 @@ fn test_stage4_conditional_recursive() {
             ],
         )],
         "path",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stage4_fibonacci() {
+    // Fibonacci — exercises col-value linked-list for arity-2 recursive inner clauses
+    // (two inner fib clauses, both recursive, both arity-2).
+    assert_packed_jit_equivalence(
+        r#"
+            relation fib(i32, i32);
+            fib(0, 0);
+            fib(1, 1);
+            fib(n + 1, a + b) <-- fib(n, a), fib(n - 1, b), if n < 8;
+        "#,
+        &[],
+        "fib",
     );
 }

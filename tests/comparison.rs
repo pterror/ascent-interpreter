@@ -738,6 +738,7 @@ fn run_jit(input: &str) -> Engine {
     let mut engine = Engine::new(&program);
     engine.enable_jit();
     engine.run(&program);
+    engine.materialize();
     engine
 }
 
