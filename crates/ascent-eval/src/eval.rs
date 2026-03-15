@@ -1008,9 +1008,10 @@ impl Engine {
             self.stratum_stage4_cache.insert(stratum_key, runtime);
         }
 
-        // Step 3: call the Stage 4 stratum function
+        // Step 3: call the Stage 4 stratum function.
         let runtime = self.stratum_stage4_cache.get_mut(&stratum_key).unwrap();
         unsafe { stage4_fn(&raw mut *runtime.stage4_ctx) };
+
         true
     }
 

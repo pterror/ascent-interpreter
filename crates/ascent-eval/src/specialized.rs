@@ -184,8 +184,6 @@ pub struct PackedStorage {
     pub(crate) delta: Vec<usize>,
     /// Tuple indices from previous iteration.
     pub(crate) recent: Vec<usize>,
-    /// O(1) recent membership.
-    recent_set: FxHashSet<usize>,
     /// Per-column u32-keyed index.
     indices: Vec<FxHashMap<u32, Vec<usize>>>,
     /// Per-column u32-keyed index for recent tuples.
@@ -241,7 +239,6 @@ impl PackedStorage {
             arity,
             delta: Vec::new(),
             recent: Vec::new(),
-            recent_set: FxHashSet::default(),
             indices: (0..arity).map(|_| FxHashMap::default()).collect(),
             recent_col_indices: (0..arity).map(|_| FxHashMap::default()).collect(),
             source_tags: Vec::new(),
@@ -497,7 +494,6 @@ impl PackedStorage {
     pub fn advance(&mut self) -> bool {
         let had_delta = !self.delta.is_empty();
         self.recent = std::mem::take(&mut self.delta);
-        self.recent_set = self.recent.iter().copied().collect();
         for col_idx in &mut self.recent_col_indices {
             col_idx.clear();
         }
@@ -513,10 +509,22 @@ impl PackedStorage {
         had_delta
     }
 
+    /// Advance variant for Stage 4 JIT: skips `recent_col_indices` rebuild.
+    ///
+    /// `recent_col_indices` is only used by the interpreter's `lookup_recent` path.
+    /// Stage 4 JIT uses `jit_recent_indices` (rebuilt by `update_jit_indices`) instead.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) fn advance_jit(&mut self) -> bool {
+        let had_delta = !self.delta.is_empty();
+        self.recent = std::mem::take(&mut self.delta);
+        // Skip recent_col_indices rebuild — JIT uses jit_recent_indices.
+        self.update_jit_indices();
+        had_delta
+    }
+
     pub fn advance_peek(&mut self) -> bool {
         let had_delta = !self.delta.is_empty();
         self.recent = self.delta.clone();
-        self.recent_set = self.recent.iter().copied().collect();
         for col_idx in &mut self.recent_col_indices {
             col_idx.clear();
         }
@@ -643,7 +651,6 @@ impl PackedStorage {
 
     pub fn clear_recent(&mut self) {
         self.recent.clear();
-        self.recent_set.clear();
     }
 
     pub fn clear(&mut self) {
@@ -653,7 +660,6 @@ impl PackedStorage {
         self.jit_dedup.clear();
         self.delta.clear();
         self.recent.clear();
-        self.recent_set.clear();
         for idx in &mut self.indices {
             idx.clear();
         }
@@ -661,10 +667,6 @@ impl PackedStorage {
             idx.clear();
         }
         self.source_tags.clear();
-    }
-
-    pub fn is_recent(&self, idx: usize) -> bool {
-        self.recent_set.contains(&idx)
     }
 
     pub fn recent_indices(&self) -> &[usize] {
@@ -716,7 +718,6 @@ impl PackedStorage {
             }
             self.delta.clear();
             self.recent.clear();
-            self.recent_set.clear();
             return;
         }
 
@@ -758,7 +759,6 @@ impl PackedStorage {
         self.indices = new_indices;
         self.delta.clear();
         self.recent.clear();
-        self.recent_set.clear();
         for col in &mut self.recent_col_indices {
             col.clear();
         }
@@ -808,13 +808,16 @@ impl PackedStorage {
             }
         }
 
+        // Build recent_set from recent for generic storage (PackedStorage no longer tracks it).
+        let recent_set: FxHashSet<usize> = self.recent.iter().copied().collect();
+
         super::RelationStorage {
             data: self.value_data,
             count: self.count,
             dedup,
             delta: self.delta,
             recent: self.recent,
-            recent_set: self.recent_set,
+            recent_set,
             indices,
             recent_col_indices,
             arity,

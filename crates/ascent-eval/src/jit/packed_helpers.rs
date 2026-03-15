@@ -566,9 +566,17 @@ pub unsafe extern "C" fn jit_stratum_advance_s4(ctx: *mut StratumStage4Ctx) -> u
     // Flush head write bufs into PackedStorage delta BEFORE advance.
     unsafe { jit_flush_head_bufs(ctx) };
     let ctx = unsafe { &*ctx };
-    let changed = unsafe { jit_stratum_advance(ctx.all_rels, ctx.n_all_rels) };
-    // Refresh handles — jit_stratum_advance already called advance() on all rels
-    // which rebuilds jit_indices / jit_recent_indices; now copy fresh pointers.
+    // Stage 4 uses advance_jit() which skips recent_col_indices rebuild.
+    // recent_col_indices is interpreter-only; Stage 4 uses jit_recent_indices instead.
+    let mut changed = false;
+    for i in 0..ctx.n_all_rels as usize {
+        let rel = unsafe { &mut **ctx.all_rels.add(i) };
+        if rel.advance_jit() {
+            changed = true;
+        }
+    }
+    let changed = changed as u8;
+    // Refresh handles — advance_jit() rebuilt jit_indices / jit_recent_indices; copy fresh pointers.
     for i in 0..ctx.total_handles as usize {
         let spec = unsafe { &*ctx.lookup_specs.add(i) };
         let ps = unsafe { &*spec.rel };

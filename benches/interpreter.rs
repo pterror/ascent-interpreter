@@ -477,7 +477,61 @@ fn bench_fibonacci(c: &mut Criterion) {
                 prog
             });
         });
+
+        // Engine::new() overhead only (no run) — subtract from jit_hot to get pure JIT cost.
+        group.bench_with_input(BenchmarkId::new("engine_new_only", limit), &limit, |b, &_n| {
+            let source = "relation fib(i32, i32);\n\
+                 fib(0, 0);\n\
+                 fib(1, 1);\n\
+                 fib(nn + 1, a + b) <-- fib(nn, a), fib(nn - 1, b), if *nn < 20;\n";
+            let (program, _) = prepare_program(source);
+            b.iter(|| Engine::new(&program));
+        });
     }
+    group.finish();
+}
+
+fn bench_engine_overhead(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine_overhead");
+
+    let fib20_source = "relation fib(i32, i32);\nfib(0, 0);\nfib(1, 1);\nfib(nn + 1, a + b) <-- fib(nn, a), fib(nn - 1, b), if *nn < 20;\n";
+    let (fib20_program, _) = {
+        let ast: AscentProgram = syn::parse_str(fib20_source).unwrap();
+        let program = Program::from_ast(ast);
+        let engine = Engine::new(&program);
+        (program, engine)
+    };
+
+    // Just Engine::new()
+    group.bench_function("fib20_engine_new", |b| {
+        b.iter(|| Engine::new(&fib20_program))
+    });
+
+    // Engine::new() + with_jit_compiler (pre-compiled)
+    #[cfg(feature = "jit")]
+    group.bench_function("fib20_new_with_jit", |b| {
+        let mut warmup = Engine::new(&fib20_program);
+        warmup.enable_jit();
+        warmup.run(&fib20_program);
+        let compiled = warmup.share_jit_compiler().unwrap();
+        b.iter(|| {
+            let mut engine = Engine::new(&fib20_program);
+            engine.with_jit_compiler(compiled.clone());
+            engine
+        })
+    });
+
+    // Engine::new() + run but with insert-only (no fixpoint, measure setup)
+    group.bench_function("fib20_insert_2_facts", |b| {
+        use ascent_eval::value::Value;
+        b.iter(|| {
+            let mut engine = Engine::new(&fib20_program);
+            engine.insert("fib", vec![Value::I32(0), Value::I32(0)]);
+            engine.insert("fib", vec![Value::I32(1), Value::I32(1)]);
+            engine
+        })
+    });
+
     group.finish();
 }
 
@@ -486,6 +540,7 @@ criterion_group!(
     bench_transitive_closure,
     bench_triangle,
     bench_connected_components,
-    bench_fibonacci
+    bench_fibonacci,
+    bench_engine_overhead
 );
 criterion_main!(benches);

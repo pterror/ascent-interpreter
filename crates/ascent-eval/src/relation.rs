@@ -737,7 +737,7 @@ impl Relation {
         match self {
             Relation::Generic(r) => r.is_recent(idx),
             #[cfg(feature = "specialized")]
-            Relation::Packed(p) => p.is_recent(idx),
+            Relation::Packed(p) => p.recent.contains(&idx),
         }
     }
 

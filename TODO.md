@@ -416,8 +416,15 @@ of `try_insert_with_source`.  Tests call `engine.materialize()` before result co
 **Results (n=20, 2026-03-15):** triangle 359 µs → 298 µs = **17% improvement (9.2× vs macro)**;
 fibonacci 18.2 µs → 13.3 µs = **27% improvement (1.6× vs macro)**.
 
-**Residual gap:** triangle ~9.2×, fibonacci ~1.6×, TC ~2.5×. The triangle gap is dominated
-by instruction-count overhead (Cranelift vs LLVM code quality) in the inner join loop.
+**Step 6 (2026-03-16): remove dead `recent_set` + skip `recent_col_indices` in Stage 4 advance.**
+Removed `FxHashSet<usize> recent_set` from `PackedStorage` (dead: `is_recent()` had no callers).
+Added `advance_jit()` method that skips `recent_col_indices` rebuild (interpreter-only; Stage 4
+uses `jit_recent_indices`); called from `jit_stratum_advance_s4` instead of `advance()`.
+**Results (n=20, 2026-03-16):** triangle 298 µs → 246 µs = **17% improvement (7.7× vs macro)**;
+fibonacci 13.3 µs → 12.0 µs = **10% improvement (1.4× vs macro)**.
+
+**Residual gap:** triangle ~7.7×, fibonacci ~1.4×. The triangle gap is dominated by
+instruction-count overhead (Cranelift vs LLVM code quality) in the inner join loop.
 Remaining options: (a) asm backend register assignment (Step 3a — outer-loop variables in
 callee-saved regs eliminates load/store per inner iter); (b) eliminate `packed_try_insert`
 call for new tuples (inline into JIT).
@@ -430,7 +437,8 @@ before 2026-03-15 changes. Root cause unknown — dynasm TC path. Does not affec
 
 - [x] **Skip JIT index building for program-wide sink relations** — `jit_is_sink` flag on `PackedStorage`; `update_jit_indices()` returns early when set. 14% improvement on triangle. See above.
 
-- [ ] **Lazy `recent_col_indices` rebuild** — `advance()` in both `PackedStorage` (`specialized.rs`) and `RelationStorage` (`relation.rs`) unconditionally rebuilds recent indices even for sink relations (head-only, never body clauses). The right implementation is a new `ensure_recent_indices(&mut self)` called at eval-loop level only for relations that are body clauses in the current stratum — avoids the `&self`/`RefCell` tangle. Impact limited to programs with head-only output relations; benchmarks (TC, triangles) don't benefit.
+- [x] **Skip `recent_col_indices` rebuild in Stage 4** — Stage 4 JIT calls `advance_jit()` (not `advance()`) which skips `recent_col_indices` rebuild. `recent_col_indices` is interpreter-only; Stage 4 uses `jit_recent_indices`. Also removed dead `recent_set: FxHashSet<usize>` from `PackedStorage` (was maintained but never queried).
+- [ ] **Lazy `recent_col_indices` rebuild for non-body relations** — `advance()` in `RelationStorage` unconditionally rebuilds recent indices even for sink relations. The right implementation is a new `ensure_recent_indices(&mut self)` called at eval-loop level only for relations that are body clauses in the current stratum. Impact limited to programs with head-only output relations; benchmarks (TC, triangles) don't benefit.
 
 - [ ] **Sparse delta evaluation (LSP path)** — for incremental workloads where deltas are large relative to full relations, build selective delta indices only on columns actually used in downstream join clauses (determined at rule compile time). Avoids scanning delta tuples whose relevant columns don't match any current binding, reducing O(|delta|) inner loop iterations for non-matching tuples.
 
