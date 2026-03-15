@@ -208,6 +208,11 @@ pub struct PackedStorage {
     /// built contiguously each iteration. Set by `eval.rs` before running a stratum.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) jit_is_edb: bool,
+    /// True if this relation is a sink in the current stratum (appears only in rule heads,
+    /// never in any body clause). When true, `update_jit_indices` skips all index building
+    /// since the indices are never probed. Set by `eval.rs` before running a stratum.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) jit_is_sink: bool,
     /// Authoritative dedup table (inline u32 hash table, also probed by JIT code directly).
     pub(crate) jit_dedup: crate::jit_index::JitDedupTable,
 }
@@ -236,6 +241,8 @@ impl PackedStorage {
             jit_full_indexed_count: 0,
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_is_edb: false,
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_is_sink: false,
             jit_dedup: crate::jit_index::JitDedupTable::new(arity),
         }
     }
@@ -501,6 +508,9 @@ impl PackedStorage {
     /// Must be called after `advance()` / `advance_peek()` to keep JIT handles fresh.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) fn update_jit_indices(&mut self) {
+        if self.jit_is_sink {
+            return;
+        }
         // ── Full index ───────────────────────────────────────────────────────
         if self.jit_is_edb {
             // EDB: build contiguous index ONCE, then never touch it again.

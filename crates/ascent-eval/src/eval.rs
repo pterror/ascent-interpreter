@@ -912,6 +912,26 @@ impl Engine {
                 }
             }
 
+            // Set jit_is_sink: true for relations that are head-only across the ENTIRE
+            // program (never appear as a body clause in any rule). Using program-wide
+            // analysis avoids marking a relation as a sink in one stratum when it will
+            // be probed as a body clause in a later stratum.
+            {
+                let strat = self.stratification.as_ref().unwrap();
+                let program_body_rels: rustc_hash::FxHashSet<&str> = strat
+                    .compiled
+                    .iter()
+                    .flat_map(|r| r.body.iter().filter_map(|item| {
+                        if let CBodyItem::Clause(c) = item { Some(c.relation.as_str()) } else { None }
+                    }))
+                    .collect();
+                for rel_name in &head_rels {
+                    if let Some(Relation::Packed(ps)) = self.relations.get_mut(*rel_name) {
+                        ps.jit_is_sink = !program_body_rels.contains(rel_name);
+                    }
+                }
+            }
+
             // If an EDB relation already has a linked-list JIT index (built by a
             // prior fact stratum that ran with `jit_is_edb = false`), rebuild it
             // contiguously NOW — before `build_stratum_stage4_runtime` reads the
