@@ -406,11 +406,21 @@ in any body clause of the entire program. Set per-stratum via program-wide body-
 analysis in `try_run_stratum_stage4`. **Triangle `jit_hot/20`: ~333 µs (was ~390 µs) — ~14%
 improvement.** Eliminates ~20,520 hash insertions per advance() call (3 cols × 6,840 tuples).
 
-**Residual gap:** triangle ~10.2×, TC ~2.5×. The triangle gap is still dominated by: (a) arity-2
-fully-bound clause uses col-value scan, slower than ascent_macro's O(1) HashSet probe; (b)
-`packed_try_insert` call per-iteration overhead (JitHeadBuf reduced this but doesn't eliminate).
-Primary remaining options: (a) extend JitTupleSet to arity 2; (b) profile residual to confirm
-remaining cost breakdown.
+**Lazy interpreter state sync — implemented 2026-03-15** ✅
+
+`PackedStorage.insert_packed_raw` (called from `packed_try_insert` JIT FFI) now skips
+updating `indices`, `value_data`, `source_tags` — interpreter-only structures unused during
+pure-JIT stratum evaluation.  Added `ensure_interp_synced()` called on demand: before
+interpreter stratum fallback, by `Engine::materialize()` (new public API), and at the start
+of `try_insert_with_source`.  Tests call `engine.materialize()` before result comparison.
+**Results (n=20, 2026-03-15):** triangle 359 µs → 298 µs = **17% improvement (9.2× vs macro)**;
+fibonacci 18.2 µs → 13.3 µs = **27% improvement (1.6× vs macro)**.
+
+**Residual gap:** triangle ~9.2×, fibonacci ~1.6×, TC ~2.5×. The triangle gap is dominated
+by instruction-count overhead (Cranelift vs LLVM code quality) in the inner join loop.
+Remaining options: (a) asm backend register assignment (Step 3a — outer-loop variables in
+callee-saved regs eliminates load/store per inner iter); (b) eliminate `packed_try_insert`
+call for new tuples (inline into JIT).
 
 **Pre-existing bug:** `tc_shared_jit` test hangs infinitely with `jit-asm` feature. Existed
 before 2026-03-15 changes. Root cause unknown — dynasm TC path. Does not affect `jit+specialized`
