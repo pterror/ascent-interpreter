@@ -507,27 +507,6 @@ impl PackedStorage {
     /// Insert a pre-packed tuple whose dedup entry has already been written by the JIT.
     ///
     /// Skips the `jit_dedup.insert_if_new` check (the JIT wrote to the dedup table inline).
-    /// Updates `indices`, `value_data`, `packed_data`, `source_tags`, `count`, and `delta`.
-    ///
-    /// # Safety (invariant)
-    /// The caller guarantees this tuple is NEW (not already in `packed_data`).  The dedup
-    /// table entry has already been filled by the JIT, so `insert_if_new` would return false.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) fn insert_packed_raw_no_dedup(&mut self, packed: &[u32]) {
-        debug_assert_eq!(packed.len(), self.arity, "packed tuple arity mismatch");
-        let idx = self.count;
-        for (col, &p) in packed.iter().enumerate() {
-            self.indices[col].entry(p).or_default().push(idx);
-        }
-        for (col, &p) in packed.iter().enumerate() {
-            self.value_data.push(self.col_types[col].unpack(p));
-        }
-        self.packed_data.extend_from_slice(packed);
-        self.source_tags.push(SourceId::ANONYMOUS);
-        self.count += 1;
-        self.delta.push(idx);
-    }
-
     pub fn contains(&self, tuple: &[Value]) -> bool {
         if self.arity == 0 {
             return self.count > 0;
