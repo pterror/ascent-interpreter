@@ -1231,18 +1231,11 @@ fn emit_clause_level(
         let stride = (arity * 4) as i32;
         let use_recent = p.use_recent[level];
         let is_rec = p.is_rec[level];
-        // Non-recursive relations use contiguous mode (built once for EDB).
-        // Recursive relations use linked-list mode (not supported in native path).
-        let is_contiguous = !is_rec;
-
-        // Native path only supports contiguous (EDB) inner clauses.
-        // Reject strata where any inner-level clause is recursive (linked-list).
-        if p.use_jit_native && !is_contiguous {
-            return Err(format!(
-                "asm native: rule {} clause {} is recursive (linked-list not supported in native path)",
-                p.rule_i, level
-            ));
-        }
+        // Native path: JitColIndex always stores contiguous (start, count) ranges regardless
+        // of whether the relation is EDB or IDB.  The linked-list layout only exists in the
+        // old JitHashIndex used by the non-native (Cranelift callback) path.
+        // Old path: IDB uses linked-list traversal; EDB uses contiguous.
+        let is_contiguous = p.use_jit_native || !is_rec;
 
         // Save the ENCLOSING level's r15 and rbx before we clobber them with
         // the new probe.  The enclosing level is `level-1`.
