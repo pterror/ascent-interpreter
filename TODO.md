@@ -261,15 +261,15 @@ advance: call rust_advance(ctx)   // once per fixpoint iter
 `JitColIndex`, `JitTupleSet`, `JitRelData` already exist in `storage.rs` as a blueprint — not yet wired. `JitColIndex.ranges` encodes `start | (count << 32)` per bucket (u64). `JitRelData` layout: `data@0`, `len@8`, `cap@16`, `col_indices@24`, `tuple_set@32` (embedded 24-byte JitTupleSet), `arity@56`.
 
 Sequenced steps:
-1. **storage.rs growth callbacks** (~60 lines): add `extern "C" fn jit_rel_data_grow(*mut JitRelData)` (doubles data capacity, updates ptr+cap) and `extern "C" fn jit_tuple_set_grow(*mut JitTupleSet, arity)` (doubles+rehashes). These are the only two new Rust callbacks the hot path ever makes.
-2. **specialized.rs projection** (~120 lines): add `jit_native: Option<JitNativeRelData>` to `PackedStorage` holding `[total, recent, new]` `Box<JitRelData>`. Add `build_native_projection()`. Call in `advance_jit()`.
-3. **eval.rs native runtime** (~200 lines): `build_stratum_stage4_native_runtime` alongside existing builder; `StratumStage4NativeCtx` with `*mut JitRelData` pointers instead of `JitLookupHandle` arrays. Falls back to old path if any relation lacks `jit_native`.
-4. **asm read path** (~180 lines): `use_jit_native` flag in `EmitParams`; replace outer-scan `packed_count`/`packed_data_ptr` calls with direct `[jit_rel+0]`/`[jit_rel+8]` loads; replace `JitLookupHandle` probe with `JitColIndex` `keys/ranges/vals` inline probe.
-5. **asm write path** (~120 lines): replace `emit_heads`+`packed_try_insert` with direct stores to `head_jitrel.data`, inline `JitTupleSet` insert, `len++`, bounds-check → `call jit_rel_data_grow`.
-6. **Cranelift parity** (~150 lines): mirror steps 4–5 in `packed_codegen.rs`.
-7. **Dead code removal** (~50 lines): delete `JitHeadBuf`, `jit_flush_head_bufs`, `tuple_sets_buf`, `head_write_bufs`, `head_rel_ptrs` from `StratumStage4Ctx` once all tests pass.
+1. ✅ **storage.rs growth callbacks** — `JitColIndex`, `JitTupleSet`, `JitRelData` exist with `build_from_packed`; `JitRelData::new_empty` for write buffers. Growth callbacks not yet needed (write path still uses `packed_try_insert`).
+2. ✅ **specialized.rs projection** — `jit_native: Option<JitNativeRelData>` on `PackedStorage`; `build_native_projection()` called from `advance_jit()`. Done.
+3. ✅ **eval.rs native runtime** — `StratumStage4NativeCtx`, `build_stratum_stage4_native_runtime`, `jit_advance_native`, `StratumStage4NativeRuntime`. Done (commit `9a83b54`).
+4. ✅ **asm read path** — `use_jit_native` flag, inline `JitColIndex` probe (Knuth hash, keys/ranges/vals), direct data load from `JitRelData.data`, head insertion via `ctx->head_specs[flat_hi].rel`. Upfront advance refreshes stale pointers. Native path active for EDB-inner-only strata. Done (commit `363a0fa`).
+5. [ ] **asm write path** (~120 lines): replace `emit_heads`+`packed_try_insert` with direct stores to `head_jitrel.data`, inline `JitTupleSet` insert, `len++`, bounds-check → `call jit_rel_data_grow`. Growth callback in `storage.rs` needed.
+6. [ ] **Cranelift parity** (~150 lines): mirror steps 4–5 in `packed_codegen.rs`.
+7. [ ] **Dead code removal** (~50 lines): delete `JitHeadBuf`, `jit_flush_head_bufs`, `tuple_sets_buf`, `head_write_bufs`, `head_rel_ptrs` from `StratumStage4Ctx` once all tests pass.
 
-Total: ~880 lines across 6 files. Steps 1–2 are parallel-independent.
+Total: ~880 lines across 6 files. Steps 1–4 done; steps 5–7 remaining.
 
 ### Near-native performance roadmap
 
