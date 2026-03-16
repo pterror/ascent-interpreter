@@ -297,6 +297,7 @@ impl PackedStorage {
             // `build_from_packed` on an empty slice allocates a minimum-capacity (16 slots)
             // tuple_set and a data buffer, with len=0 and cap=1.
             new: JitRelData::build_from_packed(&[], arity, false),
+            total_built_count: self.count,
         }
     }
 
@@ -559,7 +560,7 @@ impl PackedStorage {
         // Flush any tuples the JIT wrote to jit_native.new into this relation's delta.
         // Takes only the `new` buffer from jit_native so we can update jit_native in-place
         // when nothing changed (avoids a full rebuild of total + recent).
-        let new_written = if let Some(ref mut native) = self.jit_native {
+        let _new_written = if let Some(ref mut native) = self.jit_native {
             let arity = self.arity;
             // Swap out the `new` buffer, replacing with a fresh empty one.
             let new_buf = std::mem::replace(
@@ -603,19 +604,49 @@ impl PackedStorage {
         // The asm native runtime builder explicitly initializes jit_native before first run;
         // after that, this block keeps it fresh on every fixpoint iteration.
         if self.jit_native.is_some() {
-            if new_written || had_delta {
-                // Data changed: full rebuild.
-                self.jit_native = Some(self.build_native_projection());
-            } else if self.jit_is_edb {
-                // EDB, nothing changed: total is still valid; just reset recent (empty).
+            use crate::jit::storage::JitRelData;
+            let arity = self.arity;
+            let build_indices = !self.jit_is_sink;
+
+            if self.jit_is_edb {
+                // EDB: total never changes. Always reset recent to empty.
                 let native = self.jit_native.as_mut().unwrap();
-                use crate::jit::storage::JitRelData;
-                let build_indices = !self.jit_is_sink;
-                native.recent = JitRelData::build_from_packed(&[], self.arity, build_indices);
+                native.recent = JitRelData::build_from_packed(&[], arity, build_indices);
                 // `new` was already reset above by the swap.
             } else {
-                // IDB: full rebuild to include any new tuples in total.
-                self.jit_native = Some(self.build_native_projection());
+                // IDB: extend total with only the new delta tuples; rebuild indices.
+                let native = self.jit_native.as_mut().unwrap();
+                let prev_count = native.total_built_count;
+                let curr_count = self.count;
+
+                if curr_count > prev_count {
+                    // Gather new tuples from packed_data (indices prev_count..curr_count).
+                    let arity_max1 = arity.max(1);
+                    let new_start = prev_count * arity_max1;
+                    let new_end = curr_count * arity_max1;
+                    let new_slice = &self.packed_data[new_start..new_end];
+                    // Safety: native.total was built by build_native_projection /
+                    // extend_and_rebuild_indices and is fully initialised.
+                    unsafe {
+                        native.total.extend_and_rebuild_indices(
+                            new_slice,
+                            arity,
+                            build_indices,
+                        );
+                    }
+                    native.total_built_count = curr_count;
+                }
+
+                // Rebuild recent from self.recent index list.
+                let arity_max1 = arity.max(1);
+                let mut recent_buf = Vec::with_capacity(self.recent.len() * arity_max1);
+                for &idx in &self.recent {
+                    let start = idx * arity_max1;
+                    recent_buf
+                        .extend_from_slice(&self.packed_data[start..start + arity_max1]);
+                }
+                native.recent =
+                    JitRelData::build_from_packed(&recent_buf, arity, build_indices);
             }
         }
 

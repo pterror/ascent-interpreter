@@ -538,6 +538,114 @@ impl JitRelData {
     }
 }
 
+impl JitRelData {
+    /// Appends `new_tuples` (flat row-major, stride=arity) to this relation's data buffer,
+    /// rebuilds all column indices from the extended data, and updates the `tuple_set`
+    /// to include the new tuples (required for cross-iteration JIT head dedup).
+    ///
+    /// # Safety
+    /// `self` must be a fully initialized `JitRelData` from `build_from_packed`.
+    pub unsafe fn extend_and_rebuild_indices(
+        &mut self,
+        new_tuples: &[u32],
+        arity: usize,
+        build_indices: bool,
+    ) {
+        let arity_max1 = arity.max(1);
+        let n_new = new_tuples.len() / arity_max1;
+        if n_new == 0 {
+            return;
+        }
+
+        let old_len = self.len as usize;
+        let new_len = old_len + n_new;
+
+        // Grow data buffer if needed.
+        if new_len > self.cap as usize {
+            let mut new_cap = (self.cap as usize).max(1);
+            while new_cap < new_len {
+                new_cap *= 2;
+            }
+            let old_layout = Layout::array::<u32>((self.cap as usize) * arity_max1)
+                .expect("layout overflow");
+            let new_ptr = unsafe {
+                realloc(
+                    self.data as *mut u8,
+                    old_layout,
+                    new_cap * arity_max1 * std::mem::size_of::<u32>(),
+                ) as *mut u32
+            };
+            assert!(!new_ptr.is_null(), "extend_and_rebuild_indices: realloc failed");
+            // Zero-initialize newly added region.
+            unsafe {
+                std::ptr::write_bytes(
+                    new_ptr.add(old_len * arity_max1),
+                    0,
+                    (new_cap - old_len) * arity_max1,
+                );
+            }
+            self.data = new_ptr;
+            self.cap = new_cap as u64;
+        }
+
+        // Append new tuples.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                new_tuples.as_ptr(),
+                self.data.add(old_len * arity_max1),
+                new_tuples.len(),
+            );
+        }
+        self.len = new_len as u64;
+
+        // Update tuple_set: rebuild from the full extended data.
+        // Required because the JIT uses total.tuple_set for cross-iteration head dedup.
+        {
+            let full_slice = if arity == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(self.data, new_len * arity) }
+            };
+            // Free old tuple_set slots allocation (JitTupleSet::drop is a no-op; we own it).
+            if !self.tuple_set.slots.is_null() && self._ts_slots_words > 0 {
+                unsafe { free_u32_slice(self.tuple_set.slots, self._ts_slots_words) };
+            }
+            // Build fresh tuple_set.
+            let ts = JitTupleSet::build(full_slice, arity);
+            let stride = arity + 1;
+            let ts_cap = ts.cap_in_slots();
+            let ts_slots_words = ts_cap * stride;
+            let ts_slots = ts.slots;
+            let ts_mask = ts.mask;
+            let ts_len = ts.len;
+            std::mem::forget(ts); // suppress the no-op drop; we own the memory
+            self.tuple_set.slots = ts_slots;
+            self.tuple_set.mask = ts_mask;
+            self.tuple_set.len = ts_len;
+            self._ts_slots_words = ts_slots_words;
+        }
+
+        if !build_indices || arity == 0 {
+            return;
+        }
+
+        // Rebuild all column indices from the full extended data.
+        let full_slice =
+            unsafe { std::slice::from_raw_parts(self.data, new_len * arity) };
+        let col_indices_ptr = self.col_indices;
+        for col in 0..arity {
+            // Drop old index.
+            let old_ptr = unsafe { *col_indices_ptr.add(col) };
+            if !old_ptr.is_null() {
+                drop(unsafe { Box::from_raw(old_ptr) });
+            }
+            // Build and store new index.
+            let new_idx = JitColIndex::build(full_slice, arity, col);
+            unsafe { *col_indices_ptr.add(col) = Box::into_raw(new_idx) };
+        }
+    }
+}
+
 impl Drop for JitRelData {
     fn drop(&mut self) {
         let arity = self.arity as usize;
@@ -583,6 +691,9 @@ pub struct JitNativeRelData {
     pub total: Box<JitRelData>,
     pub recent: Box<JitRelData>,
     pub new: Box<JitRelData>,
+    /// Number of tuples in `total` at the time it was last built.
+    /// Used by `advance_jit` to extend incrementally instead of full rebuild.
+    pub total_built_count: usize,
 }
 
 // Safety: JitRelData contains raw pointers and is !Send by default, but all
