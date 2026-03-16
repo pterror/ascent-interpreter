@@ -10,7 +10,7 @@
 // Not all storage types/methods are used yet — dead_code allowed intentionally.
 #![allow(dead_code)]
 
-use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::alloc::{alloc_zeroed, dealloc, realloc, Layout};
 use std::ptr;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -569,6 +569,104 @@ impl Drop for JitRelData {
             self.tuple_set.slots = ptr::null_mut();
         }
     }
+}
+
+// ─── JIT growth callbacks ────────────────────────────────────────────────────
+//
+// These are the ONLY Rust functions the new JIT hot path calls — and only on
+// capacity overflow (rare).  All other data access is direct memory reads/writes
+// using the fixed offsets verified by the assertions below.
+
+/// Called from JIT when `JitRelData.len == JitRelData.cap`.
+/// Doubles the `data` buffer capacity; updates `rel.data` and `rel.cap` in place.
+///
+/// # Safety
+/// `rel` must be a valid non-null `*mut JitRelData` with a properly initialised
+/// `data`, `cap`, and `arity` field.  The caller must NOT have incremented `len`
+/// yet — this function does not touch `len`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_rel_data_grow(rel: *mut JitRelData) {
+    let rel = unsafe { &mut *rel };
+    let arity = rel.arity as usize;
+    let old_cap = rel.cap as usize;
+    let new_cap = (old_cap * 2).max(1);
+
+    // Each tuple is `arity` u32 words (minimum 1 word to satisfy allocator).
+    let word_size = arity.max(1);
+    let old_words = old_cap * word_size;
+    let new_words = new_cap * word_size;
+
+    let old_layout = Layout::array::<u32>(old_words).expect("layout overflow");
+    let new_layout = Layout::array::<u32>(new_words).expect("layout overflow");
+
+    let new_ptr = unsafe {
+        realloc(rel.data as *mut u8, old_layout, new_layout.size()) as *mut u32
+    };
+    assert!(!new_ptr.is_null(), "jit_rel_data_grow: allocation failed");
+
+    // Zero-initialise the newly added region so stale bytes are not visible.
+    unsafe {
+        std::ptr::write_bytes(new_ptr.add(old_words), 0, new_words - old_words);
+    }
+
+    rel.data = new_ptr;
+    rel.cap = new_cap as u64;
+}
+
+/// Called from JIT when `JitTupleSet` load factor exceeds threshold
+/// (`len * 10 > cap * 7`).  Doubles capacity and rehashes all existing entries.
+///
+/// # Safety
+/// `ts` must be a valid non-null `*mut JitTupleSet` with a properly initialised
+/// `slots`, `mask`, and `len` field.  `arity` must be >= 1 and match the arity
+/// that was used when the slot buffer was originally allocated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_tuple_set_grow(ts: *mut JitTupleSet, arity: u32) {
+    let ts = unsafe { &mut *ts };
+    let arity = arity as usize;
+    let stride = arity + 1; // words per slot: [hash_tag, col0…colN]
+
+    let old_cap = (ts.mask + 1) as usize; // must be power of 2
+    let new_cap = old_cap * 2;
+    let new_mask = (new_cap - 1) as u64;
+
+    // Allocate new zeroed slot array (zero ↔ EMPTY_TAG for all hash_tag words).
+    let new_words = new_cap * stride;
+    let new_ptr = alloc_u32_zeroed(new_words);
+
+    // Rehash all occupied entries from the old table into the new one.
+    let old_slots = ts.slots;
+    for i in 0..old_cap {
+        let tag = unsafe { *old_slots.add(i * stride) };
+        if tag == EMPTY_TAG {
+            continue;
+        }
+        // Linear-probe insert into new table using the stored hash tag.
+        let mut slot = (tag as u64 & new_mask) as usize;
+        loop {
+            let existing_tag = unsafe { *new_ptr.add(slot * stride) };
+            if existing_tag == EMPTY_TAG {
+                // Copy the entire slot (tag + arity fields).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        old_slots.add(i * stride),
+                        new_ptr.add(slot * stride),
+                        stride,
+                    );
+                }
+                break;
+            }
+            slot = ((slot as u64 + 1) & new_mask) as usize;
+        }
+    }
+
+    // Free the old slot allocation.
+    let old_words = old_cap * stride;
+    unsafe { free_u32_slice(old_slots, old_words) };
+
+    // Update the JitTupleSet in place (len is unchanged).
+    ts.slots = new_ptr;
+    ts.mask = new_mask;
 }
 
 // ─── Static offset assertions ────────────────────────────────────────────────
