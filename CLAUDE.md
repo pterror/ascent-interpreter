@@ -50,7 +50,7 @@ cd docs && bun dev # Local docs
 
 When evaluating a JIT optimization, profile with `perf stat -e instructions,cycles,cache-misses` and compare *per-iteration* numbers against the `ascent_macro` benchmark. The gap is closed when both instruction count and cache behavior converge, not just one.
 
-Current state (2026-03-16): fibonacci jit_hot/20 = 11.9µs vs ascent_macro 8.0µs (**1.49×**); triangle jit_hot/20 = 245µs vs ascent_macro 34µs (**7.2×**). The EDB contiguous index is already in place, reducing triangle cache misses from 116× to ~13× (estimated). Primary remaining bottleneck for triangle is the `JitHashIndex` pointer-chased structure — see TODO.md § "New architecture" for the compact JitColIndex replacement plan.
+Current state (2026-03-17): fibonacci jit_hot/20 = 16µs vs ascent_macro 10µs (**1.6×**); triangle jit_hot/20 = 207µs vs ascent_macro 38µs (**5.4×**); TC jit_hot/50 = 196µs vs ascent_macro 122µs (**1.6×**). The EDB contiguous index is already in place, reducing triangle cache misses from 116× to ~13× (estimated). Primary remaining bottleneck for triangle is the `JitHashIndex` pointer-chased structure — see TODO.md § "New architecture" for the compact JitColIndex replacement plan.
 
 **ABI scan callbacks (`packed_data_ptr`, `packed_count`, `packed_recent_ptr`) are NOT the bottleneck.** These functions access warm cache lines (offsets 24, 72, 112 in `PackedStorage`). Any scheme that replaces them with direct loads risks adding cache misses from `PackedScanInfo` fields at cold offsets, or disrupts the overall layout. Attempted 2026-03-16 as `PackedScanInfo` in `PackedStorage` — regressed fibonacci 1.49× → 1.56–1.73× in all configurations. Do not retry.
 

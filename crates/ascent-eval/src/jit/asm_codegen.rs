@@ -1833,7 +1833,19 @@ fn codegen_stratum_asm_inner(
                 return Err(format!("asm: rule {ri} clause{ci} has no bound_cols; unsupported"));
             }
         }
-        // No recursive rejection: linked-list traversal is now supported.
+        // Non-native path: reject IDB inner clauses (level >= 1).
+        // The linked-list traversal for IDB inner clauses is buggy — TC runs
+        // ~12× slower and tc_shared_jit hangs. Fall through to Cranelift instead.
+        if !use_jit_native {
+            for (ci, c) in clauses.iter().enumerate().skip(1) {
+                let is_idb = heads.iter().any(|h| h.relation == c.relation);
+                if is_idb {
+                    return Err(format!(
+                        "asm: rule {ri} clause {ci} is IDB inner; linked-list buggy, use Cranelift"
+                    ));
+                }
+            }
+        }
     }
 
     let max_head_arity = rules
