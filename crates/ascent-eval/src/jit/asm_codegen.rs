@@ -38,6 +38,7 @@
 //!   - level L's r15 (next_node) is saved to level_node_save_slot(L)
 //!   - level L's rbx (data_ptr)  is saved to level_dptr_save_slot(L)
 //!   - level L's vptr remains in level_vptr_slot(L) (written at probe setup, not clobbered)
+//!
 //! When level L+1 exhausts (sentinel), control passes to `sub_exhausted` where:
 //!   - r15 is restored from level_node_save_slot(L)
 //!   - rbx is restored from level_dptr_save_slot(L)
@@ -398,7 +399,8 @@ fn emit_tuple_set_probe(
 
 fn check_expr(expr: &CExpr) -> Result<(), String> {
     match expr {
-        CExpr::Var(_) | CExpr::Literal(Value::I32(_)) | CExpr::Literal(Value::Bool(_)) => Ok(()),
+        CExpr::Var(_) | CExpr::DerefVar(_) => Ok(()),
+        CExpr::Literal(Value::I32(_)) | CExpr::Literal(Value::Bool(_)) => Ok(()),
         CExpr::VarBinVar(op, _, _)
         | CExpr::VarBinLit(op, _, _)
         | CExpr::LitBinVar(op, _, _) => check_binop(*op),
@@ -407,7 +409,7 @@ fn check_expr(expr: &CExpr) -> Result<(), String> {
             check_expr(a)?;
             check_expr(b)
         }
-        CExpr::Unary(CUnOp::Not | CUnOp::Neg, i) => check_expr(i),
+        CExpr::Unary(CUnOp::Not | CUnOp::Neg | CUnOp::Deref, i) => check_expr(i),
         _ => Err(format!("asm: unsupported expr: {expr:?}")),
     }
 }
@@ -415,7 +417,8 @@ fn check_expr(expr: &CExpr) -> Result<(), String> {
 fn check_binop(op: CBinOp) -> Result<(), String> {
     use CBinOp::*;
     match op {
-        Add | Sub | Mul | Eq | Ne | Lt | Le | Gt | Ge | And | Or => Ok(()),
+        Add | Sub | Mul | Eq | Ne | Lt | Le | Gt | Ge | And | Or
+        | BitXor | Shl | Shr => Ok(()),
         _ => Err(format!("asm: unsupported binop: {op:?}")),
     }
 }
@@ -455,6 +458,7 @@ fn emit_expr(asm: &mut Assembler, expr: &CExpr, var_locs: &[VarLoc]) -> Result<(
             dynasm!(asm; pop rcx);
             emit_binop(asm, *op)?;
         }
+        CExpr::DerefVar(id) => emit_load_var(asm, var_locs, *id),
         CExpr::Unary(CUnOp::Not, i) => {
             emit_expr(asm, i, var_locs)?;
             dynasm!(asm; xor eax, 1i8);
@@ -463,6 +467,7 @@ fn emit_expr(asm: &mut Assembler, expr: &CExpr, var_locs: &[VarLoc]) -> Result<(
             emit_expr(asm, i, var_locs)?;
             dynasm!(asm; neg eax);
         }
+        CExpr::Unary(CUnOp::Deref, i) => emit_expr(asm, i, var_locs)?,
         _ => return Err(format!("asm: unsupported expr: {expr:?}")),
     }
     Ok(())
@@ -477,13 +482,16 @@ fn emit_binop(asm: &mut Assembler, op: CBinOp) -> Result<(), String> {
         Mul => dynasm!(asm; imul eax, ecx),
         And => dynasm!(asm; and eax, ecx),
         Or  => dynasm!(asm; or eax, ecx),
-        Eq  => dynasm!(asm; cmp eax, ecx; sete al; movzx eax, al),
-        Ne  => dynasm!(asm; cmp eax, ecx; setne al; movzx eax, al),
-        Lt  => dynasm!(asm; cmp eax, ecx; setl al; movzx eax, al),
-        Le  => dynasm!(asm; cmp eax, ecx; setle al; movzx eax, al),
-        Gt  => dynasm!(asm; cmp eax, ecx; setg al; movzx eax, al),
-        Ge  => dynasm!(asm; cmp eax, ecx; setge al; movzx eax, al),
-        _   => return Err(format!("asm: unsupported binop: {op:?}")),
+        Eq     => dynasm!(asm; cmp eax, ecx; sete al; movzx eax, al),
+        Ne     => dynasm!(asm; cmp eax, ecx; setne al; movzx eax, al),
+        Lt     => dynasm!(asm; cmp eax, ecx; setl al; movzx eax, al),
+        Le     => dynasm!(asm; cmp eax, ecx; setle al; movzx eax, al),
+        Gt     => dynasm!(asm; cmp eax, ecx; setg al; movzx eax, al),
+        Ge     => dynasm!(asm; cmp eax, ecx; setge al; movzx eax, al),
+        BitXor => dynasm!(asm; xor eax, ecx),
+        Shl    => dynasm!(asm; shl eax, cl),
+        Shr    => dynasm!(asm; sar eax, cl),
+        _      => return Err(format!("asm: unsupported binop: {op:?}")),
     }
     Ok(())
 }
@@ -1267,10 +1275,10 @@ pub fn codegen_stratum_asm(
             }
         }
         // clause0 must have no bound cols (full scan)
-        if let Some(c0) = clauses.first() {
-            if !c0.bound_cols.is_empty() {
-                return Err(format!("asm: rule {ri} clause0 has bound_cols; unsupported"));
-            }
+        if let Some(c0) = clauses.first()
+            && !c0.bound_cols.is_empty()
+        {
+            return Err(format!("asm: rule {ri} clause0 has bound_cols; unsupported"));
         }
         // clauses 1..N must have at least one bound col for index probe
         for (ci, c) in clauses.iter().enumerate().skip(1) {
