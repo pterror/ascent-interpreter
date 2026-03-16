@@ -695,11 +695,14 @@ pub unsafe extern "C" fn jit_advance_native(ctx: *mut StratumStage4NativeCtx) ->
     let mut changed = false;
     for &rel_ptr in advance_slice {
         let rel = unsafe { &mut *rel_ptr };
-        if rel.advance_jit() {
+        // Skip JitHashIndex rebuild when safe: the asm native path reads JitColIndex directly
+        // via jit_native. When jit_used_in_cranelift_strata=false, no Cranelift stratum
+        // will probe jit_indices for this relation, so the rebuild can be elided.
+        if rel.advance_jit_skip_hash_indices() {
             changed = true;
         }
         // Re-initialize jit_native if it was cleared (e.g., by Engine::clone()).
-        // advance_jit() only refreshes an existing jit_native; it never builds from None.
+        // advance_jit_skip_hash_indices() only refreshes an existing jit_native; it never builds from None.
         // This is a cold path: runs at most once per engine clone, not every iteration.
         if rel.jit_native.is_none() {
             rel.jit_native = Some(rel.build_native_projection());

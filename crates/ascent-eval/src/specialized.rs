@@ -223,6 +223,12 @@ pub struct PackedStorage {
     /// `jit_is_edb` transitions from false to true.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) jit_index_is_edb_fmt: bool,
+    /// True when this relation's `jit_indices`/`jit_recent_indices` are accessed by at least
+    /// one Cranelift (non-asm-native) stratum.  Set permanently once a Cranelift stratum
+    /// registers the relation as a body-clause source.  When false, `update_jit_indices()`
+    /// may be skipped on the asm native path without affecting correctness.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) jit_used_in_cranelift_strata: bool,
     /// Native JIT storage projection: total, recent, and empty-new views.
     /// Rebuilt on every `advance_jit()` call.  `None` before the first advance.
     #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -259,6 +265,8 @@ impl PackedStorage {
             jit_is_sink: false,
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_index_is_edb_fmt: false,
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_used_in_cranelift_strata: false,
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_native: None,
             jit_dedup: crate::jit_index::JitDedupTable::new(arity),
@@ -564,8 +572,12 @@ impl PackedStorage {
     ///
     /// `recent_col_indices` is only used by the interpreter's `lookup_recent` path.
     /// Stage 4 JIT uses `jit_recent_indices` (rebuilt by `update_jit_indices`) instead.
+    ///
+    /// When `update_hash_indices` is false, the `update_jit_indices()` call is skipped.
+    /// Use this on the asm native path, which reads `JitColIndex` directly and never
+    /// touches `jit_indices` / `jit_recent_indices`.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) fn advance_jit(&mut self) -> bool {
+    pub(crate) fn advance_jit_inner(&mut self, update_hash_indices: bool) -> bool {
         // Flush any tuples the JIT wrote to jit_native.new into this relation's delta.
         // Takes only the `new` buffer from jit_native so we can update jit_native in-place
         // when nothing changed (avoids a full rebuild of total + recent).
@@ -605,7 +617,9 @@ impl PackedStorage {
         let had_delta = !self.delta.is_empty();
         self.recent = std::mem::take(&mut self.delta);
         // Skip recent_col_indices rebuild — JIT uses jit_recent_indices.
-        self.update_jit_indices();
+        if update_hash_indices {
+            self.update_jit_indices();
+        }
 
         // Rebuild jit_native only if it has already been initialized.
         // jit_native is None on the Cranelift path (build_stratum_stage4_native_runtime is
@@ -670,6 +684,25 @@ impl PackedStorage {
         }
 
         had_delta
+    }
+
+    /// Advance for the Cranelift JIT path (rebuilds `jit_indices` / `jit_recent_indices`).
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) fn advance_jit(&mut self) -> bool {
+        self.advance_jit_inner(true)
+    }
+
+    /// Advance for the asm native path: skips `JitHashIndex` rebuild when safe.
+    ///
+    /// The asm native path reads `JitColIndex` directly via `jit_native` and never
+    /// consults `jit_indices` / `jit_recent_indices` within its own stratum.  The skip
+    /// is only applied when `jit_used_in_cranelift_strata=false` — i.e., no Cranelift
+    /// stratum has registered this relation as a body-clause source.  When true, the
+    /// hash indices must be kept fresh for later Cranelift strata in the same engine run.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) fn advance_jit_skip_hash_indices(&mut self) -> bool {
+        let update = self.jit_used_in_cranelift_strata;
+        self.advance_jit_inner(update)
     }
 
     pub fn advance_peek(&mut self) -> bool {
@@ -1008,6 +1041,8 @@ impl Clone for PackedStorage {
             jit_is_sink: self.jit_is_sink,
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_index_is_edb_fmt: self.jit_index_is_edb_fmt,
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_used_in_cranelift_strata: self.jit_used_in_cranelift_strata,
             // Deep-clone jit_native so the cloned engine does not pay the full
             // build_native_projection rebuild cost on its first jit_advance_native call.
             #[cfg(all(feature = "jit", feature = "specialized"))]

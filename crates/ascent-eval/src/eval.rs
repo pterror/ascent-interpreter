@@ -622,6 +622,7 @@ impl Engine {
         let compiled: Vec<CRule> = strat.compiled.clone();
 
         self.var_count = self.var_interner.len();
+
         for (scc_idx, scc_indices) in sccs.iter().enumerate() {
             let rules: Vec<&CRule> = scc_indices.iter().map(|&i| &compiled[i]).collect();
             self.run_stratum(&rules, scc_idx, scc_indices);
@@ -1076,6 +1077,31 @@ impl Engine {
         let mut specs_flat: Vec<LookupSpec> = Vec::new();
         // Starting handle index for each rule (for setting lookup_handles ptr later).
         let mut rule_handle_offsets: Vec<usize> = Vec::new();
+
+        // When the Cranelift path will be used (native not available), mark all body-clause
+        // relations as needing hash indices.  This prevents `advance_jit_skip_hash_indices`
+        // from skipping `update_jit_indices()` on asm-native strata that run before this
+        // stratum, which would leave stale handles in this Cranelift context.
+        // When the Cranelift path will be used (native not available), mark all body-clause
+        // relations as needing hash indices, and immediately rebuild any stale indices.
+        // This handles two cases:
+        //   1. An earlier asm-native stratum skipped update_jit_indices(), leaving stale indices.
+        //      We rebuild them now so handles below read correct data.
+        //   2. Future asm-native strata must NOT skip for these relations, so we set the sticky
+        //      jit_used_in_cranelift_strata flag.
+        #[cfg(feature = "jit-asm")]
+        if !native_fn_available {
+            for rule in rules {
+                for item in &rule.body {
+                    if let CBodyItem::Clause(c) = item
+                        && let Some(Relation::Packed(ps)) = self.relations.get_mut(&c.relation) {
+                        ps.jit_used_in_cranelift_strata = true;
+                        // Rebuild indices if stale (asm-native strata may have skipped them).
+                        ps.update_jit_indices();
+                    }
+                }
+            }
+        }
 
         for rule in rules {
             // Clause rel pointers
