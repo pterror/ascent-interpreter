@@ -1231,11 +1231,17 @@ fn emit_clause_level(
         let stride = (arity * 4) as i32;
         let use_recent = p.use_recent[level];
         let is_rec = p.is_rec[level];
-        // Native path: JitColIndex always stores contiguous (start, count) ranges regardless
-        // of whether the relation is EDB or IDB.  The linked-list layout only exists in the
-        // old JitHashIndex used by the non-native (Cranelift callback) path.
-        // Old path: IDB uses linked-list traversal; EDB uses contiguous.
-        let is_contiguous = p.use_jit_native || !is_rec;
+        // Native path only supports EDB (contiguous JitColIndex) inner clauses.
+        // IDB inner clauses require full JitColIndex rebuild per iteration (O(n log n)),
+        // which is slower than the Cranelift callback path's O(1) linked-list inserts.
+        // Reject so the stratum falls back to Cranelift for these rules.
+        if p.use_jit_native && is_rec {
+            return Err(format!(
+                "asm native: clause {level} is IDB \
+                 (per-iteration JitColIndex rebuild is slower than Cranelift linked-list)"
+            ));
+        }
+        let is_contiguous = !is_rec;
 
         // Save the ENCLOSING level's r15 and rbx before we clobber them with
         // the new probe.  The enclosing level is `level-1`.
