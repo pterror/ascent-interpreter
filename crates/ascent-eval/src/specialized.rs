@@ -315,6 +315,37 @@ impl PackedStorage {
             // tuple_set and a data buffer, with len=0 and cap=1.
             new: JitRelData::build_from_packed(&[], arity, false),
             total_built_count: self.count,
+            build_indices: true,
+        }
+    }
+
+    /// Like `build_native_projection`, but skips `JitColIndex` building.
+    ///
+    /// Used for Cranelift strata that only read `data` and `len` directly from
+    /// `JitRelData` and never probe `col_indices`.
+    pub(crate) fn build_native_projection_lean(
+        &self,
+    ) -> crate::jit::storage::JitNativeRelData {
+        use crate::jit::storage::{JitNativeRelData, JitRelData};
+
+        let arity = self.arity;
+        let total_slice = &self.packed_data[0..self.count * arity.max(1)];
+
+        let mut recent_buf: Vec<u32> = Vec::with_capacity(self.recent.len() * arity.max(1));
+        for &idx in &self.recent {
+            let start = idx * arity;
+            recent_buf.extend_from_slice(&self.packed_data[start..start + arity]);
+        }
+
+        JitNativeRelData {
+            // build_indices=false: Cranelift path never probes JitColIndex.
+            total: JitRelData::build_from_packed(total_slice, arity, false),
+            // `recent` is only iterated, never probed — skip tuple_set too.
+            recent: JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, false),
+            // The Cranelift path does not write to jit_native.new; keep an empty placeholder.
+            new: JitRelData::build_from_packed(&[], arity, false),
+            total_built_count: self.count,
+            build_indices: false,
         }
     }
 
@@ -626,10 +657,15 @@ impl PackedStorage {
         // never called without jit-asm), so this guard prevents paying the build cost there.
         // The asm native runtime builder explicitly initializes jit_native before first run;
         // after that, this block keeps it fresh on every fixpoint iteration.
+        //
+        // Exception: the Cranelift direct-load path (Step 6) also initializes jit_native,
+        // but with build_indices=false (lean projection). The build_indices flag is respected
+        // below so lean projections never build JitColIndex.
         if self.jit_native.is_some() {
             use crate::jit::storage::JitRelData;
             let arity = self.arity;
-            let build_indices = !self.jit_is_sink;
+            // Use the build_indices flag stored in jit_native to preserve lean vs full mode.
+            let build_indices = self.jit_native.as_ref().unwrap().build_indices;
 
             if self.jit_is_edb {
                 // EDB: total never changes. Always reset recent to empty.

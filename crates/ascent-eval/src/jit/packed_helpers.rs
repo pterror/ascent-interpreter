@@ -323,6 +323,8 @@ pub type StratumMetaFn = unsafe extern "C" fn(*mut StratumMetaCtx);
 ///   head_rels          (ptr)  @ offset 16
 ///   lookup_handles     (ptr)  @ offset 24  ← flat array of JitLookupHandle
 ///   head_dedup_handles (ptr)  @ offset 32  ← one *mut JitDedupHandle per head
+///   jit_rels           (ptr)  @ offset 40  ← flat array of *const JitRelData,
+///                                             indexed by clause_offset * 2 + use_recent
 #[repr(C)]
 pub struct PackedJitContextV3 {
     /// Array of PackedStorage pointers, one per clause relation.
@@ -337,6 +339,11 @@ pub struct PackedJitContextV3 {
     /// Points into the `jit_dedup.handle` field of each head's PackedStorage.
     /// Used by the JIT to probe the dedup snapshot before calling packed_try_insert.
     pub head_dedup_handles: *const *mut JitDedupHandle,
+    /// Flat array of `*const JitRelData`, indexed by `clause_offset * 2 + use_recent`.
+    /// Points into `jit_native.total` (use_recent=0) or `jit_native.recent` (use_recent=1)
+    /// for each clause's relation.  Refreshed by `jit_stratum_advance_s4` after each advance.
+    /// Null when Stage 4 is used without the Cranelift JitRelData-direct path.
+    pub jit_rels: *const *const storage::JitRelData,
 }
 
 pub type PackedJitFnV3 = unsafe extern "C" fn(*mut PackedJitContextV3);
@@ -348,6 +355,7 @@ const _: () = {
     assert!(std::mem::offset_of!(PackedJitContextV3, head_rels) == 16);
     assert!(std::mem::offset_of!(PackedJitContextV3, lookup_handles) == 24);
     assert!(std::mem::offset_of!(PackedJitContextV3, head_dedup_handles) == 32);
+    assert!(std::mem::offset_of!(PackedJitContextV3, jit_rels) == 40);
 };
 
 /// Context for Stage 3 stratum meta-function (direct-insert variant).
@@ -412,6 +420,30 @@ const _: () = {
     assert!(std::mem::offset_of!(LookupSpec, use_recent) == 12);
 };
 
+/// Spec for refreshing one `*const JitRelData` slot in a `PackedJitContextV3.jit_rels` buffer.
+///
+/// Parallel to `handles_buf`/`lookup_specs`: indexed by `clause_offset * 2 + use_recent`.
+///
+/// repr(C) layout (16 bytes on 64-bit):
+///   offset  0: rel        *mut PackedStorage  (8 bytes)
+///   offset  8: use_recent u32                 (4 bytes; non-zero = recent)
+///   offset 12: _pad       u32
+#[repr(C)]
+pub struct JitRelSpec {
+    pub rel: *mut PackedStorage,
+    pub use_recent: u32,
+    pub _pad: u32,
+}
+
+unsafe impl Send for JitRelSpec {}
+unsafe impl Sync for JitRelSpec {}
+
+const _: () = {
+    assert!(std::mem::size_of::<JitRelSpec>() == 16);
+    assert!(std::mem::offset_of!(JitRelSpec, rel) == 0);
+    assert!(std::mem::offset_of!(JitRelSpec, use_recent) == 8);
+};
+
 /// Context for Stage 4 stratum function: rule bodies inlined, no fn-ptr arrays.
 ///
 /// Layout (repr C, 64-bit):
@@ -432,6 +464,14 @@ const _: () = {
 ///             parallel to head_write_bufs; maps buf index → target PackedStorage.
 ///   offset 80: total_heads     u32                            (4 bytes)
 ///   offset 84: _pad4           u32                            (4 bytes)
+///   offset 88: jit_rel_specs   *const JitRelSpec              (8 bytes)
+///             flat array parallel to handles_buf; tells jit_stratum_advance_s4
+///             which PackedStorage and use_recent maps to each jit_rels slot.
+///   offset 96: jit_rel_ptrs    *mut *const JitRelData         (8 bytes)
+///             flat mutable array of *const JitRelData, refreshed each iteration.
+///             PackedJitContextV3.jit_rels for rule_i points into this flat buffer.
+///   offset 104: total_jit_rels u32                            (4 bytes)
+///   offset 108: _pad5          u32                            (4 bytes)
 #[repr(C)]
 pub struct StratumStage4Ctx {
     /// Pointer to array of *mut PackedJitContextV3, one per rule.
@@ -461,6 +501,16 @@ pub struct StratumStage4Ctx {
     /// Total number of (rule, head) pairs (= len of head_write_bufs / head_rel_ptrs).
     pub total_heads: u32,
     pub _pad4: u32,
+    /// Flat array of `JitRelSpec`, parallel to the flat `jit_rel_ptrs` buffer.
+    /// Tells `jit_stratum_advance_s4` which PackedStorage + use_recent maps to each slot.
+    pub jit_rel_specs: *const JitRelSpec,
+    /// Flat mutable array of `*const JitRelData`, one entry per `clause_offset * 2 + use_recent`
+    /// per rule (concatenated across all rules).  Each `PackedJitContextV3.jit_rels` points into
+    /// the rule's slice of this buffer.  Refreshed by `jit_stratum_advance_s4` after each advance.
+    pub jit_rel_ptrs: *mut *const storage::JitRelData,
+    /// Total number of entries in `jit_rel_ptrs` / `jit_rel_specs`.
+    pub total_jit_rels: u32,
+    pub _pad5: u32,
 }
 
 unsafe impl Send for StratumStage4Ctx {}
@@ -481,6 +531,9 @@ const _: () = {
     assert!(std::mem::offset_of!(StratumStage4Ctx, head_write_bufs) == 64);
     assert!(std::mem::offset_of!(StratumStage4Ctx, head_rel_ptrs) == 72);
     assert!(std::mem::offset_of!(StratumStage4Ctx, total_heads) == 80);
+    assert!(std::mem::offset_of!(StratumStage4Ctx, jit_rel_specs) == 88);
+    assert!(std::mem::offset_of!(StratumStage4Ctx, jit_rel_ptrs) == 96);
+    assert!(std::mem::offset_of!(StratumStage4Ctx, total_jit_rels) == 104);
 };
 
 /// Insert a packed u32 tuple directly into a relation.
@@ -786,6 +839,22 @@ pub unsafe extern "C" fn jit_stratum_advance_s4(ctx: *mut StratumStage4Ctx) -> u
         handle.values = idx.values_ptr;
         handle.mask = idx.mask;
         handle._pad = 0;
+    }
+    // Refresh jit_rel_ptrs — advance_jit() rebuilt jit_native; copy fresh JitRelData pointers.
+    // These are used by the Cranelift direct-load path to read count and data pointer inline.
+    if !ctx.jit_rel_specs.is_null() && !ctx.jit_rel_ptrs.is_null() {
+        for i in 0..ctx.total_jit_rels as usize {
+            let spec = unsafe { &*ctx.jit_rel_specs.add(i) };
+            let ps = unsafe { &*spec.rel };
+            if let Some(native) = ps.jit_native.as_ref() {
+                let jrel: *const storage::JitRelData = if spec.use_recent != 0 {
+                    native.recent.as_ref() as *const storage::JitRelData
+                } else {
+                    native.total.as_ref() as *const storage::JitRelData
+                };
+                unsafe { *ctx.jit_rel_ptrs.add(i) = jrel };
+            }
+        }
     }
     changed
 }

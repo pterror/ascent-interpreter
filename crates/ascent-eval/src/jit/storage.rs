@@ -769,6 +769,11 @@ pub struct JitNativeRelData {
     /// Number of tuples in `total` at the time it was last built.
     /// Used by `advance_jit` to extend incrementally instead of full rebuild.
     pub total_built_count: usize,
+    /// Whether to build `JitColIndex` arrays during advance.
+    ///
+    /// `true` for the asm native path (which reads `col_indices` directly).
+    /// `false` for lean Cranelift projections (which only read `data` and `len`).
+    pub build_indices: bool,
 }
 
 // Safety: JitRelData contains raw pointers and is !Send by default, but all
@@ -829,6 +834,7 @@ impl JitNativeRelData {
             recent: recent_clone,
             new: new_clone,
             total_built_count: self.total_built_count,
+            build_indices: self.build_indices,
         }
     }
 }

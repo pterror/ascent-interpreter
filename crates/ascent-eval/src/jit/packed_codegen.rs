@@ -906,6 +906,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
         &conditions,
         &precomputed_packed_bufs,
         None, // Stage 3 single-rule path: no tuple_sets_buf available
+        None, // Stage 3 single-rule path: no jit_rels available
     );
 
     builder.ins().return_(&[]);
@@ -918,7 +919,7 @@ pub(crate) fn codegen_packed_rule_body_v3(
     Ok(())
 }
 
-/// Recursively generate Stage 3 clause-matching code.
+/// Recursively generate Stage 3/4 clause-matching code.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gen_clauses_v3(
     builder: &mut FunctionBuilder,
@@ -937,6 +938,10 @@ pub(crate) fn gen_clauses_v3(
     conditions: &[&CExpr],
     precomputed_packed_bufs: &[Option<CValue>],
     tuple_sets_ptr: Option<CValue>,
+    // Pointer to the flat `*const JitRelData` array for this rule, indexed by
+    // `clause_offset * 2 + use_recent`.  `None` on the Stage 3 path where
+    // `jit_native` is not available.
+    jit_rels: Option<CValue>,
 ) {
     if clause_offset >= clauses.len() {
         if !conditions.is_empty() {
@@ -971,7 +976,7 @@ pub(crate) fn gen_clauses_v3(
             builder, clause, clause_offset, use_recent, ts_ptr,
             clauses, recent_clause_idx, rels, vars, head_rels,
             lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var,
-            conditions, precomputed_packed_bufs,
+            conditions, precomputed_packed_bufs, jit_rels,
         );
         return;
     }
@@ -995,14 +1000,14 @@ pub(crate) fn gen_clauses_v3(
             builder, clause, rel_ptr, arity, use_recent, use_recent_val,
             clauses, clause_offset, recent_clause_idx, rels, vars, head_rels,
             lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
-            is_recursive, precomputed_packed_bufs, tuple_sets_ptr,
+            is_recursive, precomputed_packed_bufs, tuple_sets_ptr, jit_rels,
         );
     } else {
         gen_index_scan_v3(
             builder, clause, rel_ptr, arity, use_recent,
             clauses, clause_offset, recent_clause_idx, rels, vars, head_rels,
             lookup_handles, head_dedup_handles, func_refs, heads, ptr_type, next_var, conditions,
-            is_recursive, precomputed_packed_bufs, tuple_sets_ptr,
+            is_recursive, precomputed_packed_bufs, tuple_sets_ptr, jit_rels,
         );
     }
 }
@@ -1031,20 +1036,54 @@ fn gen_full_scan_v3(
     _is_recursive: bool,
     precomputed_packed_bufs: &[Option<CValue>],
     tuple_sets_ptr: Option<CValue>,
+    jit_rels: Option<CValue>,
 ) {
-    let call = builder.ins().call(func_refs.packed_count, &[rel_ptr, use_recent_val]);
-    let count = builder.inst_results(call)[0];
+    // ── count and data_ptr: direct JitRelData loads (Stage 4) or callbacks (Stage 3) ──
+    //
+    // Stage 4 provides `jit_rels`, a flat array of *const JitRelData indexed by
+    // clause_offset * 2 + use_recent.  We load count @ offset 8 and data @ offset 0
+    // directly, eliminating the packed_count and packed_data_ptr callbacks.
+    //
+    // For the recent path in Stage 4: jit_rels[clause_offset*2+1] points to
+    // jit_native.recent, which is a contiguous buffer of recent tuples.
+    // We iterate directly (index i = tuple index in recent), eliminating the
+    // packed_recent_ptr + recent_ptr[i] indirection.
+    let (count, cached_data_ptr_for_direct) = if let Some(jrel_arr) = jit_rels {
+        let use_recent_bit = use_recent as usize;
+        let jrel_byte_off = ((clause_offset * 2 + use_recent_bit) as i64) * 8;
+        let jrel_arr_addr = if jrel_byte_off == 0 {
+            jrel_arr
+        } else {
+            let off = builder.ins().iconst(ptr_type, jrel_byte_off);
+            builder.ins().iadd(jrel_arr, off)
+        };
+        let jrel = builder.ins().load(ptr_type, MemFlags::trusted(), jrel_arr_addr, 0);
+        // count = jrel.len @ offset 8 (u64, but we load as ptr_type = i64 on 64-bit)
+        let cnt = builder.ins().load(ptr_type, MemFlags::trusted(), jrel, 8i32);
+        // data = jrel.data @ offset 0
+        let data = builder.ins().load(ptr_type, MemFlags::trusted(), jrel, 0i32);
+        (cnt, Some(data))
+    } else {
+        let call = builder.ins().call(func_refs.packed_count, &[rel_ptr, use_recent_val]);
+        (builder.inst_results(call)[0], None)
+    };
 
-    // For non-recursive rules the packed_data buffer cannot be reallocated during
-    // the scan, so we use the pointer hoisted before all loop nesting.
-    // For recursive rules (head writes to this clause's relation) we must re-fetch
-    // on every iteration because packed_try_insert may grow the Vec.
-    let cached_packed_buf = precomputed_packed_bufs.get(clause_offset).copied().flatten();
+    // For the Stage 3 path (no jit_rels): use precomputed_packed_bufs or callback.
+    // For Stage 4 recent path: cached_data_ptr_for_direct already points to contiguous
+    // recent data — we iterate it directly with index i (no indirection needed).
+    // For Stage 4 non-recent path: same direct data pointer.
+    let cached_packed_buf = if cached_data_ptr_for_direct.is_some() {
+        cached_data_ptr_for_direct
+    } else {
+        // Stage 3: use precomputed pointer (hoisted before all loop nesting).
+        precomputed_packed_bufs.get(clause_offset).copied().flatten()
+    };
 
-    // For recent scans, fetch the recent-index array pointer once before the loop.
+    // For Stage 3 recent scans, fetch the recent-index array pointer once before the loop.
     // recent[i] is a usize (pointer-sized) stored at recent_ptr + i * ptr_size.
-    // This replaces the per-iteration packed_recent_idx call with an inline load.
-    let cached_recent_ptr = if use_recent {
+    // On Stage 4 this is not needed: jit_native.recent.data is already contiguous and
+    // cached_data_ptr_for_direct gives us the buffer directly.
+    let cached_recent_ptr = if use_recent && cached_data_ptr_for_direct.is_none() {
         let call = builder.ins().call(func_refs.packed_recent_ptr, &[rel_ptr]);
         Some(builder.inst_results(call)[0])
     } else {
@@ -1070,12 +1109,14 @@ fn gen_full_scan_v3(
     builder.switch_to_block(loop_body);
     let i = builder.use_var(var_i);
 
-    let tuple_idx = if use_recent {
-        // recent_ptr[i] is a usize (pointer-sized); load it directly.
+    let tuple_idx = if use_recent && cached_data_ptr_for_direct.is_none() {
+        // Stage 3 recent path: recent_ptr[i] is a usize (pointer-sized); load it directly.
         let byte_off = builder.ins().imul_imm(i, std::mem::size_of::<usize>() as i64);
         let elem_addr = builder.ins().iadd(cached_recent_ptr.unwrap(), byte_off);
         builder.ins().load(ptr_type, MemFlags::trusted(), elem_addr, 0)
     } else {
+        // Stage 4 path (jit_rels available) or non-recent: i is the direct tuple index
+        // into the contiguous data buffer (recent or total).
         i
     };
 
@@ -1134,7 +1175,7 @@ fn gen_full_scan_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
         rels, vars, head_rels, lookup_handles, head_dedup_handles,
         func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
-        tuple_sets_ptr,
+        tuple_sets_ptr, jit_rels,
     );
 
     builder.ins().jump(continue_block, &[]);
@@ -1188,6 +1229,7 @@ fn gen_index_scan_v3(
     is_recursive: bool,
     precomputed_packed_bufs: &[Option<CValue>],
     tuple_sets_ptr: Option<CValue>,
+    jit_rels: Option<CValue>,
 ) {
     let primary_col = clause.bound_cols[0];
     let key_i32 = load_bound_val_vars(builder, clause, primary_col, vars);
@@ -1402,8 +1444,21 @@ fn gen_index_scan_v3(
         } else {
             // Tuple-index linked-list (arity > 2): v0 is tuple_idx.
             let tuple_idx = builder.ins().uextend(ptr_type, v0);
-            // Re-fetch packed_data_ptr: recursive head insert may have reallocated.
-            let packed_buf = {
+            // Get data pointer. Stage 4: load from jit_rels[clause_offset*2+use_recent].data (@ 0).
+            // Stage 3: call packed_data_ptr callback. Recursive head insert may have reallocated
+            // on Stage 3; on Stage 4 the JitRelData.data pointer is refreshed each iteration.
+            let packed_buf = if let Some(jrel_arr) = jit_rels {
+                let use_recent_bit = use_recent as usize;
+                let jrel_byte_off = ((clause_offset * 2 + use_recent_bit) as i64) * 8;
+                let jrel_arr_addr = if jrel_byte_off == 0 {
+                    jrel_arr
+                } else {
+                    let off = builder.ins().iconst(ptr_type, jrel_byte_off);
+                    builder.ins().iadd(jrel_arr, off)
+                };
+                let jrel = builder.ins().load(ptr_type, MemFlags::trusted(), jrel_arr_addr, 0);
+                builder.ins().load(ptr_type, MemFlags::trusted(), jrel, 0i32)
+            } else {
                 let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_ptr]);
                 builder.inst_results(call)[0]
             };
@@ -1462,7 +1517,7 @@ fn gen_index_scan_v3(
             builder, clauses, clause_offset + 1, recent_clause_idx,
             rels, vars, head_rels, lookup_handles, head_dedup_handles,
             func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
-            tuple_sets_ptr,
+            tuple_sets_ptr, jit_rels,
         );
 
         builder.ins().jump(continue_block, &[]);
@@ -1618,7 +1673,7 @@ fn gen_index_scan_v3(
             builder, clauses, clause_offset + 1, recent_clause_idx,
             rels, vars, head_rels, lookup_handles, head_dedup_handles,
             func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
-            tuple_sets_ptr,
+            tuple_sets_ptr, jit_rels,
         );
 
         builder.ins().jump(continue_block, &[]);
@@ -1685,6 +1740,7 @@ fn gen_tuple_set_probe_v3(
     next_var: &mut usize,
     conditions: &[&CExpr],
     precomputed_packed_bufs: &[Option<CValue>],
+    jit_rels: Option<CValue>,
 ) {
     let arity = clause.args.len();
 
@@ -1781,7 +1837,7 @@ fn gen_tuple_set_probe_v3(
         builder, clauses, clause_offset + 1, recent_clause_idx,
         rels, vars, head_rels, lookup_handles, head_dedup_handles,
         func_refs, heads, ptr_type, next_var, conditions, precomputed_packed_bufs,
-        Some(tuple_sets_ptr),
+        Some(tuple_sets_ptr), jit_rels,
     );
     builder.ins().jump(not_found, &[]);
 

@@ -338,6 +338,10 @@ struct StratumStage4Runtime {
     _head_write_bufs: Box<[*mut crate::jit::packed_helpers::JitHeadBuf]>,
     /// Flat pointer array: head_rel_ptrs in ctx.
     _head_rel_ptrs: Box<[*mut crate::specialized::PackedStorage]>,
+    /// Flat spec array parallel to jit_rel_ptrs (jit_rel_specs in ctx).
+    _jit_rel_specs: Box<[crate::jit::packed_helpers::JitRelSpec]>,
+    /// Flat mutable pointer array (jit_rel_ptrs in ctx); refreshed by jit_stratum_advance_s4.
+    _jit_rel_ptrs: Box<[*const crate::jit::storage::JitRelData]>,
     /// Optional native fast-path runtime (Step 3). `None` if any relation lacks `jit_native`.
     /// TODO: compile native JIT function (Step 4)
     stage4_native_runtime: Option<crate::jit::packed_helpers::StratumStage4NativeRuntime>,
@@ -1060,7 +1064,8 @@ impl Engine {
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule], native_fn_available: bool) -> Option<StratumStage4Runtime> {
-        use crate::jit::packed_helpers::{JitHeadBuf, LookupSpec, PackedJitContextV3, StratumStage4Ctx};
+        use crate::jit::packed_helpers::{JitHeadBuf, JitRelSpec, LookupSpec, PackedJitContextV3, StratumStage4Ctx};
+        use crate::jit::storage::JitRelData;
         use crate::jit_index::JitLookupHandle;
         use crate::relation::Relation;
         use crate::specialized::PackedStorage;
@@ -1077,6 +1082,10 @@ impl Engine {
         let mut specs_flat: Vec<LookupSpec> = Vec::new();
         // Starting handle index for each rule (for setting lookup_handles ptr later).
         let mut rule_handle_offsets: Vec<usize> = Vec::new();
+
+        // Flat JitRelSpec array parallel to handles_flat (for jit_rel_ptrs refresh).
+        // Starting offset per rule (same as rule_handle_offsets since parallel layout).
+        let mut jit_rel_specs_flat: Vec<JitRelSpec> = Vec::new();
 
         // When the Cranelift path will be used (native not available), mark all body-clause
         // relations as needing hash indices.  This prevents `advance_jit_skip_hash_indices`
@@ -1098,6 +1107,21 @@ impl Engine {
                         ps.jit_used_in_cranelift_strata = true;
                         // Rebuild indices if stale (asm-native strata may have skipped them).
                         ps.update_jit_indices();
+                    }
+                }
+            }
+        }
+
+        // For the Cranelift direct-load path (Step 6): initialize lean jit_native projections
+        // on all body-clause relations so jit_rel_ptrs can point into jit_native.total / .recent.
+        // Only when native_fn_available=false (i.e. the asm path won't manage jit_native for us).
+        if !native_fn_available {
+            for rule in rules {
+                for item in &rule.body {
+                    if let CBodyItem::Clause(c) = item
+                        && let Some(Relation::Packed(ps)) = self.relations.get_mut(&c.relation)
+                        && ps.jit_native.is_none() {
+                        ps.jit_native = Some(ps.build_native_projection_lean());
                     }
                 }
             }
@@ -1188,6 +1212,13 @@ impl Engine {
                             use_recent: use_recent_flag,
                         });
                     }
+                    // jit_rel_specs: one entry per (clause_offset * 2 + use_recent), parallel to handles.
+                    jit_rel_specs_flat.push(JitRelSpec {
+                        rel: rel_ptr as *mut PackedStorage,
+                        use_recent: use_recent_flag,
+                        _pad: 0,
+                    });
+                    let _ = clause_offset; // already used above
                 }
             }
 
@@ -1202,7 +1233,7 @@ impl Engine {
                 .collect();
             let head_dedup_handles_ptr = dedup_handles.as_ptr();
 
-            // lookup_handles pointer will be fixed up after handles_flat is boxed.
+            // lookup_handles and jit_rels pointers will be fixed up after flat buffers are boxed.
             let ctx = Box::new(PackedJitContextV3 {
                 rels: clause_rels_box.as_ptr(),
                 rels_len: clause_rels_box.len() as u32,
@@ -1210,6 +1241,7 @@ impl Engine {
                 head_rels: head_rels_ptr,
                 lookup_handles: std::ptr::null(), // fixed up below
                 head_dedup_handles: head_dedup_handles_ptr,
+                jit_rels: std::ptr::null(), // fixed up below
             });
 
             rule_ctx_ptrs_vec
@@ -1277,6 +1309,37 @@ impl Engine {
             ctx.lookup_handles = unsafe { handles_box.as_mut_ptr().add(offset) };
         }
 
+        // Build jit_rel_ptrs flat buffer and jit_rel_specs box.
+        // jit_rel_specs is parallel to handles_flat (same indexing: clause_offset * 2 + use_recent).
+        // jit_rel_ptrs is a mutable buffer initialized from the current jit_native state.
+        let total_jit_rels = jit_rel_specs_flat.len() as u32;
+        let jit_rel_specs_box: Box<[JitRelSpec]> = jit_rel_specs_flat.into_boxed_slice();
+        // Initialize jit_rel_ptrs: for each spec, resolve the current jit_native pointer.
+        let mut jit_rel_ptrs_init: Vec<*const JitRelData> =
+            Vec::with_capacity(total_jit_rels as usize);
+        for spec in jit_rel_specs_box.iter() {
+            let ps = unsafe { &*spec.rel };
+            let jrel: *const JitRelData = if let Some(native) = ps.jit_native.as_ref() {
+                if spec.use_recent != 0 {
+                    native.recent.as_ref() as *const JitRelData
+                } else {
+                    native.total.as_ref() as *const JitRelData
+                }
+            } else {
+                std::ptr::null()
+            };
+            jit_rel_ptrs_init.push(jrel);
+        }
+        let mut jit_rel_ptrs_box: Box<[*const JitRelData]> =
+            jit_rel_ptrs_init.into_boxed_slice();
+
+        // Fix up per-rule ctx jit_rels pointers into jit_rel_ptrs_box.
+        // Each rule's slice starts at the same offset as its handles (rule_handle_offsets).
+        for (rule_i, ctx) in per_rule_ctxs.iter_mut().enumerate() {
+            let offset = rule_handle_offsets[rule_i];
+            ctx.jit_rels = unsafe { jit_rel_ptrs_box.as_mut_ptr().add(offset) };
+        }
+
         // Build head write buffers: one JitHeadBuf per (rule_i, head_i) pair.
         // Also build a parallel head_rel_ptrs array mapping each buf → *mut PackedStorage.
         const HEAD_BUF_INIT_CAP: u32 = 256;
@@ -1340,6 +1403,10 @@ impl Engine {
             head_rel_ptrs: head_rel_ptrs_box.as_ptr(),
             total_heads,
             _pad4: 0,
+            jit_rel_specs: jit_rel_specs_box.as_ptr(),
+            jit_rel_ptrs: jit_rel_ptrs_box.as_mut_ptr(),
+            total_jit_rels,
+            _pad5: 0,
         });
 
         // Build the native runtime only when the asm native fn actually compiled.
@@ -1371,6 +1438,8 @@ impl Engine {
             _head_buf_data: head_buf_data,
             _head_write_bufs: head_write_bufs_box,
             _head_rel_ptrs: head_rel_ptrs_box,
+            _jit_rel_specs: jit_rel_specs_box,
+            _jit_rel_ptrs: jit_rel_ptrs_box,
             stage4_native_runtime: native_runtime,
         })
     }
@@ -1681,6 +1750,7 @@ impl Engine {
                 head_rels: head_rels_ptr,
                 lookup_handles: std::ptr::null(),
                 head_dedup_handles: head_dedup_handles_ptr,
+                jit_rels: std::ptr::null(),
             });
 
             // Build recent variants for this rule

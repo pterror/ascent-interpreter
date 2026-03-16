@@ -548,11 +548,12 @@ fn emit_rule_bodies(
         let ctx_i = rule_ctx_vals[rule_i];
 
         // Load PackedJitContextV3 fields: rels @ 0, head_rels @ 16,
-        // lookup_handles @ 24, head_dedup_handles @ 32 (bindings removed — in Variables).
+        // lookup_handles @ 24, head_dedup_handles @ 32, jit_rels @ 40.
         let rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 0i32);
         let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
         let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
         let head_dedup_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
+        let jit_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 40i32);
 
         // Compute per-rule pointer into the flat tuple_sets_buf array.
         // Each entry is 8 bytes (pointer). Offset = rule_handle_start * 8.
@@ -571,17 +572,29 @@ fn emit_rule_bodies(
 
         let cond_refs: Vec<&CExpr> = conditions.iter().collect();
 
+        // Precomputed packed data pointers for non-recursive clauses.
+        // Stage 4: load data ptr from jit_rels[clause_offset * 2 + 0] (total, offset 0).
+        // Stage 3 path (no jit_rels): call packed_data_ptr callback.
+        let jit_rels_val = jit_rels_i;
         let precomputed_packed_bufs: Vec<Option<cranelift_codegen::ir::Value>> = indexed_clauses
             .iter()
             .enumerate()
             .map(|(clause_offset, (_, clause))| {
                 let is_recursive = heads.iter().any(|h| h.relation == clause.relation);
                 if !is_recursive {
-                    let rel_off = builder.ins().iconst(ptr_t, (clause_offset as i64) * 8);
-                    let rel_addr = builder.ins().iadd(rels_i, rel_off);
-                    let rel_p = builder.ins().load(ptr_t, MemFlags::trusted(), rel_addr, 0);
-                    let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_p]);
-                    Some(builder.inst_results(call)[0])
+                    // Stage 4: load data from jit_rels[clause_offset * 2 + 0].data @ 0.
+                    // use_recent=0 (total) for the precomputed pointer used in the full-scan
+                    // non-recursive hoisted path. The recent path is handled inline in gen_full_scan_v3.
+                    let jrel_byte_off = ((clause_offset * 2) as i64) * 8;
+                    let jrel_arr_addr = if jrel_byte_off == 0 {
+                        jit_rels_val
+                    } else {
+                        let off = builder.ins().iconst(ptr_t, jrel_byte_off);
+                        builder.ins().iadd(jit_rels_val, off)
+                    };
+                    let jrel = builder.ins().load(ptr_t, MemFlags::trusted(), jrel_arr_addr, 0);
+                    let data = builder.ins().load(ptr_t, MemFlags::trusted(), jrel, 0i32);
+                    Some(data)
                 } else {
                     None
                 }
@@ -605,6 +618,7 @@ fn emit_rule_bodies(
             &cond_refs,
             &precomputed_packed_bufs,
             Some(tuple_sets_ptr_i),
+            Some(jit_rels_i),
         );
 
         rule_handle_start += clauses.len() * 2;
@@ -653,10 +667,13 @@ fn emit_recent_rule_bodies(
         let (clauses, heads, conditions) = &rules[rule_i];
         let ctx_i = rule_ctx_vals[rule_i];
 
+        // Load PackedJitContextV3 fields: rels @ 0, head_rels @ 16,
+        // lookup_handles @ 24, head_dedup_handles @ 32, jit_rels @ 40.
         let rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 0i32);
         let head_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 16i32);
         let lookup_handles_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 24i32);
         let head_dedup_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 32i32);
+        let jit_rels_i = builder.ins().load(ptr_t, MemFlags::trusted(), ctx_i, 40i32);
 
         // Compute per-rule pointer into tuple_sets_buf.
         let ts_byte_off = rule_handle_starts[rule_i] * 8;
@@ -672,17 +689,25 @@ fn emit_recent_rule_bodies(
 
         let cond_refs: Vec<&CExpr> = conditions.iter().collect();
 
+        // Precomputed data pointers for non-recursive clauses.
+        // Stage 4: load data from jit_rels[clause_offset * 2 + 0] (total).
+        let jit_rels_val = jit_rels_i;
         let precomputed_packed_bufs: Vec<Option<cranelift_codegen::ir::Value>> = indexed_clauses
             .iter()
             .enumerate()
             .map(|(clause_offset, (_, clause))| {
                 let is_recursive = heads.iter().any(|h| h.relation == clause.relation);
                 if !is_recursive {
-                    let rel_off = builder.ins().iconst(ptr_t, (clause_offset as i64) * 8);
-                    let rel_addr = builder.ins().iadd(rels_i, rel_off);
-                    let rel_p = builder.ins().load(ptr_t, MemFlags::trusted(), rel_addr, 0);
-                    let call = builder.ins().call(func_refs.packed_data_ptr, &[rel_p]);
-                    Some(builder.inst_results(call)[0])
+                    let jrel_byte_off = ((clause_offset * 2) as i64) * 8;
+                    let jrel_arr_addr = if jrel_byte_off == 0 {
+                        jit_rels_val
+                    } else {
+                        let off = builder.ins().iconst(ptr_t, jrel_byte_off);
+                        builder.ins().iadd(jit_rels_val, off)
+                    };
+                    let jrel = builder.ins().load(ptr_t, MemFlags::trusted(), jrel_arr_addr, 0);
+                    let data = builder.ins().load(ptr_t, MemFlags::trusted(), jrel, 0i32);
+                    Some(data)
                 } else {
                     None
                 }
@@ -708,6 +733,7 @@ fn emit_recent_rule_bodies(
             &cond_refs,
             &precomputed_packed_bufs,
             Some(tuple_sets_ptr_i),
+            Some(jit_rels_i),
         );
 
         if emit_i + 1 < recent_emissions.len() {
