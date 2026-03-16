@@ -271,7 +271,11 @@ Sequenced steps:
 6. [ ] **Cranelift parity** (~150 lines): mirror steps 4–5 in `packed_codegen.rs`.
 7. [ ] **Dead code removal** (~50 lines): delete `JitHeadBuf`, `jit_flush_head_bufs`, `tuple_sets_buf`, `head_write_bufs`, `head_rel_ptrs` from `StratumStage4Ctx` once all tests pass.
 
-Total: ~880 lines across 6 files. Steps 1–5 done + regression fixed; steps 6–7 remaining. **Blocker before step 6:** asm path must be faster than Cranelift first — otherwise mirroring to Cranelift regresses both. Make `build_native_projection` incremental for IDB relations (append-only JitColIndex updates) to eliminate the per-iteration O(n²) rebuild cost.
+Total: ~880 lines across 6 files. Steps 1–5 done + regression fixed; steps 6–7 remaining. **Blocker before step 6:** asm path must be faster than Cranelift first — otherwise mirroring to Cranelift regresses both.
+
+**Incremental tuple_set in `extend_and_rebuild_indices` (2026-03-16):** When existing `total.tuple_set` capacity fits `new_len` at <70% load, skip full rebuild — insert only the `n_new` new tuples. When capacity is insufficient, reallocate + reinsert all. Also added `build_from_packed_no_tupleset` (skip tuple_set build for `recent` buffers that are only iterated, never probed) and `JitNativeRelData::deep_clone` (preserve prebuilt native projection across `PackedStorage::Clone`). **Results (2026-03-16):** triangle asm `jit_hot/20`: ~217µs → ~190µs (**12% improvement**, gap to Cranelift ~172µs: 52% → 10%); TC asm `jit_hot/50`: ~2.36ms → ~1.88ms (**20% improvement**).
+
+Remaining 10% asm vs Cranelift gap for triangle: `update_jit_indices()` is called from `advance_jit()` on both Cranelift and asm paths, rebuilding `JitHashIndex` structures that the asm path never uses. Skipping it (`skip_jit_hash_indices` param) was attempted but broke TC correctness (empirically — the interaction was not fully understood). The asm path also still pays for `build_from_packed_no_tupleset` recent rebuild per iteration even though recent is only iterated.
 
 ### Near-native performance roadmap
 

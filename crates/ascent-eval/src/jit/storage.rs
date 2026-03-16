@@ -404,6 +404,39 @@ impl JitTupleSet {
     }
 }
 
+/// Insert a single tuple into a raw `JitTupleSet` slot buffer without grow checks.
+///
+/// `slots` must be a zeroed allocation with `(mask + 1)` slots of `arity + 1` words each.
+/// The caller must ensure load factor < 70% before calling (no automatic grow).
+///
+/// # Safety
+/// `slots` must be valid, zeroed, and have capacity `(mask + 1) * (arity + 1)` u32 words.
+#[inline]
+unsafe fn jit_tuple_set_insert_unchecked(slots: *mut u32, mask: u64, tuple: &[u32]) {
+    let arity = tuple.len();
+    let stride = arity + 1;
+    let h = tuple_hash(tuple);
+    let mut slot = (h as u64 & mask) as usize;
+    loop {
+        let tag = unsafe { *slots.add(slot * stride) };
+        if tag == EMPTY_TAG {
+            unsafe {
+                *slots.add(slot * stride) = h;
+                for (j, &v) in tuple.iter().enumerate() {
+                    *slots.add(slot * stride + 1 + j) = v;
+                }
+            }
+            return;
+        }
+        // Dedup: skip if already present (shouldn't happen for fresh inserts, but be safe).
+        let matches = (0..arity).all(|j| unsafe { *slots.add(slot * stride + 1 + j) == tuple[j] });
+        if matches {
+            return;
+        }
+        slot = ((slot as u64 + 1) & mask) as usize;
+    }
+}
+
 // JitTupleSet does NOT implement Drop for freeing slots — the owner
 // (JitRelData) holds the arity and is responsible for freeing slots.
 // Dropping a standalone JitTupleSet built via `build` will leak.
@@ -475,7 +508,21 @@ impl JitRelData {
     /// Build from a flat row-major packed tuple slice.
     ///
     /// If `build_indices` is true, column indices are built for all `arity` columns.
+    /// The `JitTupleSet` is always built (used for cross-iteration head dedup on total).
     pub fn build_from_packed(data: &[u32], arity: usize, build_indices: bool) -> Box<Self> {
+        Self::build_from_packed_impl(data, arity, build_indices, true)
+    }
+
+    /// Like `build_from_packed`, but skips building the `JitTupleSet`.
+    ///
+    /// Use this for `recent` buffers that are only iterated over, never probed as a
+    /// membership set (the JIT only probes `total.tuple_set` for head dedup, not
+    /// `recent.tuple_set`).
+    pub fn build_from_packed_no_tupleset(data: &[u32], arity: usize, build_indices: bool) -> Box<Self> {
+        Self::build_from_packed_impl(data, arity, build_indices, false)
+    }
+
+    fn build_from_packed_impl(data: &[u32], arity: usize, build_indices: bool, build_tuple_set: bool) -> Box<Self> {
         let n_tuples = if arity == 0 { 0 } else { data.len() / arity };
 
         // ── data array ───────────────────────────────────────────────────
@@ -488,15 +535,21 @@ impl JitRelData {
 
         // ── tuple set ────────────────────────────────────────────────────
         // Build, then manually decompose so we can store the slots_words for Drop.
-        let ts = JitTupleSet::build(data, arity);
-        let stride = arity + 1;
-        let ts_cap = ts.cap_in_slots();
-        let ts_slots_words = ts_cap * stride;
-        let ts_slots = ts.slots;
-        let ts_mask = ts.mask;
-        let ts_len = ts.len;
-        // Suppress the (no-op) drop — we own the memory.
-        std::mem::forget(ts);
+        // Skipped for `recent` buffers that are only iterated, never probed.
+        let (ts_slots, ts_mask, ts_len, ts_slots_words) = if build_tuple_set {
+            let ts = JitTupleSet::build(data, arity);
+            let stride = arity + 1;
+            let ts_cap = ts.cap_in_slots();
+            let ts_slots_words = ts_cap * stride;
+            let ts_slots = ts.slots;
+            let ts_mask = ts.mask;
+            let ts_len = ts.len;
+            // Suppress the (no-op) drop — we own the memory.
+            std::mem::forget(ts);
+            (ts_slots, ts_mask, ts_len, ts_slots_words)
+        } else {
+            (ptr::null_mut(), 0u64, 0u64, 0usize)
+        };
 
         // ── column index pointer array ────────────────────────────────────
         // We allocate an array of `arity` raw pointers.  `*mut *mut JitColIndex`
@@ -598,31 +651,53 @@ impl JitRelData {
         }
         self.len = new_len as u64;
 
-        // Update tuple_set: rebuild from the full extended data.
-        // Required because the JIT uses total.tuple_set for cross-iteration head dedup.
-        {
-            let full_slice = if arity == 0 {
-                &[][..]
-            } else {
-                unsafe { std::slice::from_raw_parts(self.data, new_len * arity) }
-            };
-            // Free old tuple_set slots allocation (JitTupleSet::drop is a no-op; we own it).
-            if !self.tuple_set.slots.is_null() && self._ts_slots_words > 0 {
-                unsafe { free_u32_slice(self.tuple_set.slots, self._ts_slots_words) };
-            }
-            // Build fresh tuple_set.
-            let ts = JitTupleSet::build(full_slice, arity);
+        // Update tuple_set: required for cross-iteration head dedup (JIT probes total.tuple_set).
+        if arity > 0 {
             let stride = arity + 1;
-            let ts_cap = ts.cap_in_slots();
-            let ts_slots_words = ts_cap * stride;
-            let ts_slots = ts.slots;
-            let ts_mask = ts.mask;
-            let ts_len = ts.len;
-            std::mem::forget(ts); // suppress the no-op drop; we own the memory
-            self.tuple_set.slots = ts_slots;
-            self.tuple_set.mask = ts_mask;
-            self.tuple_set.len = ts_len;
-            self._ts_slots_words = ts_slots_words;
+
+            // Check if existing capacity can accommodate new_len at <70% load factor.
+            // If so, just insert the n_new new tuples (old_len..new_len) without
+            // zeroing or reinserting the old tuples — they are still correct in the set.
+            let current_cap = if !self.tuple_set.slots.is_null() {
+                self._ts_slots_words / stride
+            } else {
+                0
+            };
+
+            if current_cap > 0 && (new_len * 10 / 7) < current_cap {
+                // Incremental path: current allocation fits new_len at <70% load.
+                // Insert only the n_new new tuples into the existing set.
+                let slots = self.tuple_set.slots;
+                let mask = self.tuple_set.mask;
+                for i in old_len..new_len {
+                    let tuple = unsafe {
+                        std::slice::from_raw_parts(self.data.add(i * arity), arity)
+                    };
+                    unsafe { jit_tuple_set_insert_unchecked(slots, mask, tuple) };
+                }
+                self.tuple_set.len = new_len as u64;
+            } else {
+                // Growth path: allocate a new larger set, zero it, and reinsert all tuples.
+                let needed_cap = next_pow2_min16((new_len * 10 / 7) + 1);
+                let needed_words = needed_cap * stride;
+                if !self.tuple_set.slots.is_null() && self._ts_slots_words > 0 {
+                    unsafe { free_u32_slice(self.tuple_set.slots, self._ts_slots_words) };
+                }
+                let new_slots = alloc_u32_zeroed(needed_words);
+                self._ts_slots_words = needed_words;
+                let mask = (needed_cap - 1) as u64;
+                self.tuple_set.slots = new_slots;
+                self.tuple_set.mask = mask;
+                self.tuple_set.len = 0;
+                // Reinsert all new_len tuples into the fresh set.
+                for i in 0..new_len {
+                    let tuple = unsafe {
+                        std::slice::from_raw_parts(self.data.add(i * arity), arity)
+                    };
+                    unsafe { jit_tuple_set_insert_unchecked(new_slots, mask, tuple) };
+                }
+                self.tuple_set.len = new_len as u64;
+            }
         }
 
         if !build_indices || arity == 0 {
@@ -708,6 +783,53 @@ impl std::fmt::Debug for JitNativeRelData {
             .field("recent_len", &self.recent.len)
             .field("new_len", &self.new.len)
             .finish()
+    }
+}
+
+impl JitNativeRelData {
+    /// Deep-clone this `JitNativeRelData` by rebuilding each `JitRelData` from its raw data.
+    ///
+    /// Used by `PackedStorage::Clone` to preserve the prebuilt native projection across
+    /// clones so that the first `jit_advance_native` call in a cloned engine does not pay
+    /// the full `build_native_projection` rebuild cost.
+    pub fn deep_clone(&self) -> Self {
+        let arity = self.total.arity as usize;
+        let build_indices = !self.total.col_indices.is_null();
+
+        // Rebuild total from its raw data buffer.
+        let total_clone = {
+            let n = self.total.len as usize;
+            let words = n * arity.max(1);
+            let slice = if n == 0 || self.total.data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(self.total.data, words) }
+            };
+            JitRelData::build_from_packed(slice, arity, build_indices)
+        };
+
+        // Rebuild recent from its raw data buffer.
+        // `recent` is only iterated, never probed as a membership set — skip tuple_set.
+        let recent_clone = {
+            let n = self.recent.len as usize;
+            let words = n * arity.max(1);
+            let slice = if n == 0 || self.recent.data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(self.recent.data, words) }
+            };
+            JitRelData::build_from_packed_no_tupleset(slice, arity, build_indices)
+        };
+
+        // `new` is always an empty write buffer — no data to copy.
+        let new_clone = JitRelData::build_from_packed(&[], arity, false);
+
+        JitNativeRelData {
+            total: total_clone,
+            recent: recent_clone,
+            new: new_clone,
+            total_built_count: self.total_built_count,
+        }
     }
 }
 

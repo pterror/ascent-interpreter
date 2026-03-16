@@ -763,6 +763,7 @@ pub unsafe extern "C" fn jit_stratum_advance_s4(ctx: *mut StratumStage4Ctx) -> u
     let mut changed = false;
     for i in 0..ctx.n_all_rels as usize {
         let rel = unsafe { &mut **ctx.all_rels.add(i) };
+        // skip_jit_hash_indices=false: the Cranelift path uses jit_indices / jit_recent_indices.
         if rel.advance_jit() {
             changed = true;
         }

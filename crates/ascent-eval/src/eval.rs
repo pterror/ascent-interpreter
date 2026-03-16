@@ -1394,15 +1394,19 @@ impl Engine {
                 .into_iter()
                 .collect();
             for name in &all_rels {
-                if let Some(Relation::Packed(ps)) = self.relations.get_mut(name)
-                    && ps.jit_native.is_none()
-                {
-                    // advance_jit() moves delta→recent and updates jit indices.
-                    // It does NOT build jit_native when it's None (to avoid the cost on the
-                    // Cranelift path, which never calls build_stratum_stage4_native_runtime).
-                    // Explicitly initialize jit_native here so the `?` guards below succeed.
-                    ps.advance_jit();
-                    ps.jit_native = Some(ps.build_native_projection());
+                if let Some(Relation::Packed(ps)) = self.relations.get_mut(name) {
+                    if ps.jit_native.is_none() {
+                        // Cold path: advance_jit() moves delta→recent and updates jit indices.
+                        // advance_jit() does NOT build jit_native when it's None (to avoid the
+                        // cost on the Cranelift path). Explicitly build it here.
+                        ps.advance_jit();
+                        ps.jit_native = Some(ps.build_native_projection());
+                    } else if !ps.delta.is_empty() {
+                        // jit_native was deep-cloned (PackedStorage::clone) and new facts were
+                        // inserted into delta since the clone.  advance_jit() moves delta→recent
+                        // and refreshes jit_native so the first JIT iteration sees the new data.
+                        ps.advance_jit();
+                    }
                 }
             }
         }

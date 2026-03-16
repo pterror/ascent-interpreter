@@ -284,15 +284,24 @@ impl PackedStorage {
         let total_slice = &self.packed_data[0..self.count * arity.max(1)];
 
         // Gather recent tuples into a contiguous slice.
-        let mut recent_buf: Vec<u32> = Vec::with_capacity(self.recent.len() * arity.max(1));
-        for &idx in &self.recent {
-            let start = idx * arity;
-            recent_buf.extend_from_slice(&self.packed_data[start..start + arity]);
-        }
+        // Sink relations are never body clauses, so their `recent` is never JIT-scanned.
+        let recent = if self.jit_is_sink {
+            // Skip the gather + build entirely for sink relations.
+            JitRelData::build_from_packed_no_tupleset(&[], arity, false)
+        } else {
+            let mut recent_buf: Vec<u32> = Vec::with_capacity(self.recent.len() * arity.max(1));
+            for &idx in &self.recent {
+                let start = idx * arity;
+                recent_buf.extend_from_slice(&self.packed_data[start..start + arity]);
+            }
+            // `recent` is only iterated, never probed as a membership set.
+            // Skip tuple_set to avoid O(n) hash-build cost on every advance.
+            JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, build_indices)
+        };
 
         JitNativeRelData {
             total: JitRelData::build_from_packed(total_slice, arity, build_indices),
-            recent: JitRelData::build_from_packed(&recent_buf, arity, build_indices),
+            recent,
             // `new` must have an allocated tuple_set so the JIT can probe it inline.
             // `build_from_packed` on an empty slice allocates a minimum-capacity (16 slots)
             // tuple_set and a data buffer, with len=0 and cap=1.
@@ -610,8 +619,10 @@ impl PackedStorage {
 
             if self.jit_is_edb {
                 // EDB: total never changes. Always reset recent to empty.
+                // `recent` is only iterated, never probed as a membership set —
+                // skip tuple_set to avoid O(n) hash-build cost.
                 let native = self.jit_native.as_mut().unwrap();
-                native.recent = JitRelData::build_from_packed(&[], arity, build_indices);
+                native.recent = JitRelData::build_from_packed_no_tupleset(&[], arity, build_indices);
                 // `new` was already reset above by the swap.
             } else {
                 // IDB: extend total with only the new delta tuples; rebuild indices.
@@ -638,15 +649,23 @@ impl PackedStorage {
                 }
 
                 // Rebuild recent from self.recent index list.
-                let arity_max1 = arity.max(1);
-                let mut recent_buf = Vec::with_capacity(self.recent.len() * arity_max1);
-                for &idx in &self.recent {
-                    let start = idx * arity_max1;
-                    recent_buf
-                        .extend_from_slice(&self.packed_data[start..start + arity_max1]);
+                // `recent` is only iterated, never probed as a membership set —
+                // skip tuple_set to avoid O(n) hash-build cost.
+                //
+                // Sink relations (head-only) never appear in body clauses, so their
+                // `recent` JitRelData is never scanned by the JIT. Skip the rebuild
+                // entirely for them (keep existing data; it is never accessed).
+                if !self.jit_is_sink {
+                    let arity_max1 = arity.max(1);
+                    let mut recent_buf = Vec::with_capacity(self.recent.len() * arity_max1);
+                    for &idx in &self.recent {
+                        let start = idx * arity_max1;
+                        recent_buf
+                            .extend_from_slice(&self.packed_data[start..start + arity_max1]);
+                    }
+                    native.recent =
+                        JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, build_indices);
                 }
-                native.recent =
-                    JitRelData::build_from_packed(&recent_buf, arity, build_indices);
             }
         }
 
@@ -989,9 +1008,10 @@ impl Clone for PackedStorage {
             jit_is_sink: self.jit_is_sink,
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_index_is_edb_fmt: self.jit_index_is_edb_fmt,
-            // jit_native is a rebuild cache; start fresh on clone.
+            // Deep-clone jit_native so the cloned engine does not pay the full
+            // build_native_projection rebuild cost on its first jit_advance_native call.
             #[cfg(all(feature = "jit", feature = "specialized"))]
-            jit_native: None,
+            jit_native: self.jit_native.as_ref().map(|n| n.deep_clone()),
             jit_dedup: self.jit_dedup.clone(),
         }
     }
