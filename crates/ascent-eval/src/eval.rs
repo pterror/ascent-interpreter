@@ -1002,6 +1002,20 @@ impl Engine {
             }
         };
 
+        // Step 1b: also compile the native function if the jit-asm feature is available.
+        // The native fn reads scan data directly from JitRelData (no packed_count/pdptr callbacks).
+        // This is compiled speculatively; it will only be used if stage4_native_runtime is Some.
+        #[cfg(feature = "jit-asm")]
+        let stage4_native_fn: Option<crate::jit::packed_helpers::StratumStage4Fn> = {
+            let r = self.jit.as_ref().and_then(|jit_cell| {
+                let mut jit = jit_cell.lock().unwrap();
+                jit.var_count = self.var_count;
+                jit.compile_stratum_stage4_native(stratum_key, rules)
+            });
+            eprintln!("DEBUG: after compile_stratum_stage4_native: is_some={}", r.is_some());
+            r
+        };
+
         // Step 2: build the runtime context if not yet cached
         if !self.stratum_stage4_cache.contains_key(&stratum_key) {
             let runtime = match self.build_stratum_stage4_runtime(rules) {
@@ -1011,8 +1025,25 @@ impl Engine {
             self.stratum_stage4_cache.insert(stratum_key, runtime);
         }
 
-        // Step 3: call the Stage 4 stratum function.
+        // Step 3: call the stratum function.
+        // If the native runtime is available AND the native function compiled successfully,
+        // use the native path (zero read-side Rust callbacks).
+        // Otherwise fall back to the old path.
         let runtime = self.stratum_stage4_cache.get_mut(&stratum_key).unwrap();
+
+        #[cfg(feature = "jit-asm")]
+        if let (Some(native_fn), Some(native_runtime)) =
+            (stage4_native_fn, runtime.stage4_native_runtime.as_mut())
+        {
+            // The native fn takes *mut StratumStage4NativeCtx, but StratumStage4Fn
+            // is typed as *mut StratumStage4Ctx. Both are opaque pointers at the ABI
+            // level; transmute is safe here since we know which ctx the fn expects.
+            type NativeFn = unsafe extern "C" fn(*mut crate::jit::packed_helpers::StratumStage4NativeCtx);
+            let native_fn_typed: NativeFn = unsafe { std::mem::transmute(native_fn) };
+            unsafe { native_fn_typed(&raw mut *native_runtime.ctx) };
+            return true;
+        }
+
         unsafe { stage4_fn(&raw mut *runtime.stage4_ctx) };
 
         true

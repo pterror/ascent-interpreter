@@ -156,6 +156,11 @@ pub struct JitCompiler {
     /// Cache of Stage 4 stratum functions (inlined rule bodies).
     #[cfg(feature = "specialized")]
     pub(crate) stratum_stage4_fn_cache: FxHashMap<usize, Option<packed_helpers::StratumStage4Fn>>,
+    /// Cache of Stage 4 native stratum functions (JitRelData direct read path).
+    /// Keyed by stratum_key. None = not eligible (or not attempted yet).
+    #[cfg(all(feature = "specialized", feature = "jit-asm"))]
+    pub(crate) stratum_stage4_native_fn_cache:
+        FxHashMap<usize, Option<packed_helpers::StratumStage4Fn>>,
     /// Asm-backend stratum buffers: kept alive so the fn_ptr remains valid.
     #[cfg(all(feature = "specialized", feature = "jit-asm"))]
     pub(crate) asm_buffers: Vec<asm_codegen::AsmStratum>,
@@ -268,6 +273,8 @@ impl JitCompiler {
             stratum_stage3_fn_cache: FxHashMap::default(),
             #[cfg(feature = "specialized")]
             stratum_stage4_fn_cache: FxHashMap::default(),
+            #[cfg(all(feature = "specialized", feature = "jit-asm"))]
+            stratum_stage4_native_fn_cache: FxHashMap::default(),
             #[cfg(all(feature = "specialized", feature = "jit-asm"))]
             asm_buffers: Vec::new(),
             #[cfg(feature = "specialized")]
@@ -767,6 +774,71 @@ impl JitCompiler {
         let code_ptr = self.module.get_finalized_function(func_id);
         let fn_ptr: packed_helpers::StratumStage4Fn = unsafe { std::mem::transmute(code_ptr) };
         Ok(fn_ptr)
+    }
+
+    /// Compile or retrieve the native Stage 4 stratum function (Step 4).
+    ///
+    /// The native function reads scan data directly from `JitRelData` fields,
+    /// eliminating all Rust callbacks from the inner loop READ side.
+    ///
+    /// Returns `None` if the asm backend is unavailable or returns an error.
+    #[cfg(all(feature = "specialized", feature = "jit-asm"))]
+    pub fn compile_stratum_stage4_native(
+        &mut self,
+        stratum_key: usize,
+        rules: &[&CRule],
+    ) -> Option<packed_helpers::StratumStage4Fn> {
+        if let Some(cached) = self.stratum_stage4_native_fn_cache.get(&stratum_key) {
+            return *cached;
+        }
+
+        let rule_data: Vec<(Vec<crate::compiled::CClause>, Vec<crate::compiled::CHeadClause>, Vec<crate::compiled::CExpr>)> = rules
+            .iter()
+            .map(|rule| {
+                let clauses: Vec<crate::compiled::CClause> = rule
+                    .body
+                    .iter()
+                    .filter_map(|item| match item {
+                        CBodyItem::Clause(c) => Some(c.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let conditions: Vec<crate::compiled::CExpr> = rule
+                    .body
+                    .iter()
+                    .filter_map(|item| match item {
+                        CBodyItem::Condition(CCondition::If(expr)) => Some(expr.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                (clauses, rule.heads.clone(), conditions)
+            })
+            .collect();
+        let rules_refs: Vec<(&[crate::compiled::CClause], &[crate::compiled::CHeadClause], &[crate::compiled::CExpr])> = rule_data
+            .iter()
+            .map(|(c, h, conds)| (c.as_slice(), h.as_slice(), conds.as_slice()))
+            .collect();
+
+        match asm_codegen::codegen_stratum_asm_native(
+            &rules_refs,
+            self.var_count,
+            packed_helpers::jit_advance_native as usize,
+            packed_helpers::packed_try_insert as usize,
+        ) {
+            Ok(asm_stratum) => {
+                let fn_ptr = asm_stratum.fn_ptr;
+                self.asm_buffers.push(asm_stratum);
+                self.stratum_stage4_native_fn_cache.insert(stratum_key, Some(fn_ptr));
+                Some(fn_ptr)
+            }
+            Err(reason) => {
+                if std::env::var("ASCENT_DUMP_JIT").is_ok() {
+                    eprintln!("asm native backend skipped stratum {stratum_key}: {reason}");
+                }
+                self.stratum_stage4_native_fn_cache.insert(stratum_key, None);
+                None
+            }
+        }
     }
 
     /// Compile or retrieve a stratum meta-function for the given rules.

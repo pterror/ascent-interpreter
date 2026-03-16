@@ -40,6 +40,7 @@ syn.workspace = true
 
 [features]
 jit = ["ascent-eval/jit", "ascent-eval/specialized"]
+jit-asm = ["ascent-eval/jit-asm"]
 specialized = ["ascent-eval/specialized"]
 
 [dev-dependencies]

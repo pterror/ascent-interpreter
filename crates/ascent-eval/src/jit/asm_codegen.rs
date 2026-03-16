@@ -271,7 +271,12 @@ fn emit_store_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
 ///
 /// # Register protocol
 /// Clobbers: rax, rcx, rdx, rdi, rsi, r8, r9, r10, r11.
-/// Reads handle_idx entry from `ctx->tuple_sets_buf` via CTX_SLOT.
+///
+/// # Source of JitTupleSet pointer
+/// - `jit_rel_for_probe`: when `Some(jit_rel_ptr_reg)`, the `JitTupleSet` is loaded
+///   from that already-loaded `*mut JitRelData` register (offset 32 = `JitRelData::tuple_set`).
+///   This is the native path.
+/// - When `None`, the old path: ctx->tuple_sets_buf[handle_idx] via CTX_SLOT.
 ///
 /// # JitTupleSet layout (from storage.rs)
 /// - slots @ 0, mask @ 8, len @ 16
@@ -283,6 +288,10 @@ fn emit_tuple_set_probe(
     handle_idx: usize,
     when_exhausted: DynamicLabel,
     var_locs: &[VarLoc],
+    // When Some, load JitTupleSet from JitRelData.tuple_set (offset 32) using
+    // the given flat scan-rels index into total_rels.  When None, use the old
+    // ctx->tuple_sets_buf path.
+    native_total_rel_flat_idx: Option<usize>,
 ) -> Result<(), String> {
     let arity = clause.args.len();
     if arity == 0 || arity > 3 {
@@ -301,14 +310,26 @@ fn emit_tuple_set_probe(
         }
     }
 
-    let handle_idx_i32 = (handle_idx * 8) as i32;
-
-    // Load JitTupleSet pointer: ctx->tuple_sets_buf[handle_idx]
-    dynasm!(asm
-        ; mov rdi, [rbp + CTX_SLOT]        // ctx
-        ; mov rdi, [rdi + 56]              // tuple_sets_buf (offset 56 in StratumStage4Ctx)
-        ; mov rdi, [rdi + handle_idx_i32]  // *const JitTupleSet for this clause
-    );
+    // Load JitTupleSet pointer into rdi.
+    if let Some(flat_idx) = native_total_rel_flat_idx {
+        // Native path: total_rels[flat_idx]->tuple_set (JitRelData offset 32)
+        // total_rels is at offset 8 in StratumStage4NativeCtx.
+        let flat_idx_i32 = (flat_idx * 8) as i32;
+        dynasm!(asm
+            ; mov rdi, [rbp + CTX_SLOT]        // native ctx (*mut StratumStage4NativeCtx)
+            ; mov rdi, [rdi + 8]               // total_rels ptr (offset 8)
+            ; mov rdi, [rdi + flat_idx_i32]    // *mut JitRelData
+            ; add rdi, 32                      // &JitRelData.tuple_set (offset 32)
+        );
+    } else {
+        let handle_idx_i32 = (handle_idx * 8) as i32;
+        // Old path: ctx->tuple_sets_buf[handle_idx]
+        dynasm!(asm
+            ; mov rdi, [rbp + CTX_SLOT]        // ctx
+            ; mov rdi, [rdi + 56]              // tuple_sets_buf (offset 56 in StratumStage4Ctx)
+            ; mov rdi, [rdi + handle_idx_i32]  // *const JitTupleSet for this clause
+        );
+    }
 
     // Load JitTupleSet fields
     // r8 = slots ptr (offset 0), r9 = mask (offset 8, u64)
@@ -590,14 +611,42 @@ fn emit_heads(
     max_head_arity: usize,
     pti: usize,
     var_locs: &[VarLoc],
+    // When true, load *mut PackedStorage from ctx->head_specs[rule_head_base+hi].rel
+    // instead of from rule_ctx->head_rels[hi].  head_specs is at offset 64 in NativeCtx.
+    use_jit_native: bool,
+    rule_head_base: usize,
 ) -> Result<(), String> {
     for (hi, head) in heads.iter().enumerate() {
         let arity = head.args.len();
         let hoff: i32 = (hi as i32) * 8;
+        let t0_off = head_col_slot(var_count, max_head_arity, 0);
 
         for (col, arg) in head.args.iter().enumerate() {
             emit_expr(asm, arg, var_locs)?;
             dynasm!(asm; mov [rbp + head_col_slot(var_count, max_head_arity, col)], eax);
+        }
+
+        if use_jit_native {
+            // Native path: load *mut PackedStorage from ctx->head_specs[flat_hi].rel.
+            // head_specs is at offset 64 in StratumStage4NativeCtx.
+            // NativeHeadSpec is 8 bytes with rel (*mut PackedStorage) at offset 0.
+            // flat_hi = rule_head_base + hi.
+            let flat_hi_i32 = ((rule_head_base + hi) * 8) as i32;
+            dynasm!(asm
+                ; mov rdi, [rbp + CTX_SLOT]        // NativeCtx*
+                ; mov rdi, [rdi + 64]              // head_specs (*const NativeHeadSpec)
+                ; mov rdi, [rdi + flat_hi_i32]     // *mut PackedStorage
+            );
+            if arity == 0 {
+                dynasm!(asm; xor rsi, rsi; xor edx, edx);
+            } else {
+                dynasm!(asm
+                    ; lea rsi, [rbp + t0_off]
+                    ; mov edx, arity as i32
+                );
+            }
+            call_abs!(asm, pti);
+            continue;
         }
 
         if arity == 0 {
@@ -611,8 +660,6 @@ fn emit_heads(
             call_abs!(asm, pti);
             continue;
         }
-
-        let t0_off = head_col_slot(var_count, max_head_arity, 0);
 
         // Load JitDedupHandle for this head:
         //   rule_ctx->head_dedup_handles[hi] → *mut JitDedupHandle
@@ -721,6 +768,13 @@ struct EmitParams<'a> {
     var_locs: &'a [VarLoc],
     /// Absolute starting index of this rule in the flat handles_buf / tuple_sets_buf.
     rule_handle_base: usize,
+    /// Absolute starting index of this rule's heads in the flat head_specs array
+    /// (used by native path to load *mut PackedStorage for packed_try_insert).
+    rule_head_base: usize,
+    /// When true, use the native JIT path: read data directly from JitRelData fields
+    /// instead of calling packed_count/packed_data_ptr/packed_recent_ptr.
+    /// CTX_SLOT holds a *mut StratumStage4NativeCtx.
+    use_jit_native: bool,
 }
 
 /// Emit code for clause `level` and all deeper clauses.
@@ -750,6 +804,92 @@ fn emit_clause_level(
         let stride = (arity * 4) as i32;
         let use_recent = p.use_recent[0];
         let uri32 = if use_recent { 1i32 } else { 0i32 };
+
+        // flat handle index for clause 0:  rule_handle_base + 0*2 + use_recent
+        let flat_idx0 = p.rule_handle_base + if use_recent { 1 } else { 0 };
+        let flat_idx0_i32 = (flat_idx0 * 8) as i32;
+
+        if p.use_jit_native {
+            // ── Native path: read directly from JitRelData ──────────────────
+            // scan_rels is at offset 0 in StratumStage4NativeCtx.
+            // scan_rels[flat_idx0] → *mut JitRelData  (scan version: total or recent)
+            //
+            // r12 = count (JitRelData.len @ 8)
+            // r13 = data_ptr (JitRelData.data @ 0) — needed for both total and recent
+            // r14 = loop counter i
+
+            // Load scan_rel for clause 0
+            dynasm!(asm
+                ; mov rdi, [rbp + CTX_SLOT]         // native ctx
+                ; mov rdi, [rdi]                    // scan_rels (offset 0)
+                ; mov rdi, [rdi + flat_idx0_i32]    // *mut JitRelData
+            );
+
+            // r12 = len
+            dynasm!(asm
+                ; mov r12, [rdi + 8]                // JitRelData.len @ 8
+                ; test r12, r12
+                ; jz =>outer_exit
+            );
+
+            if use_recent {
+                // r13 is reserved for the data ptr (excluded from variable registers when
+                // use_recent0=true by compute_var_locs).  Cache it here to avoid reloading.
+                dynasm!(asm; mov r13, [rdi]);   // JitRelData.data @ 0
+            }
+            // (For total scan, r13 may hold a variable, so reload data ptr each iteration)
+
+            dynasm!(asm; xor r14d, r14d);  // i = 0
+
+            let loop_hdr = asm.new_dynamic_label();
+            let outer_continue = asm.new_dynamic_label();
+
+            dynasm!(asm; =>loop_hdr);
+            dynasm!(asm; cmp r14, r12; jge =>outer_exit);
+
+            if use_recent {
+                // recent: tuple_ptr = r13 + i * stride (r13 = recent.data cached above)
+                dynasm!(asm
+                    ; imul rcx, r14, stride
+                    ; lea rax, [r13 + rcx]          // rax = tuple_ptr
+                );
+            } else {
+                // total: reload data_ptr from scan_rels each iteration
+                dynasm!(asm
+                    ; mov rax, [rbp + CTX_SLOT]         // native ctx
+                    ; mov rax, [rax]                    // scan_rels (offset 0)
+                    ; mov rax, [rax + flat_idx0_i32]    // *mut JitRelData
+                    ; mov rax, [rax]                    // JitRelData.data (offset 0)
+                    ; imul rcx, r14, stride
+                    ; add rax, rcx                      // rax = data + i * stride
+                );
+            }
+
+            // Bind clause0 cols (rax = tuple_ptr)
+            emit_bind_cols(asm, clause, outer_continue, p.var_locs)?;
+
+            // Clause0 conditions
+            for cond in &clause.conditions {
+                if let CCondition::If(expr) = cond {
+                    emit_expr(asm, expr, p.var_locs)?;
+                    dynasm!(asm; test eax, eax; jz =>outer_continue);
+                }
+            }
+
+            if p.clauses.len() == 1 {
+                for expr in p.rule_conds {
+                    emit_expr(asm, expr, p.var_locs)?;
+                    dynasm!(asm; test eax, eax; jz =>outer_continue);
+                }
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base)?;
+            } else {
+                emit_clause_level(asm, p, 1, outer_exit, outer_continue)?;
+            }
+
+            dynasm!(asm; =>outer_continue);
+            dynasm!(asm; inc r14; jmp =>loop_hdr);
+        } else {
+        // ── Old path: use packed_count / packed_recent_ptr / packed_data_ptr callbacks ──
 
         // Count
         load_rel_rdi!(asm, p.rule_i, 0usize);
@@ -806,7 +946,7 @@ fn emit_clause_level(
                 emit_expr(asm, expr, p.var_locs)?;
                 dynasm!(asm; test eax, eax; jz =>outer_continue);
             }
-            emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
+            emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base)?;
         } else {
             // Multi-clause: recurse into level 1.
             // The level-1 code is emitted inline here; it ends by jumping to
@@ -816,6 +956,7 @@ fn emit_clause_level(
 
         dynasm!(asm; =>outer_continue);
         dynasm!(asm; inc r14; jmp =>loop_hdr);
+        } // end old path
 
     } else {
         // ── Level >= 1: hash probe + inner scan ────────────────────────────
@@ -829,8 +970,17 @@ fn emit_clause_level(
         let use_recent = p.use_recent[level];
         let is_rec = p.is_rec[level];
         // Non-recursive relations use contiguous mode (built once for EDB).
-        // Recursive relations use linked-list mode (not supported in asm — rejected above).
+        // Recursive relations use linked-list mode (not supported in native path).
         let is_contiguous = !is_rec;
+
+        // Native path only supports contiguous (EDB) inner clauses.
+        // Reject strata where any inner-level clause is recursive (linked-list).
+        if p.use_jit_native && !is_contiguous {
+            return Err(format!(
+                "asm native: rule {} clause {} is recursive (linked-list not supported in native path)",
+                p.rule_i, level
+            ));
+        }
 
         // Save the ENCLOSING level's r15 and rbx before we clobber them with
         // the new probe.  The enclosing level is `level-1`.
@@ -852,19 +1002,26 @@ fn emit_clause_level(
             );
         }
 
+        // flat handle index for this (level, use_recent)
+        let flat_idx = p.rule_handle_base + level * 2 + if use_recent { 1 } else { 0 };
+        let flat_idx_i32 = (flat_idx * 8) as i32;
+        // For tuple_set probes on the native path, we use the total version (always non-recent).
+        let total_flat_idx = p.rule_handle_base + level * 2; // use_recent=false
+        let total_flat_idx_i32 = (total_flat_idx * 8) as i32;
+        let _ = total_flat_idx_i32; // suppress unused warning in old path
+
         // Fast path for fully-bound existence checks: inline JitTupleSet probe.
         if clause.fresh_cols.is_empty() {
-            let handle_idx_in_buf = p.rule_handle_base
-                + level * 2
-                + if use_recent { 1 } else { 0 };
-            if emit_tuple_set_probe(asm, clause, handle_idx_in_buf, when_exhausted, p.var_locs).is_ok() {
+            let handle_idx_in_buf = flat_idx;
+            let native_total_for_probe = if p.use_jit_native { Some(total_flat_idx) } else { None };
+            if emit_tuple_set_probe(asm, clause, handle_idx_in_buf, when_exhausted, p.var_locs, native_total_for_probe).is_ok() {
                 // Probe succeeded (emitted inline code). Fall through means found.
                 if level + 1 == p.clauses.len() {
                     for expr in p.rule_conds {
                         emit_expr(asm, expr, p.var_locs)?;
                         dynasm!(asm; test eax, eax; jz =>when_exhausted);
                     }
-                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
+                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base)?;
                     dynasm!(asm; jmp =>when_exhausted);
                 } else {
                     emit_clause_level(asm, p, level + 1, outer_exit, when_exhausted)?;
@@ -894,6 +1051,95 @@ fn emit_clause_level(
                 dynasm!(asm; mov ecx, eax);
             }
         }
+
+        if p.use_jit_native {
+            // ── Native path: inline JitColIndex probe ────────────────────────
+            //
+            // JitRelData offsets:
+            //   data       @ 0
+            //   len        @ 8
+            //   cap        @ 16
+            //   col_indices @ 24  (*mut *mut JitColIndex, array of arity ptrs)
+            //   tuple_set  @ 32
+            //   arity      @ 56
+            //
+            // JitColIndex offsets:
+            //   keys   @ 0   (*mut u32)
+            //   ranges @ 8   (*mut u64)
+            //   vals   @ 16  (*mut u32)
+            //   mask   @ 24  (u32)
+            //   len    @ 28  (u32)
+            //
+            // Hash probe: slot = (key * 0x9e3779b9) & mask   (Knuth multiplicative)
+            // EMPTY_KEY = 0xFFFFFFFF
+            //
+            // After probe:
+            //   esi = start (lo32 of ranges[slot])
+            //   eax = count (hi32 of ranges[slot])
+            //   r11 = vals ptr (JitColIndex.vals)
+            //   rdi = *mut JitRelData for this scan slot (for data ptr later)
+
+            // Load scan_rel *mut JitRelData
+            dynasm!(asm
+                ; mov rdi, [rbp + CTX_SLOT]         // native ctx
+                ; mov rdi, [rdi]                    // scan_rels (offset 0)
+                ; mov rdi, [rdi + flat_idx_i32]     // *mut JitRelData for this clause
+            );
+
+            // Load col_indices ptr and get JitColIndex* for primary_col
+            let primary_col_i32 = (primary_col * 8) as i32;
+            dynasm!(asm
+                ; mov r8, [rdi + 24]                // col_indices: *mut *mut JitColIndex
+                ; mov r8, [r8 + primary_col_i32]    // JitColIndex* for primary_col
+            );
+
+            // Hash: slot = (key * KNUTH32) & mask, key is in ecx
+            dynasm!(asm
+                ; mov eax, ecx
+                ; imul eax, eax, 0x9e3779b9u32 as i32  // Knuth hash (same as col_hash in storage.rs)
+                ; mov edx, [r8 + 24]                   // JitColIndex.mask (offset 24, u32)
+                ; and eax, edx                         // slot = hash & mask
+            );
+
+            // Load keys ptr (JitColIndex.keys is a *mut u32 at offset 0)
+            // Note: edx = mask (u32), eax = slot (u32), ecx = key, r8 = *mut JitColIndex
+            dynasm!(asm
+                ; mov r9, [r8]                  // r9 = keys ptr (*mut u32) at offset 0
+            );
+
+            let probe_lp = asm.new_dynamic_label();
+            let probe_hit = asm.new_dynamic_label();
+
+            // probe_lp: keys[slot] — r9 is keys ptr, eax is slot
+            dynasm!(asm; =>probe_lp);
+            dynasm!(asm
+                ; mov esi, [r9 + rax*4]         // keys[slot]
+                ; cmp esi, -1i32                // EMPTY_KEY = 0xFFFFFFFF = -1
+                ; je =>when_exhausted           // not found → exhaust level
+                ; cmp esi, ecx
+                ; je =>probe_hit
+                ; inc eax                       // slot++
+                ; and eax, edx                  // slot & mask (edx still = mask)
+                ; jmp =>probe_lp
+            );
+
+            dynasm!(asm; =>probe_hit);
+            // Load ranges[slot]: u64 = start | (count << 32)
+            // ranges is at offset 8 in JitColIndex
+            dynasm!(asm
+                ; mov r11, [r8 + 8]             // ranges ptr (offset 8)
+                ; mov r11, [r11 + rax*8]        // ranges[slot] as u64
+                ; mov esi, r11d                 // start = lo32
+                ; shr r11, 32
+                ; mov eax, r11d                 // count = hi32
+            );
+            // Load vals ptr from JitColIndex into r11 (for vals_base computation below)
+            dynasm!(asm
+                ; mov r11, [r8 + 16]            // vals ptr (offset 16 in JitColIndex)
+            );
+            // rdi still = *mut JitRelData for this scan slot
+        } else {
+        // ── Old path: probe JitLookupHandle (JitHashIndex) ──────────────────
 
         // Probe: handle_off uses (clause_seq * 2 + use_recent) * 24 (JitLookupHandle stride)
         let handle_off: i32 = ((level * 2 + if use_recent { 1 } else { 0 }) * 24) as i32;
@@ -963,6 +1209,7 @@ fn emit_clause_level(
         );
 
         dynasm!(asm; =>after_probe);
+        } // end old path hash probe
 
         // Dispatch to contiguous scan or linked-list traversal.
         //   esi = entry.head (start index into values array, or first node index)
@@ -1007,9 +1254,15 @@ fn emit_clause_level(
                     ; lea r11, [r11 + rsi*4]          // r11 = vals_base
                     ; mov [rbp + vs], r11             // save vals_base
                 );
-                load_rel_rdi!(asm, p.rule_i, level);
-                call_abs!(asm, p.pdptr);
-                dynasm!(asm; mov rbx, rax);
+                if p.use_jit_native {
+                    // Native path: load data_ptr directly from JitRelData.data (offset 0)
+                    // rdi still = *mut JitRelData for this scan slot (set during hash probe)
+                    dynasm!(asm; mov rbx, [rdi]);  // JitRelData.data @ 0
+                } else {
+                    load_rel_rdi!(asm, p.rule_i, level);
+                    call_abs!(asm, p.pdptr);
+                    dynasm!(asm; mov rbx, rax);
+                }
             }
 
             let inner_hdr = asm.new_dynamic_label();
@@ -1059,7 +1312,7 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base)?;
                 if is_col_value && clause.fresh_cols.is_empty() {
                     dynasm!(asm; jmp =>when_exhausted);
                 }
@@ -1102,9 +1355,19 @@ fn emit_clause_level(
             // For tuple_idx mode (arity > 2), load data_ptr into rbx once.
             // (r11 already saved above so the call is safe.)
             if !is_ll_col_value {
-                load_rel_rdi!(asm, p.rule_i, level);
-                call_abs!(asm, p.pdptr);
-                dynasm!(asm; mov rbx, rax);
+                if p.use_jit_native {
+                    // Native path: reload scan_rels[flat_idx]->data (offset 0)
+                    dynasm!(asm
+                        ; mov rbx, [rbp + CTX_SLOT]         // native ctx
+                        ; mov rbx, [rbx]                    // scan_rels (offset 0)
+                        ; mov rbx, [rbx + flat_idx_i32]     // *mut JitRelData
+                        ; mov rbx, [rbx]                    // JitRelData.data @ 0
+                    );
+                } else {
+                    load_rel_rdi!(asm, p.rule_i, level);
+                    call_abs!(asm, p.pdptr);
+                    dynasm!(asm; mov rbx, rax);
+                }
             }
 
             let inner_hdr = asm.new_dynamic_label();
@@ -1152,7 +1415,7 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs)?;
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base)?;
             } else {
                 let sub_exhausted = asm.new_dynamic_label();
                 emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
@@ -1193,6 +1456,8 @@ fn emit_rule_variant(
     pdptr: usize,
     prptr: usize,
     rule_handle_base: usize,
+    rule_head_base: usize,
+    use_jit_native: bool,
 ) -> Result<(), String> {
     let variant_exit = asm.new_dynamic_label();
 
@@ -1220,7 +1485,7 @@ fn emit_rule_variant(
             emit_expr(asm, expr, &var_locs)?;
             dynasm!(asm; test eax, eax; jz =>variant_exit);
         }
-        emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti, &var_locs)?;
+        emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti, &var_locs, use_jit_native, rule_head_base)?;
         dynasm!(asm; =>variant_exit);
         return Ok(());
     }
@@ -1241,6 +1506,8 @@ fn emit_rule_variant(
         pcount,
         var_locs: &var_locs,
         rule_handle_base,
+        rule_head_base,
+        use_jit_native,
     };
 
     emit_clause_level(asm, &p, 0, variant_exit, variant_exit)?;
@@ -1251,14 +1518,27 @@ fn emit_rule_variant(
 
 // ─── Main entry point ─────────────────────────────────────────────────────
 
-pub fn codegen_stratum_asm(
+/// Common codegen logic for both old and native paths.
+///
+/// When `use_jit_native=true`:
+///   - CTX_SLOT holds `*mut StratumStage4NativeCtx` instead of `*mut StratumStage4Ctx`.
+///   - `advance_addr` is the address of `jit_advance_native`.
+///   - Loop body reads scan data directly from `JitRelData` fields.
+///
+/// When `use_jit_native=false` (default):
+///   - CTX_SLOT holds `*mut StratumStage4Ctx`.
+///   - `advance_addr` is the address of `jit_stratum_advance_s4`.
+///   - Loop body uses `packed_count` / `packed_data_ptr` / `packed_recent_ptr` callbacks.
+#[allow(clippy::too_many_arguments)]
+fn codegen_stratum_asm_inner(
     rules: &[(&[CClause], &[CHeadClause], &[CExpr])],
     var_count: usize,
-    advance_s4_addr: usize,
+    advance_addr: usize,
     packed_try_insert_addr: usize,
     packed_count_addr: usize,
     packed_data_ptr_addr: usize,
     packed_recent_ptr_addr: usize,
+    use_jit_native: bool,
 ) -> Result<AsmStratum, String> {
     // ── Eligibility ──────────────────────────────────────────────────────────
     for (ri, (clauses, heads, conds)) in rules.iter().enumerate() {
@@ -1338,6 +1618,27 @@ pub fn codegen_stratum_asm(
         bases
     };
 
+    // Each rule contributes head_count entries to the flat head_specs / head_rels arrays.
+    let rule_head_bases: Vec<usize> = {
+        let mut bases = Vec::with_capacity(rules.len());
+        let mut offset = 0usize;
+        for (_, heads, _) in rules.iter() {
+            bases.push(offset);
+            offset += heads.len();
+        }
+        bases
+    };
+
+    // In the native path, scan_rels pointers may be stale (pointing into a JitNativeRelData
+    // that was rebuilt by a previous advance_jit call between cache creation and first invocation).
+    // Call advance once upfront to refresh them before the full variants run.
+    if use_jit_native {
+        dynasm!(asm; mov rdi, [rbp + CTX_SLOT]);
+        call_abs!(asm, advance_addr);
+        // Don't check al here — full variants must run regardless of whether anything changed,
+        // since we need the total-scan to process all existing facts on the first evaluation.
+    }
+
     // Full variants
     for (rule_i, (clauses, heads, conds)) in rules.iter().enumerate() {
         emit_rule_variant(
@@ -1346,12 +1647,14 @@ pub fn codegen_stratum_asm(
             packed_try_insert_addr, packed_count_addr,
             packed_data_ptr_addr, packed_recent_ptr_addr,
             rule_handle_bases[rule_i],
+            rule_head_bases[rule_i],
+            use_jit_native,
         )?;
     }
 
-    // jit_stratum_advance_s4(ctx) → al
+    // advance(ctx) → al
     dynasm!(asm; mov rdi, [rbp + CTX_SLOT]);
-    call_abs!(asm, advance_s4_addr);
+    call_abs!(asm, advance_addr);
     dynasm!(asm; test al, al; jz =>exit_lbl);
 
     // Recent-variant loop
@@ -1366,12 +1669,14 @@ pub fn codegen_stratum_asm(
                 packed_try_insert_addr, packed_count_addr,
                 packed_data_ptr_addr, packed_recent_ptr_addr,
                 rule_handle_bases[rule_i],
+                rule_head_bases[rule_i],
+                use_jit_native,
             )?;
         }
     }
 
     dynasm!(asm; mov rdi, [rbp + CTX_SLOT]);
-    call_abs!(asm, advance_s4_addr);
+    call_abs!(asm, advance_addr);
     dynasm!(asm; test al, al; jnz =>inner_hdr);
 
     // Epilogue
@@ -1390,4 +1695,48 @@ pub fn codegen_stratum_asm(
     let buffer = asm.finalize().map_err(|_| "asm finalize: reloc error".to_string())?;
     let fn_ptr: StratumStage4Fn = unsafe { std::mem::transmute(buffer.ptr(fn_start)) };
     Ok(AsmStratum { _buffer: buffer, fn_ptr })
+}
+
+/// Old (non-native) entry point: uses `packed_count`/`packed_data_ptr`/`packed_recent_ptr`
+/// callbacks and the `StratumStage4Ctx` context.
+pub fn codegen_stratum_asm(
+    rules: &[(&[CClause], &[CHeadClause], &[CExpr])],
+    var_count: usize,
+    advance_s4_addr: usize,
+    packed_try_insert_addr: usize,
+    packed_count_addr: usize,
+    packed_data_ptr_addr: usize,
+    packed_recent_ptr_addr: usize,
+) -> Result<AsmStratum, String> {
+    codegen_stratum_asm_inner(
+        rules, var_count,
+        advance_s4_addr,
+        packed_try_insert_addr,
+        packed_count_addr,
+        packed_data_ptr_addr,
+        packed_recent_ptr_addr,
+        false,
+    )
+}
+
+/// Native entry point: reads scan data directly from `JitRelData` fields (Step 4).
+///
+/// The generated function takes `*mut StratumStage4NativeCtx` as its argument.
+/// `advance_native_addr` is the address of `jit_advance_native`.
+/// `packed_try_insert_addr` is still used for head insertion (write side; Step 5 will replace this).
+pub fn codegen_stratum_asm_native(
+    rules: &[(&[CClause], &[CHeadClause], &[CExpr])],
+    var_count: usize,
+    advance_native_addr: usize,
+    packed_try_insert_addr: usize,
+) -> Result<AsmStratum, String> {
+    codegen_stratum_asm_inner(
+        rules, var_count,
+        advance_native_addr,
+        packed_try_insert_addr,
+        0, // packed_count_addr unused in native path
+        0, // packed_data_ptr_addr unused in native path
+        0, // packed_recent_ptr_addr unused in native path
+        true,
+    )
 }
