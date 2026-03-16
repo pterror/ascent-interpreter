@@ -571,6 +571,35 @@ impl Drop for JitRelData {
     }
 }
 
+// ─── JitNativeRelData ────────────────────────────────────────────────────────
+
+/// Three `JitRelData` views of a `PackedStorage` relation: total, recent, and new.
+///
+/// Kept fresh by `PackedStorage::advance_jit()`:
+/// - `total`  — all tuples (`packed_data[0..count*arity]`), column indices built.
+/// - `recent` — only the tuples that became recent this iteration.
+/// - `new`    — empty write buffer for JIT-generated tuples; reset after each advance.
+pub struct JitNativeRelData {
+    pub total: Box<JitRelData>,
+    pub recent: Box<JitRelData>,
+    pub new: Box<JitRelData>,
+}
+
+// Safety: JitRelData contains raw pointers and is !Send by default, but all
+// three views are only ever accessed from the single JIT-evaluation thread.
+unsafe impl Send for JitNativeRelData {}
+unsafe impl Sync for JitNativeRelData {}
+
+impl std::fmt::Debug for JitNativeRelData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitNativeRelData")
+            .field("total_len", &self.total.len)
+            .field("recent_len", &self.recent.len)
+            .field("new_len", &self.new.len)
+            .finish()
+    }
+}
+
 // ─── JIT growth callbacks ────────────────────────────────────────────────────
 //
 // These are the ONLY Rust functions the new JIT hot path calls — and only on

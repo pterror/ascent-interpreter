@@ -168,7 +168,7 @@ pub fn try_packed_col_types(col_types: &[Option<String>]) -> Option<Vec<PackedTy
 /// Dedup hashing and per-column indices use the u32 representation,
 /// avoiding Value enum dispatch overhead. The Value buffer is maintained
 /// in parallel so the evaluation loop can read tuples without conversion.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PackedStorage {
     /// Flat Value buffer for eval loop reads. Tuple `i` at `[i*arity..(i+1)*arity]`.
     pub(crate) value_data: Vec<Value>,
@@ -223,6 +223,10 @@ pub struct PackedStorage {
     /// `jit_is_edb` transitions from false to true.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) jit_index_is_edb_fmt: bool,
+    /// Native JIT storage projection: total, recent, and empty-new views.
+    /// Rebuilt on every `advance_jit()` call.  `None` before the first advance.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) jit_native: Option<crate::jit::storage::JitNativeRelData>,
     /// Authoritative dedup table (inline u32 hash table, also probed by JIT code directly).
     pub(crate) jit_dedup: crate::jit_index::JitDedupTable,
 }
@@ -255,7 +259,37 @@ impl PackedStorage {
             jit_is_sink: false,
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_index_is_edb_fmt: false,
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_native: None,
             jit_dedup: crate::jit_index::JitDedupTable::new(arity),
+        }
+    }
+
+    /// Build a `JitNativeRelData` projection from the current state of this storage.
+    ///
+    /// - `total`:  covers all tuples in `packed_data[0..count*arity]`, column indices built.
+    /// - `recent`: covers only the recent tuples (gathered from `self.recent` index list).
+    /// - `new`:    empty write buffer with initial capacity 64 tuples.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) fn build_native_projection(
+        &self,
+    ) -> crate::jit::storage::JitNativeRelData {
+        use crate::jit::storage::{JitNativeRelData, JitRelData};
+
+        let arity = self.arity;
+        let total_slice = &self.packed_data[0..self.count * arity.max(1)];
+
+        // Gather recent tuples into a contiguous slice.
+        let mut recent_buf: Vec<u32> = Vec::with_capacity(self.recent.len() * arity.max(1));
+        for &idx in &self.recent {
+            let start = idx * arity;
+            recent_buf.extend_from_slice(&self.packed_data[start..start + arity]);
+        }
+
+        JitNativeRelData {
+            total: JitRelData::build_from_packed(total_slice, arity, true),
+            recent: JitRelData::build_from_packed(&recent_buf, arity, true),
+            new: JitRelData::new_empty(arity),
         }
     }
 
@@ -519,6 +553,7 @@ impl PackedStorage {
         self.recent = std::mem::take(&mut self.delta);
         // Skip recent_col_indices rebuild — JIT uses jit_recent_indices.
         self.update_jit_indices();
+        self.jit_native = Some(self.build_native_projection());
         had_delta
     }
 
@@ -824,6 +859,44 @@ impl PackedStorage {
             is_lattice: false,
             key_index: HashTable::new(),
             source_tags: self.source_tags,
+        }
+    }
+}
+
+impl Clone for PackedStorage {
+    /// Clone all interpreter-side state.
+    ///
+    /// `jit_native` is a rebuild cache; cloned instances start with `None` and
+    /// the cache is repopulated on the first `advance_jit()` call.
+    fn clone(&self) -> Self {
+        Self {
+            value_data: self.value_data.clone(),
+            packed_data: self.packed_data.clone(),
+            col_types: self.col_types.clone(),
+            count: self.count,
+            arity: self.arity,
+            delta: self.delta.clone(),
+            recent: self.recent.clone(),
+            indices: self.indices.clone(),
+            recent_col_indices: self.recent_col_indices.clone(),
+            source_tags: self.source_tags.clone(),
+            interp_synced_count: self.interp_synced_count,
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_indices: self.jit_indices.clone(),
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_recent_indices: self.jit_recent_indices.clone(),
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_full_indexed_count: self.jit_full_indexed_count,
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_is_edb: self.jit_is_edb,
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_is_sink: self.jit_is_sink,
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_index_is_edb_fmt: self.jit_index_is_edb_fmt,
+            // jit_native is a rebuild cache; start fresh on clone.
+            #[cfg(all(feature = "jit", feature = "specialized"))]
+            jit_native: None,
+            jit_dedup: self.jit_dedup.clone(),
         }
     }
 }
