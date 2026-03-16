@@ -332,11 +332,28 @@ remaining call for *new* tuples.
 Extends `asm_codegen.rs` with a proper register assigner and full pattern coverage. Keep Cranelift
 as fallback for anything the asm backend explicitly rejects.
 
-- **3a — Depth-priority register assignment** (~150 lines): variables bound in clause `i` are live
-  from clause `i` entry to head emission; assign by depth so clause-0 variables (longest-lived, in
-  every inner-loop iteration) get callee-saved registers first (r12, r13, r15), spill later-bound
-  variables to dedicated stack slots only when the register file is exhausted. Eliminates the
-  load/store pairs per inner iteration that make the current asm backend slower than Cranelift.
+- **3a — Depth-priority register assignment** (~150 lines): ✅ IMPLEMENTED (2026-03-16).
+  `compute_var_locs()` assigns outer-loop-stable variables to callee-saved registers (r13 for
+  first outer-fresh var when `use_recent0=false`, rbx for 1-clause rules), with stack slots for
+  remaining vars. `emit_load_var`/`emit_store_var`/`emit_load_var_ecx` dispatch on `VarLoc::Reg`
+  vs `VarLoc::Stack`. For 3-clause rules (triangle): r13 = var_a (total-scan variant), all others
+  on stack. For 2-clause rules (TC/fibonacci): r13 = first outer var.
+
+  Also implemented: **data_ptr0 cache slot** — outer-loop total-scan path was reloading
+  `JitRelData.data` via 4-level pointer chain (ctx→scan_rels→JitRelData→data) on every iteration.
+  Added `data_ptr0_slot()` (new stack slot at bottom of frame) and a pre-loop store before the
+  outer scan; inner loop loads from that slot (1 load vs 4 serialized loads). Frame size increased
+  by 8 bytes to accommodate.
+
+  **Benchmark result (2026-03-16):** triangle jit-asm/20: ~294 µs → ~226 µs (**~23% improvement**),
+  now within ~6% of Cranelift (226 µs vs 214 µs). Near parity.
+
+  **Remaining gap (analysis):** For 3-clause rules, all 5 callee-saved regs (r12/r13/r14/r15/rbx)
+  are occupied by loop machinery; only r13 is available for one variable. The variable bound at
+  level 1 (c for triangle) is stored to stack and immediately reloaded for the level-2 existence
+  check — a redundant store/load pair. Eliminating it would require either a 6th callee-saved reg
+  (none exists on x86-64) or assigning level-1 vars to caller-saved regs restricted to call-free
+  inner body spans. Not implemented.
 
 - **3b — N-clause rules** *(committed `cec22d0`, 2026-03-15, at parity with Cranelift)*:
   Recursive `emit_clause_level` with per-depth stack slots (vptr, node-save, dptr-save). Triangle
@@ -442,9 +459,16 @@ fibonacci 13.3 µs → 12.0 µs = **10% improvement (1.4× vs macro)**.
 
 **Residual gap:** triangle ~7.7×, fibonacci ~1.4×. The triangle gap is dominated by
 instruction-count overhead (Cranelift vs LLVM code quality) in the inner join loop.
-Remaining options: (a) asm backend register assignment (Step 3a — outer-loop variables in
-callee-saved regs eliminates load/store per inner iter); (b) eliminate `packed_try_insert`
-call for new tuples (inline into JIT).
+Options: (a) asm backend register assignment (Step 3a — ✅ done, see below); (b) eliminate
+`packed_try_insert` call for new tuples (inline into JIT).
+
+**Step 3a asm register assignment + data_ptr cache (2026-03-16):**
+`compute_var_locs()` assigns outer-fresh variables to callee-saved registers (r13 when
+`use_recent0=false`). Also added `data_ptr0_slot`: pre-loop stores `JitRelData.data` to a
+new stack slot; inner loop loads from that slot (1 load) instead of 4-level pointer chain.
+**triangle jit-asm/20: ~294 µs → ~226 µs (~23% improvement, now ~6% slower than Cranelift ~214 µs).**
+Remaining gap: level-1-bound variables (c for triangle) still store/load via stack — all 5
+callee-saved regs are occupied by loop machinery; no register remains for c.
 
 **Pre-existing bug:** `tc_shared_jit` test hangs infinitely with `jit-asm` feature. Existed
 before 2026-03-15 changes. Root cause unknown — dynasm TC path. Does not affect `jit+specialized`

@@ -23,6 +23,9 @@
 //!   [base - level*8]                      level_vptr_slot(level) = values_base for level 1..MAX_DEPTH
 //!   [base - MAX_DEPTH*8 - level*8]        level_node_save(level)  for level 1..MAX_DEPTH-1
 //!   [base - 2*MAX_DEPTH*8 - level*8]      level_dptr_save(level)  for level 1..MAX_DEPTH-1
+//!   [base - 3*MAX_DEPTH*8 - level*8]      level_count_slot(level) for level 1..MAX_DEPTH (contiguous)
+//!   [base - 4*MAX_DEPTH*8 - 8]            data_ptr0_slot  = cached JitRelData.data for clause-0
+//!                                          total-scan (avoids 4-load pointer chain per outer iter)
 //! ```
 //! where V = var_count, H = max_head_arity, MAX_DEPTH = max nesting depth.
 //!
@@ -182,13 +185,21 @@ fn frame_size(var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 
     //   D*8    = per-level node save slots  (levels 1..max_depth)
     //   D*8    = per-level dptr save slots  (levels 1..max_depth)
     //   D*8    = per-level count slots      (levels 1..max_depth; contiguous mode)
+    //   8      = data_ptr0 cache slot (for total-scan outer loop; avoids 4-load chain)
     //   8      = guard / alignment slack
     let level_bytes = max_depth * 4 * 8;
-    let raw = 8 + var_count * 4 + max_head_arity * 4 + level_bytes + 8;
+    let raw = 8 + var_count * 4 + max_head_arity * 4 + level_bytes + 8 + 8;
     // Round up to next value ≡ 8 (mod 16)
     let rem = raw % 16;
     let pad = if rem <= 8 { 8 - rem } else { 24 - rem };
     (raw + pad) as i32
+}
+
+/// Stack slot for caching the clause-0 data pointer (JitRelData.data) before the outer
+/// loop in the native total-scan path.  Avoids a 4-load pointer chain on every iteration.
+/// Placed just below the per-level count-slot region.
+fn data_ptr0_slot(var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 {
+    level_slots_base(var_count, max_head_arity) - 4 * (max_depth as i32) * 8 - 8
 }
 
 // ─── Assembly helpers ─────────────────────────────────────────────────────
@@ -1081,8 +1092,16 @@ fn emit_clause_level(
                 // r13 is reserved for the data ptr (excluded from variable registers when
                 // use_recent0=true by compute_var_locs).  Cache it here to avoid reloading.
                 dynasm!(asm; mov r13, [rdi]);   // JitRelData.data @ 0
+            } else {
+                // total scan: r13 may hold a variable, so we cannot use it for data_ptr.
+                // Cache data_ptr in a stack slot before the loop to avoid the 4-load
+                // pointer chain (ctx → scan_rels → JitRelData → data) on every iteration.
+                let dp0 = data_ptr0_slot(p.var_count, p.max_head_arity, p.max_depth);
+                dynasm!(asm
+                    ; mov rax, [rdi]                    // JitRelData.data @ 0
+                    ; mov [rbp + dp0], rax              // cache data_ptr
+                );
             }
-            // (For total scan, r13 may hold a variable, so reload data ptr each iteration)
 
             dynasm!(asm; xor r14d, r14d);  // i = 0
 
@@ -1099,12 +1118,10 @@ fn emit_clause_level(
                     ; lea rax, [r13 + rcx]          // rax = tuple_ptr
                 );
             } else {
-                // total: reload data_ptr from scan_rels each iteration
+                // total: load data_ptr from stack cache (1 load vs 4-load chain)
+                let dp0 = data_ptr0_slot(p.var_count, p.max_head_arity, p.max_depth);
                 dynasm!(asm
-                    ; mov rax, [rbp + CTX_SLOT]         // native ctx
-                    ; mov rax, [rax]                    // scan_rels (offset 0)
-                    ; mov rax, [rax + flat_idx0_i32]    // *mut JitRelData
-                    ; mov rax, [rax]                    // JitRelData.data (offset 0)
+                    ; mov rax, [rbp + dp0]              // data_ptr (cached before loop)
                     ; imul rcx, r14, stride
                     ; add rax, rcx                      // rax = data + i * stride
                 );
