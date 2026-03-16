@@ -315,7 +315,7 @@ impl PackedStorage {
             // tuple_set and a data buffer, with len=0 and cap=1.
             new: JitRelData::build_from_packed(&[], arity, false),
             total_built_count: self.count,
-            build_indices: true,
+            build_indices,
         }
     }
 
