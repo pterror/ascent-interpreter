@@ -1013,9 +1013,17 @@ impl Engine {
                 jit.compile_stratum_stage4_native(stratum_key, rules)
             });
 
-        // Step 2: build the runtime context if not yet cached
+        // Step 2: build the runtime context if not yet cached.
+        // Pass whether the native fn compiled so `build_stratum_stage4_runtime` can skip
+        // the expensive `build_stratum_stage4_native_runtime` call (and jit_native init)
+        // when the asm native path will never activate for this stratum.
+        #[cfg(feature = "jit-asm")]
+        let native_fn_available = stage4_native_fn.is_some();
+        #[cfg(not(feature = "jit-asm"))]
+        let native_fn_available = false;
+
         if !self.stratum_stage4_cache.contains_key(&stratum_key) {
-            let runtime = match self.build_stratum_stage4_runtime(rules) {
+            let runtime = match self.build_stratum_stage4_runtime(rules, native_fn_available) {
                 Some(r) => r,
                 None => return false,
             };
@@ -1050,7 +1058,7 @@ impl Engine {
     ///
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule]) -> Option<StratumStage4Runtime> {
+    fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule], native_fn_available: bool) -> Option<StratumStage4Runtime> {
         use crate::jit::packed_helpers::{JitHeadBuf, LookupSpec, PackedJitContextV3, StratumStage4Ctx};
         use crate::jit_index::JitLookupHandle;
         use crate::relation::Relation;
@@ -1308,9 +1316,16 @@ impl Engine {
             _pad4: 0,
         });
 
-        // Build the native runtime (asm path only; Cranelift never needs jit_native).
+        // Build the native runtime only when the asm native fn actually compiled.
+        // Skipping this when native_fn_available=false avoids initializing jit_native on
+        // every PackedStorage, which would then be rebuilt on every fixpoint iteration even
+        // though the native asm path is never used (e.g. fibonacci unsupported exprs).
         #[cfg(feature = "jit-asm")]
-        let native_runtime = self.build_stratum_stage4_native_runtime(rules);
+        let native_runtime = if native_fn_available {
+            self.build_stratum_stage4_native_runtime(rules)
+        } else {
+            None
+        };
         #[cfg(not(feature = "jit-asm"))]
         let native_runtime: Option<crate::jit::packed_helpers::StratumStage4NativeRuntime> = None;
 
