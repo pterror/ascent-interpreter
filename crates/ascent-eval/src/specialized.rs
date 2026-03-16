@@ -597,28 +597,26 @@ impl PackedStorage {
         // Skip recent_col_indices rebuild — JIT uses jit_recent_indices.
         self.update_jit_indices();
 
-        // Rebuild the native projection only when data changed.  When nothing changed
-        // (e.g. stable EDB relations after initial load), reuse total and just update recent.
-        // Only apply this optimization to EDB relations (never in any head) to avoid
-        // stale col_indices for IDB relations where total grows over time.
-        if new_written || had_delta {
-            // Data changed: full rebuild (total must include new tuples; recent is new).
-            self.jit_native = Some(self.build_native_projection());
-        } else if self.jit_is_edb {
-            if let Some(ref mut native) = self.jit_native {
-                // EDB: nothing changed; `total` is still valid; just reset `recent` (empty).
-                // Use the same build_indices setting as total so that inner probes on recent
-                // find valid (empty) JitColIndex rather than null pointers.
+        // Rebuild jit_native only if it has already been initialized.
+        // jit_native is None on the Cranelift path (build_stratum_stage4_native_runtime is
+        // never called without jit-asm), so this guard prevents paying the build cost there.
+        // The asm native runtime builder explicitly initializes jit_native before first run;
+        // after that, this block keeps it fresh on every fixpoint iteration.
+        if self.jit_native.is_some() {
+            if new_written || had_delta {
+                // Data changed: full rebuild.
+                self.jit_native = Some(self.build_native_projection());
+            } else if self.jit_is_edb {
+                // EDB, nothing changed: total is still valid; just reset recent (empty).
+                let native = self.jit_native.as_mut().unwrap();
                 use crate::jit::storage::JitRelData;
                 let build_indices = !self.jit_is_sink;
                 native.recent = JitRelData::build_from_packed(&[], self.arity, build_indices);
                 // `new` was already reset above by the swap.
             } else {
+                // IDB: full rebuild to include any new tuples in total.
                 self.jit_native = Some(self.build_native_projection());
             }
-        } else {
-            // IDB or unknown: always rebuild to ensure total is correct.
-            self.jit_native = Some(self.build_native_projection());
         }
 
         had_delta

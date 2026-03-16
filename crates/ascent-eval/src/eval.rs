@@ -1308,8 +1308,11 @@ impl Engine {
             _pad4: 0,
         });
 
-        // Build the native runtime (opt-in fast path; None if any relation lacks jit_native).
+        // Build the native runtime (asm path only; Cranelift never needs jit_native).
+        #[cfg(feature = "jit-asm")]
         let native_runtime = self.build_stratum_stage4_native_runtime(rules);
+        #[cfg(not(feature = "jit-asm"))]
+        let native_runtime: Option<crate::jit::packed_helpers::StratumStage4NativeRuntime> = None;
 
         Some(StratumStage4Runtime {
             stage4_ctx,
@@ -1379,10 +1382,12 @@ impl Engine {
                 if let Some(Relation::Packed(ps)) = self.relations.get_mut(name)
                     && ps.jit_native.is_none()
                 {
-                    // advance_jit() with jit_native=None: moves delta→recent, builds jit_native
-                    // once from the current data.  Subsequent upfront JIT advance sees empty
-                    // delta and takes the cheap EDB path (no rebuild).
+                    // advance_jit() moves delta→recent and updates jit indices.
+                    // It does NOT build jit_native when it's None (to avoid the cost on the
+                    // Cranelift path, which never calls build_stratum_stage4_native_runtime).
+                    // Explicitly initialize jit_native here so the `?` guards below succeed.
                     ps.advance_jit();
+                    ps.jit_native = Some(ps.build_native_projection());
                 }
             }
         }

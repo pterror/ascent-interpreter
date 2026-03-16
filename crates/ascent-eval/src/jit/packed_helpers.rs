@@ -674,9 +674,13 @@ pub struct StratumStage4NativeRuntime {
 
 /// Called from JIT once per fixpoint iteration.
 ///
-/// Advances all `PackedStorage` relations via `advance_jit()` (which also rebuilds
-/// `jit_native`), then refreshes the `scan_rels`, `total_rels`, and `head_rels`
-/// pointer buffers so JIT code on the next iteration sees valid `JitRelData` pointers.
+/// Advances all `PackedStorage` relations via `advance_jit()`, then refreshes the
+/// `scan_rels`, `total_rels`, and `head_rels` pointer buffers so JIT code on the
+/// next iteration sees valid `JitRelData` pointers.
+///
+/// Also handles the post-clone case: after `Engine::clone()` resets `jit_native` to
+/// `None`, the first `jit_advance_native` call re-initializes it so pointer refreshes
+/// below work correctly.
 ///
 /// Returns 1 if any relation changed, 0 otherwise.
 ///
@@ -686,7 +690,6 @@ pub struct StratumStage4NativeRuntime {
 pub unsafe extern "C" fn jit_advance_native(ctx: *mut StratumStage4NativeCtx) -> u8 {
     let ctx = unsafe { &mut *ctx };
 
-    // Advance all relations; advance_jit() rebuilds jit_native on each.
     let advance_slice =
         unsafe { std::slice::from_raw_parts(ctx.advance_rels, ctx.n_advance_rels as usize) };
     let mut changed = false;
@@ -694,6 +697,12 @@ pub unsafe extern "C" fn jit_advance_native(ctx: *mut StratumStage4NativeCtx) ->
         let rel = unsafe { &mut *rel_ptr };
         if rel.advance_jit() {
             changed = true;
+        }
+        // Re-initialize jit_native if it was cleared (e.g., by Engine::clone()).
+        // advance_jit() only refreshes an existing jit_native; it never builds from None.
+        // This is a cold path: runs at most once per engine clone, not every iteration.
+        if rel.jit_native.is_none() {
+            rel.jit_native = Some(rel.build_native_projection());
         }
     }
 
