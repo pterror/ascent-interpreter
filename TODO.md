@@ -256,11 +256,20 @@ outer: for i in 0..edge_delta.len:
 advance: call rust_advance(ctx)   // once per fixpoint iter
 ```
 
-**Implementation plan:**
+**Implementation plan (2026-03-16, detailed):**
 
-1. `jit_storage.rs` — new structs, Rust-side build/populate functions, offset assertions
-2. `asm_codegen.rs` — inline probe/insert emitters using new structs; remove all Rust calls from hot path
-3. `eval.rs` — new stratum fast path using `JitRelData`; old path as fallback
+`JitColIndex`, `JitTupleSet`, `JitRelData` already exist in `storage.rs` as a blueprint — not yet wired. `JitColIndex.ranges` encodes `start | (count << 32)` per bucket (u64). `JitRelData` layout: `data@0`, `len@8`, `cap@16`, `col_indices@24`, `tuple_set@32` (embedded 24-byte JitTupleSet), `arity@56`.
+
+Sequenced steps:
+1. **storage.rs growth callbacks** (~60 lines): add `extern "C" fn jit_rel_data_grow(*mut JitRelData)` (doubles data capacity, updates ptr+cap) and `extern "C" fn jit_tuple_set_grow(*mut JitTupleSet, arity)` (doubles+rehashes). These are the only two new Rust callbacks the hot path ever makes.
+2. **specialized.rs projection** (~120 lines): add `jit_native: Option<JitNativeRelData>` to `PackedStorage` holding `[total, recent, new]` `Box<JitRelData>`. Add `build_native_projection()`. Call in `advance_jit()`.
+3. **eval.rs native runtime** (~200 lines): `build_stratum_stage4_native_runtime` alongside existing builder; `StratumStage4NativeCtx` with `*mut JitRelData` pointers instead of `JitLookupHandle` arrays. Falls back to old path if any relation lacks `jit_native`.
+4. **asm read path** (~180 lines): `use_jit_native` flag in `EmitParams`; replace outer-scan `packed_count`/`packed_data_ptr` calls with direct `[jit_rel+0]`/`[jit_rel+8]` loads; replace `JitLookupHandle` probe with `JitColIndex` `keys/ranges/vals` inline probe.
+5. **asm write path** (~120 lines): replace `emit_heads`+`packed_try_insert` with direct stores to `head_jitrel.data`, inline `JitTupleSet` insert, `len++`, bounds-check → `call jit_rel_data_grow`.
+6. **Cranelift parity** (~150 lines): mirror steps 4–5 in `packed_codegen.rs`.
+7. **Dead code removal** (~50 lines): delete `JitHeadBuf`, `jit_flush_head_bufs`, `tuple_sets_buf`, `head_write_bufs`, `head_rel_ptrs` from `StratumStage4Ctx` once all tests pass.
+
+Total: ~880 lines across 6 files. Steps 1–2 are parallel-independent.
 
 ### Near-native performance roadmap
 
