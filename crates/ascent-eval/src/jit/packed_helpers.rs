@@ -624,6 +624,10 @@ pub struct StratumStage4NativeCtx {
     pub advance_rels: *const *mut PackedStorage, // @ 40
     pub n_advance_rels: u32,                  // @ 48
     pub _pad2: u32,                           // @ 52
+    /// Parallel to head_rels: total-version `*mut JitRelData` for cross-iteration dedup.
+    /// `head_total_rels[i]` = the total JitRelData for the same relation as `head_rels[i]`.
+    /// Refreshed by `jit_advance_native` each iteration.
+    pub head_total_rels: *mut *mut JitRelData,  // @ 56
     // ── private: not JIT-visible ────────────────────────────────────────────
     /// Parallel to scan_rels / total_rels: tells `jit_advance_native` which
     /// `PackedStorage` and `use_recent` flag maps to each slot so the buffer
@@ -651,6 +655,7 @@ const _: () = {
     assert!(offset_of!(StratumStage4NativeCtx, n_head_rels) == 32);
     assert!(offset_of!(StratumStage4NativeCtx, advance_rels) == 40);
     assert!(offset_of!(StratumStage4NativeCtx, n_advance_rels) == 48);
+    assert!(offset_of!(StratumStage4NativeCtx, head_total_rels) == 56);
 };
 
 /// Pinned runtime data keeping all backing allocations alive for a native Stage 4 context.
@@ -658,12 +663,13 @@ const _: () = {
 pub struct StratumStage4NativeRuntime {
     pub ctx: Box<StratumStage4NativeCtx>,
     // Keep all the Boxes alive so pointers remain valid:
-    pub(crate) _scan_rels_buf:    Box<[*mut JitRelData]>,
-    pub(crate) _total_rels_buf:   Box<[*mut JitRelData]>,
-    pub(crate) _head_rels_buf:    Box<[*mut JitRelData]>,
-    pub(crate) _advance_rels_buf: Box<[*mut PackedStorage]>,
-    pub(crate) _scan_specs_buf:   Box<[NativeScanSpec]>,
-    pub(crate) _head_specs_buf:   Box<[NativeHeadSpec]>,
+    pub(crate) _scan_rels_buf:        Box<[*mut JitRelData]>,
+    pub(crate) _total_rels_buf:       Box<[*mut JitRelData]>,
+    pub(crate) _head_rels_buf:        Box<[*mut JitRelData]>,
+    pub(crate) _head_total_rels_buf:  Box<[*mut JitRelData]>,
+    pub(crate) _advance_rels_buf:     Box<[*mut PackedStorage]>,
+    pub(crate) _scan_specs_buf:       Box<[NativeScanSpec]>,
+    pub(crate) _head_specs_buf:       Box<[NativeHeadSpec]>,
 }
 
 /// Called from JIT once per fixpoint iteration.
@@ -709,14 +715,16 @@ pub unsafe extern "C" fn jit_advance_native(ctx: *mut StratumStage4NativeCtx) ->
         }
     }
 
-    // Refresh head_rels: new JitRelData for writes was created by advance_jit().
+    // Refresh head_rels and head_total_rels: advance_jit() rebuilt jit_native.
     let head_specs =
         unsafe { std::slice::from_raw_parts(ctx.head_specs, ctx.n_head_rels as usize) };
     for (i, spec) in head_specs.iter().enumerate() {
         let ps = unsafe { &*spec.rel };
         if let Some(native) = ps.jit_native.as_ref() {
-            let new_ptr = native.new.as_ref() as *const JitRelData as *mut JitRelData;
+            let new_ptr   = native.new.as_ref()   as *const JitRelData as *mut JitRelData;
+            let total_ptr = native.total.as_ref() as *const JitRelData as *mut JitRelData;
             unsafe { *ctx.head_rels.add(i) = new_ptr };
+            unsafe { *ctx.head_total_rels.add(i) = total_ptr };
         }
     }
 

@@ -1006,15 +1006,12 @@ impl Engine {
         // The native fn reads scan data directly from JitRelData (no packed_count/pdptr callbacks).
         // This is compiled speculatively; it will only be used if stage4_native_runtime is Some.
         #[cfg(feature = "jit-asm")]
-        let stage4_native_fn: Option<crate::jit::packed_helpers::StratumStage4Fn> = {
-            let r = self.jit.as_ref().and_then(|jit_cell| {
+        let stage4_native_fn: Option<crate::jit::packed_helpers::StratumStage4Fn> =
+            self.jit.as_ref().and_then(|jit_cell| {
                 let mut jit = jit_cell.lock().unwrap();
                 jit.var_count = self.var_count;
                 jit.compile_stratum_stage4_native(stratum_key, rules)
             });
-            eprintln!("DEBUG: after compile_stratum_stage4_native: is_some={}", r.is_some());
-            r
-        };
 
         // Step 2: build the runtime context if not yet cached
         if !self.stratum_stage4_cache.contains_key(&stratum_key) {
@@ -1053,7 +1050,7 @@ impl Engine {
     ///
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn build_stratum_stage4_runtime(&self, rules: &[&CRule]) -> Option<StratumStage4Runtime> {
+    fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule]) -> Option<StratumStage4Runtime> {
         use crate::jit::packed_helpers::{JitHeadBuf, LookupSpec, PackedJitContextV3, StratumStage4Ctx};
         use crate::jit_index::JitLookupHandle;
         use crate::relation::Relation;
@@ -1346,7 +1343,7 @@ impl Engine {
     /// TODO: compile native JIT function (Step 4)
     #[cfg(all(feature = "jit", feature = "specialized"))]
     fn build_stratum_stage4_native_runtime(
-        &self,
+        &mut self,
         rules: &[&CRule],
     ) -> Option<crate::jit::packed_helpers::StratumStage4NativeRuntime> {
         use crate::jit::packed_helpers::{
@@ -1356,11 +1353,46 @@ impl Engine {
         use crate::relation::Relation;
         use crate::specialized::PackedStorage;
 
-        let mut scan_rels_vec:   Vec<*mut JitRelData>   = Vec::new();
-        let mut total_rels_vec:  Vec<*mut JitRelData>   = Vec::new();
-        let mut head_rels_vec:   Vec<*mut JitRelData>   = Vec::new();
-        let mut scan_specs_vec:  Vec<NativeScanSpec>    = Vec::new();
-        let mut head_specs_vec:  Vec<NativeHeadSpec>    = Vec::new();
+        // Eagerly advance any packed relation that hasn't yet had `advance_jit()` called.
+        // This serves two purposes:
+        //   1. Populates `jit_native` so the `?` guards below don't return None.
+        //   2. Moves initial EDB facts from `delta` → `recent`, so the JIT's upfront
+        //      `jit_advance_native` sees `had_delta=false` and takes the cheap EDB path
+        //      instead of rebuilding the full projection a second time.
+        //
+        // Without pre-advancing, the eager init would call `build_native_projection()` and
+        // the upfront JIT advance would immediately rebuild it (double-build), adding ~50–100µs
+        // of wasted work per engine run.
+        {
+            let all_rels: Vec<String> = rules
+                .iter()
+                .flat_map(|r| {
+                    r.body.iter().filter_map(|item| {
+                        if let CBodyItem::Clause(c) = item { Some(c.relation.clone()) } else { None }
+                    })
+                    .chain(r.heads.iter().map(|h| h.relation.clone()))
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            for name in &all_rels {
+                if let Some(Relation::Packed(ps)) = self.relations.get_mut(name)
+                    && ps.jit_native.is_none()
+                {
+                    // advance_jit() with jit_native=None: moves delta→recent, builds jit_native
+                    // once from the current data.  Subsequent upfront JIT advance sees empty
+                    // delta and takes the cheap EDB path (no rebuild).
+                    ps.advance_jit();
+                }
+            }
+        }
+
+        let mut scan_rels_vec:        Vec<*mut JitRelData>   = Vec::new();
+        let mut total_rels_vec:       Vec<*mut JitRelData>   = Vec::new();
+        let mut head_rels_vec:        Vec<*mut JitRelData>   = Vec::new();
+        let mut head_total_rels_vec:  Vec<*mut JitRelData>   = Vec::new();
+        let mut scan_specs_vec:       Vec<NativeScanSpec>    = Vec::new();
+        let mut head_specs_vec:       Vec<NativeHeadSpec>    = Vec::new();
 
         for rule in rules {
             // Collect clause packed relations in order.
@@ -1402,8 +1434,10 @@ impl Engine {
                 };
                 let native = ps.jit_native.as_ref()?;
                 let ps_ptr = ps as *const PackedStorage as *mut PackedStorage;
-                let new_ptr = native.new.as_ref() as *const JitRelData as *mut JitRelData;
+                let new_ptr   = native.new.as_ref()   as *const JitRelData as *mut JitRelData;
+                let total_ptr = native.total.as_ref() as *const JitRelData as *mut JitRelData;
                 head_rels_vec.push(new_ptr);
+                head_total_rels_vec.push(total_ptr);
                 head_specs_vec.push(NativeHeadSpec { rel: ps_ptr });
             }
         }
@@ -1425,36 +1459,39 @@ impl Engine {
         let n_head_rels = head_rels_vec.len() as u32;
         let n_advance_rels = advance_rels_vec.len() as u32;
 
-        let mut scan_rels_buf:   Box<[*mut JitRelData]>   = scan_rels_vec.into_boxed_slice();
-        let mut total_rels_buf:  Box<[*mut JitRelData]>   = total_rels_vec.into_boxed_slice();
-        let mut head_rels_buf:   Box<[*mut JitRelData]>   = head_rels_vec.into_boxed_slice();
-        let     advance_rels_buf: Box<[*mut PackedStorage]> = advance_rels_vec.into_boxed_slice();
-        let     scan_specs_buf:  Box<[NativeScanSpec]>    = scan_specs_vec.into_boxed_slice();
-        let     head_specs_buf:  Box<[NativeHeadSpec]>    = head_specs_vec.into_boxed_slice();
+        let mut scan_rels_buf:         Box<[*mut JitRelData]>    = scan_rels_vec.into_boxed_slice();
+        let mut total_rels_buf:        Box<[*mut JitRelData]>    = total_rels_vec.into_boxed_slice();
+        let mut head_rels_buf:         Box<[*mut JitRelData]>    = head_rels_vec.into_boxed_slice();
+        let mut head_total_rels_buf:   Box<[*mut JitRelData]>    = head_total_rels_vec.into_boxed_slice();
+        let     advance_rels_buf:      Box<[*mut PackedStorage]> = advance_rels_vec.into_boxed_slice();
+        let     scan_specs_buf:        Box<[NativeScanSpec]>     = scan_specs_vec.into_boxed_slice();
+        let     head_specs_buf:        Box<[NativeHeadSpec]>     = head_specs_vec.into_boxed_slice();
 
         let ctx = Box::new(StratumStage4NativeCtx {
-            scan_rels:      scan_rels_buf.as_mut_ptr(),
-            total_rels:     total_rels_buf.as_mut_ptr(),
+            scan_rels:        scan_rels_buf.as_mut_ptr(),
+            total_rels:       total_rels_buf.as_mut_ptr(),
             n_scan_rels,
             _pad0: 0,
-            head_rels:      head_rels_buf.as_mut_ptr(),
+            head_rels:        head_rels_buf.as_mut_ptr(),
             n_head_rels,
             _pad1: 0,
-            advance_rels:   advance_rels_buf.as_ptr(),
+            advance_rels:     advance_rels_buf.as_ptr(),
             n_advance_rels,
             _pad2: 0,
-            scan_specs:     scan_specs_buf.as_ptr(),
-            head_specs:     head_specs_buf.as_ptr(),
+            head_total_rels:  head_total_rels_buf.as_mut_ptr(),
+            scan_specs:       scan_specs_buf.as_ptr(),
+            head_specs:       head_specs_buf.as_ptr(),
         });
 
         Some(StratumStage4NativeRuntime {
             ctx,
-            _scan_rels_buf:    scan_rels_buf,
-            _total_rels_buf:   total_rels_buf,
-            _head_rels_buf:    head_rels_buf,
-            _advance_rels_buf: advance_rels_buf,
-            _scan_specs_buf:   scan_specs_buf,
-            _head_specs_buf:   head_specs_buf,
+            _scan_rels_buf:       scan_rels_buf,
+            _total_rels_buf:      total_rels_buf,
+            _head_rels_buf:       head_rels_buf,
+            _head_total_rels_buf: head_total_rels_buf,
+            _advance_rels_buf:    advance_rels_buf,
+            _scan_specs_buf:      scan_specs_buf,
+            _head_specs_buf:      head_specs_buf,
         })
     }
 

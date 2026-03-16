@@ -823,7 +823,6 @@ impl JitCompiler {
             &rules_refs,
             self.var_count,
             packed_helpers::jit_advance_native as usize,
-            packed_helpers::packed_try_insert as usize,
         ) {
             Ok(asm_stratum) => {
                 let fn_ptr = asm_stratum.fn_ptr;

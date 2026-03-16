@@ -267,7 +267,8 @@ impl PackedStorage {
 
     /// Build a `JitNativeRelData` projection from the current state of this storage.
     ///
-    /// - `total`:  covers all tuples in `packed_data[0..count*arity]`, column indices built.
+    /// - `total`:  covers all tuples in `packed_data[0..count*arity]`, column indices built
+    ///   (skipped for sink relations since they are never probed as body clauses).
     /// - `recent`: covers only the recent tuples (gathered from `self.recent` index list).
     /// - `new`:    empty write buffer with initial capacity 64 tuples.
     #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -277,6 +278,9 @@ impl PackedStorage {
         use crate::jit::storage::{JitNativeRelData, JitRelData};
 
         let arity = self.arity;
+        // Sink relations never appear in body clauses, so JitColIndex is never probed.
+        // Skip expensive index building (sort + group) for them.
+        let build_indices = !self.jit_is_sink;
         let total_slice = &self.packed_data[0..self.count * arity.max(1)];
 
         // Gather recent tuples into a contiguous slice.
@@ -287,9 +291,12 @@ impl PackedStorage {
         }
 
         JitNativeRelData {
-            total: JitRelData::build_from_packed(total_slice, arity, true),
-            recent: JitRelData::build_from_packed(&recent_buf, arity, true),
-            new: JitRelData::new_empty(arity),
+            total: JitRelData::build_from_packed(total_slice, arity, build_indices),
+            recent: JitRelData::build_from_packed(&recent_buf, arity, build_indices),
+            // `new` must have an allocated tuple_set so the JIT can probe it inline.
+            // `build_from_packed` on an empty slice allocates a minimum-capacity (16 slots)
+            // tuple_set and a data buffer, with len=0 and cap=1.
+            new: JitRelData::build_from_packed(&[], arity, false),
         }
     }
 
@@ -549,11 +556,71 @@ impl PackedStorage {
     /// Stage 4 JIT uses `jit_recent_indices` (rebuilt by `update_jit_indices`) instead.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) fn advance_jit(&mut self) -> bool {
+        // Flush any tuples the JIT wrote to jit_native.new into this relation's delta.
+        // Takes only the `new` buffer from jit_native so we can update jit_native in-place
+        // when nothing changed (avoids a full rebuild of total + recent).
+        let new_written = if let Some(ref mut native) = self.jit_native {
+            let arity = self.arity;
+            // Swap out the `new` buffer, replacing with a fresh empty one.
+            let new_buf = std::mem::replace(
+                &mut native.new,
+                crate::jit::storage::JitRelData::build_from_packed(&[], arity, false),
+            );
+            let new_len = new_buf.len as usize;
+            if new_len > 0 {
+                if arity == 0 {
+                    // Zero-arity: the JIT wrote len=1 to signal "insert unit fact".
+                    self.insert_packed_raw(&[]);
+                } else {
+                    let data_ptr = new_buf.data;
+                    // Safety: data_ptr points to new_len * arity u32 words allocated by
+                    // jit_rel_data_grow or build_from_packed.
+                    let data = unsafe {
+                        std::slice::from_raw_parts(data_ptr, new_len * arity)
+                    };
+                    for i in 0..new_len {
+                        let tuple = &data[i * arity..(i + 1) * arity];
+                        self.insert_packed_raw(tuple);
+                    }
+                }
+                true
+            } else {
+                false
+            }
+            // new_buf drops here, freeing the old `new` JitRelData allocation.
+        } else {
+            false
+        };
+
         let had_delta = !self.delta.is_empty();
         self.recent = std::mem::take(&mut self.delta);
         // Skip recent_col_indices rebuild — JIT uses jit_recent_indices.
         self.update_jit_indices();
-        self.jit_native = Some(self.build_native_projection());
+
+        // Rebuild the native projection only when data changed.  When nothing changed
+        // (e.g. stable EDB relations after initial load), reuse total and just update recent.
+        // Only apply this optimization to EDB relations (never in any head) to avoid
+        // stale col_indices for IDB relations where total grows over time.
+        if new_written || had_delta {
+            // Data changed: full rebuild (total must include new tuples; recent is new).
+            self.jit_native = Some(self.build_native_projection());
+        } else if self.jit_is_edb {
+            if let Some(ref mut native) = self.jit_native {
+                // EDB: nothing changed; `total` is still valid; just reset `recent` (empty).
+                // Use the same build_indices setting as total so that inner probes on recent
+                // find valid (empty) JitColIndex rather than null pointers.
+                use crate::jit::storage::JitRelData;
+                let build_indices = !self.jit_is_sink;
+                native.recent = JitRelData::build_from_packed(&[], self.arity, build_indices);
+                // `new` was already reset above by the swap.
+            } else {
+                self.jit_native = Some(self.build_native_projection());
+            }
+        } else {
+            // IDB or unknown: always rebuild to ensure total is correct.
+            self.jit_native = Some(self.build_native_projection());
+        }
+
         had_delta
     }
 

@@ -49,6 +49,7 @@ use dynasmrt::x64::Assembler;
 
 use crate::compiled::{CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CUnOp};
 use crate::jit::packed_helpers::StratumStage4Fn;
+use crate::jit::storage;
 use crate::value::Value;
 
 /// A compiled stratum function produced by the asm backend.
@@ -595,13 +596,13 @@ fn emit_bind_col_value(
 
 // ─── Head emission ────────────────────────────────────────────────────────
 
-/// Build and insert all heads: inline dedup probe for duplicates, then
-/// `packed_try_insert` for new tuples.
+/// Build and insert all heads.
 ///
-/// The inline probe fast-paths the common duplicate case (no Rust call).
-/// New tuples are routed through `packed_try_insert`, which keeps the dedup
-/// table count accurate and triggers `maybe_grow` at the right time — avoiding
-/// 100%-full-table infinite-probe loops that occur when count is not maintained.
+/// Non-native path: inline dedup probe for duplicates, then `packed_try_insert`.
+///
+/// Native path (Step 5): fully inline — JitTupleSet probe for dedup, then
+/// direct write to `JitRelData.data` + JitTupleSet insert.  Growth callbacks
+/// (`jit_rel_data_grow`, `jit_tuple_set_grow`) are called only on overflow.
 #[allow(clippy::too_many_arguments)]
 fn emit_heads(
     asm: &mut Assembler,
@@ -611,10 +612,12 @@ fn emit_heads(
     max_head_arity: usize,
     pti: usize,
     var_locs: &[VarLoc],
-    // When true, load *mut PackedStorage from ctx->head_specs[rule_head_base+hi].rel
-    // instead of from rule_ctx->head_rels[hi].  head_specs is at offset 64 in NativeCtx.
+    // When true, write directly to JitRelData (head_rels[flat_hi]) without any Rust
+    // call in the common case.  CTX_SLOT holds a *mut StratumStage4NativeCtx.
     use_jit_native: bool,
     rule_head_base: usize,
+    jit_rel_data_grow_addr: usize,
+    jit_tuple_set_grow_addr: usize,
 ) -> Result<(), String> {
     for (hi, head) in heads.iter().enumerate() {
         let arity = head.args.len();
@@ -627,25 +630,263 @@ fn emit_heads(
         }
 
         if use_jit_native {
-            // Native path: load *mut PackedStorage from ctx->head_specs[flat_hi].rel.
-            // head_specs is at offset 64 in StratumStage4NativeCtx.
-            // NativeHeadSpec is 8 bytes with rel (*mut PackedStorage) at offset 0.
-            // flat_hi = rule_head_base + hi.
-            let flat_hi_i32 = ((rule_head_base + hi) * 8) as i32;
-            dynasm!(asm
-                ; mov rdi, [rbp + CTX_SLOT]        // NativeCtx*
-                ; mov rdi, [rdi + 64]              // head_specs (*const NativeHeadSpec)
-                ; mov rdi, [rdi + flat_hi_i32]     // *mut PackedStorage
-            );
+            // ── Step 5: fully inline native write path ──────────────────────────
+            //
+            // Layout refs:
+            //   StratumStage4NativeCtx:
+            //     head_rels @ 24  (*mut *mut JitRelData)
+            //   JitRelData:
+            //     data      @  0  (*mut u32)
+            //     len       @  8  (u64)
+            //     cap       @ 16  (u64)
+            //     tuple_set @ 32  (JitTupleSet embedded, 24 bytes)
+            //     arity     @ 56  (u32)
+            //   JitTupleSet (at JitRelData+32):
+            //     slots     @  0  (*mut u32)   → absolute: JitRelData+32
+            //     mask      @  8  (u64)        → absolute: JitRelData+40
+            //     len       @ 16  (u64)        → absolute: JitRelData+48
+            //
+            // flat_hi = rule_head_base + hi; head_rels[flat_hi] = *mut JitRelData (.new buf)
+            //
+            // Register protocol:
+            //   rdi = *mut JitRelData (reloaded after any call)
+            //   r8  = tuple_set.slots (*mut u32)
+            //   r9  = tuple_set.mask (u64)
+            //   r10 = probe slot index (u64)
+            //   rdx = hash_tag (u32; non-zero)
+            //   rsi, rcx, rax = scratch
+
+            let flat_hi = rule_head_base + hi;
+            let flat_hi_i32 = (flat_hi * 8) as i32;
+
             if arity == 0 {
-                dynasm!(asm; xor rsi, rsi; xor edx, edx);
-            } else {
+                // Zero-arity head: set new.len to 1 if not already 1 (idempotent).
+                // No tuple_set probe needed — arity-0 has exactly one possible fact.
+                // JitRelData.len @ 8; if already 1, skip write.
+                let head_done_0 = asm.new_dynamic_label();
                 dynasm!(asm
-                    ; lea rsi, [rbp + t0_off]
-                    ; mov edx, arity as i32
+                    ; mov rdi, [rbp + CTX_SLOT]        // NativeCtx*
+                    ; mov rdi, [rdi + 24]              // head_rels
+                    ; mov rdi, [rdi + flat_hi_i32]     // *mut JitRelData
+                    ; mov rax, [rdi + 8]               // len
+                    ; test rax, rax
+                    ; jnz =>head_done_0                // if len != 0 → already inserted
+                    ; mov rax, 1i32
+                    ; mov [rdi + 8], rax               // set len = 1
+                    ; =>head_done_0
+                );
+                continue;
+            }
+
+            let head_done = asm.new_dynamic_label();
+            let write_path = asm.new_dynamic_label();
+            let stride = (arity + 1) as i32;
+
+            // ── 1. Compute tuple hash (shared for both probes) ───────────────────
+            //   h = 0x9e3779b9; for each word w: h = h*0x9e3779b9 + w; if h==0: h=1
+            dynasm!(asm; mov edx, 0x9e3779b9u32 as i32);
+            for col in 0..arity {
+                dynasm!(asm
+                    ; imul edx, edx, 0x9e3779b9u32 as i32
+                    ; add edx, [rbp + head_col_slot(var_count, max_head_arity, col)]
                 );
             }
-            call_abs!(asm, pti);
+            {
+                let hash_nonzero = asm.new_dynamic_label();
+                dynasm!(asm; test edx, edx; jnz =>hash_nonzero; mov edx, 1; =>hash_nonzero);
+            }
+            // rdx = hash_tag (non-zero)
+
+            // ── 2a. Cross-iteration dedup: probe total.tuple_set ─────────────────
+            //   head_total_rels is at offset 56 in StratumStage4NativeCtx.
+            //   total.tuple_set.slots @ JitRelData+32, mask @ JitRelData+40
+            {
+                dynasm!(asm
+                    ; mov rdi, [rbp + CTX_SLOT]        // NativeCtx*
+                    ; mov rdi, [rdi + 56]              // head_total_rels (offset 56)
+                    ; mov rdi, [rdi + flat_hi_i32]     // *mut JitRelData (total)
+                    ; mov r8, [rdi + 32]               // total.tuple_set.slots
+                    ; mov r9, [rdi + 40]               // total.tuple_set.mask
+                    ; mov r10, rdx                     // slot = hash & mask
+                    ; and r10, r9
+                );
+                let total_probe_lp   = asm.new_dynamic_label();
+                let total_probe_next = asm.new_dynamic_label();
+                let total_probe_miss = asm.new_dynamic_label();
+                dynasm!(asm; =>total_probe_lp);
+                dynasm!(asm; imul rcx, r10, stride);
+                dynasm!(asm
+                    ; mov eax, [r8 + rcx*4]
+                    ; test eax, eax
+                    ; jz =>total_probe_miss    // empty → not in total
+                    ; cmp eax, edx
+                    ; jne =>total_probe_next   // hash mismatch
+                );
+                for col in 0..arity {
+                    let field_off = ((1 + col) as i32) * 4;
+                    dynasm!(asm
+                        ; mov eax, [r8 + rcx*4 + field_off]
+                        ; cmp eax, [rbp + head_col_slot(var_count, max_head_arity, col)]
+                        ; jne =>total_probe_next
+                    );
+                }
+                // Found in total → cross-iteration duplicate, skip
+                dynasm!(asm; jmp =>head_done);
+                dynasm!(asm; =>total_probe_next);
+                dynasm!(asm; inc r10; and r10, r9; jmp =>total_probe_lp);
+                dynasm!(asm; =>total_probe_miss);
+                // Not in total → check new (within-iteration dedup)
+            }
+
+            // ── 2b. Within-iteration dedup: probe new.tuple_set ──────────────────
+            //   head_rels at offset 24 in StratumStage4NativeCtx.
+            //   Reuse r10 as slot (recompute from hash & mask of new.tuple_set).
+            {
+                dynasm!(asm
+                    ; mov rdi, [rbp + CTX_SLOT]        // NativeCtx*
+                    ; mov rdi, [rdi + 24]              // head_rels (offset 24)
+                    ; mov rdi, [rdi + flat_hi_i32]     // *mut JitRelData (new)
+                    ; mov r8, [rdi + 32]               // new.tuple_set.slots
+                    ; mov r9, [rdi + 40]               // new.tuple_set.mask
+                    ; mov r10, rdx                     // slot = hash & mask
+                    ; and r10, r9
+                );
+                let probe_lp   = asm.new_dynamic_label();
+                let probe_next = asm.new_dynamic_label();
+                dynasm!(asm; =>probe_lp);
+                dynasm!(asm; imul rcx, r10, stride);
+                dynasm!(asm
+                    ; mov eax, [r8 + rcx*4]
+                    ; test eax, eax
+                    ; jz =>write_path          // empty → not found, proceed to write
+                    ; cmp eax, edx
+                    ; jne =>probe_next
+                );
+                for col in 0..arity {
+                    let field_off = ((1 + col) as i32) * 4;
+                    dynasm!(asm
+                        ; mov eax, [r8 + rcx*4 + field_off]
+                        ; cmp eax, [rbp + head_col_slot(var_count, max_head_arity, col)]
+                        ; jne =>probe_next
+                    );
+                }
+                // All match → within-iteration duplicate, skip
+                dynasm!(asm; jmp =>head_done);
+                dynasm!(asm; =>probe_next);
+                dynasm!(asm; inc r10; and r10, r9; jmp =>probe_lp);
+                // (write_path follows below — rdi still = *mut JitRelData (new))
+            }
+
+            // ── 6. write_path: new tuple — write to JitRelData.data + tuple_set ──
+            dynasm!(asm; =>write_path);
+            // r10 = empty slot index (save across grow calls by using callee-saved pattern)
+            // rdx = hash_tag
+            // rdi = *mut JitRelData
+            // r8  = slots ptr (may need reload after jit_rel_data_grow if data changed)
+            // r9  = mask
+
+            // 6a. Check capacity; call jit_rel_data_grow if full
+            //   len @ rdi+8, cap @ rdi+16
+            {
+                let skip_grow = asm.new_dynamic_label();
+                dynasm!(asm
+                    ; mov rsi, [rdi + 8]    // len
+                    ; mov rcx, [rdi + 16]   // cap
+                    ; cmp rsi, rcx
+                    ; jne =>skip_grow
+                    // Save r10 (slot) and rdx (hash) across the grow call.
+                    // r10 and rdx are caller-saved; push/pop around call.
+                    ; push r10
+                    ; push rdx
+                    // rdi already = *mut JitRelData (first arg)
+                    ; mov rax, QWORD jit_rel_data_grow_addr as _
+                    ; call rax
+                    // Restore
+                    ; pop rdx
+                    ; pop r10
+                    // Reload rdi (clobbered by call)
+                    ; mov rdi, [rbp + CTX_SLOT]
+                    ; mov rdi, [rdi + 24]
+                    ; mov rdi, [rdi + flat_hi_i32]
+                    ; =>skip_grow
+                );
+            }
+
+            // 6b. Write arity words to data[len * arity]
+            //   data @ rdi+0, len @ rdi+8 (reload after possible grow)
+            dynasm!(asm
+                ; mov rsi, [rdi + 8]         // len (reload)
+                ; mov rcx, [rdi]             // data ptr
+                ; imul rax, rsi, (arity * 4) as i32  // byte offset = len * arity * 4
+                ; add rcx, rax               // write_ptr = data + len*arity*4
+            );
+            for col in 0..arity {
+                dynasm!(asm
+                    ; mov eax, [rbp + head_col_slot(var_count, max_head_arity, col)]
+                    ; mov [rcx + (col * 4) as i32], eax
+                );
+            }
+            // Increment len (rdi = *mut JitRelData, len @ offset 8)
+            dynasm!(asm
+                ; mov rax, [rdi + 8]
+                ; inc rax
+                ; mov [rdi + 8], rax
+            );
+
+            // 6c. Insert into JitTupleSet at the empty slot (r10 = slot, rdx = hash_tag)
+            //   slots ptr may be stale if jit_rel_data_grow moved data — but JitRelData
+            //   itself didn't move, so reload r8/r9 from rdi+32/rdi+40.
+            dynasm!(asm
+                ; mov r8, [rdi + 32]   // reload slots ptr (in case grow ran)
+                ; mov r9, [rdi + 40]   // reload mask
+            );
+            // Write slot: slots[r10*stride + 0] = hash_tag; slots[r10*stride + k+1] = col[k]
+            dynasm!(asm; imul rcx, r10, stride);  // rcx = r10 * stride (word index)
+            dynasm!(asm; mov [r8 + rcx*4], edx);  // write hash_tag
+            for col in 0..arity {
+                let field_off = ((1 + col) as i32) * 4;
+                dynasm!(asm
+                    ; mov eax, [rbp + head_col_slot(var_count, max_head_arity, col)]
+                    ; mov [r8 + rcx*4 + field_off], eax
+                );
+            }
+            // Increment tuple_set.len (JitRelData+48 = JitRelData.tuple_set.len)
+            dynasm!(asm
+                ; mov rax, [rdi + 48]
+                ; inc rax
+                ; mov [rdi + 48], rax
+            );
+
+            // 6d. Load-factor check: if (new_len)*10 > (mask+1)*7 → call jit_tuple_set_grow
+            //   new_len = tuple_set.len (just incremented), mask = r9
+            //   (mask+1) is a power of two → cap_in_slots
+            //   condition: len*10 > cap*7  →  len*10 > (mask+1)*7
+            {
+                let no_ts_grow = asm.new_dynamic_label();
+                dynasm!(asm
+                    ; mov rax, [rdi + 48]         // tuple_set.len (JitRelData+48)
+                    ; imul rax, rax, 10i8
+                    ; lea rcx, [r9 + 1]           // cap = mask + 1
+                    ; imul rcx, rcx, 7i8
+                    ; cmp rax, rcx
+                    ; jle =>no_ts_grow
+                    // call jit_tuple_set_grow(ts: *mut JitTupleSet, arity: u32)
+                    // ts = rdi + 32, arity = compile-time constant
+                    ; push r10
+                    ; push rdx
+                    ; lea rdi, [rdi + 32]          // rdi = &JitRelData.tuple_set
+                    ; mov esi, arity as i32
+                    ; mov rax, QWORD jit_tuple_set_grow_addr as _
+                    ; call rax
+                    ; pop rdx
+                    ; pop r10
+                    ; =>no_ts_grow
+                );
+                // Note: after jit_tuple_set_grow, r8/r9 are stale, but we don't need them
+                // again (insert is already done; the grow only rehashes existing entries).
+            }
+
+            dynasm!(asm; =>head_done);
             continue;
         }
 
@@ -775,6 +1016,10 @@ struct EmitParams<'a> {
     /// instead of calling packed_count/packed_data_ptr/packed_recent_ptr.
     /// CTX_SLOT holds a *mut StratumStage4NativeCtx.
     use_jit_native: bool,
+    /// Address of `jit_rel_data_grow` (native path only).
+    jit_rel_data_grow_addr: usize,
+    /// Address of `jit_tuple_set_grow` (native path only).
+    jit_tuple_set_grow_addr: usize,
 }
 
 /// Emit code for clause `level` and all deeper clauses.
@@ -881,7 +1126,7 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs)?;
                     dynasm!(asm; test eax, eax; jz =>outer_continue);
                 }
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base)?;
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
             } else {
                 emit_clause_level(asm, p, 1, outer_exit, outer_continue)?;
             }
@@ -946,7 +1191,7 @@ fn emit_clause_level(
                 emit_expr(asm, expr, p.var_locs)?;
                 dynasm!(asm; test eax, eax; jz =>outer_continue);
             }
-            emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base)?;
+            emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
         } else {
             // Multi-clause: recurse into level 1.
             // The level-1 code is emitted inline here; it ends by jumping to
@@ -1021,7 +1266,7 @@ fn emit_clause_level(
                         emit_expr(asm, expr, p.var_locs)?;
                         dynasm!(asm; test eax, eax; jz =>when_exhausted);
                     }
-                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base)?;
+                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
                     dynasm!(asm; jmp =>when_exhausted);
                 } else {
                     emit_clause_level(asm, p, level + 1, outer_exit, when_exhausted)?;
@@ -1312,7 +1557,7 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base)?;
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
                 if is_col_value && clause.fresh_cols.is_empty() {
                     dynasm!(asm; jmp =>when_exhausted);
                 }
@@ -1415,7 +1660,7 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base)?;
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
             } else {
                 let sub_exhausted = asm.new_dynamic_label();
                 emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
@@ -1458,6 +1703,8 @@ fn emit_rule_variant(
     rule_handle_base: usize,
     rule_head_base: usize,
     use_jit_native: bool,
+    jit_rel_data_grow_addr: usize,
+    jit_tuple_set_grow_addr: usize,
 ) -> Result<(), String> {
     let variant_exit = asm.new_dynamic_label();
 
@@ -1485,7 +1732,7 @@ fn emit_rule_variant(
             emit_expr(asm, expr, &var_locs)?;
             dynasm!(asm; test eax, eax; jz =>variant_exit);
         }
-        emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti, &var_locs, use_jit_native, rule_head_base)?;
+        emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti, &var_locs, use_jit_native, rule_head_base, jit_rel_data_grow_addr, jit_tuple_set_grow_addr)?;
         dynasm!(asm; =>variant_exit);
         return Ok(());
     }
@@ -1508,6 +1755,8 @@ fn emit_rule_variant(
         rule_handle_base,
         rule_head_base,
         use_jit_native,
+        jit_rel_data_grow_addr,
+        jit_tuple_set_grow_addr,
     };
 
     emit_clause_level(asm, &p, 0, variant_exit, variant_exit)?;
@@ -1539,6 +1788,8 @@ fn codegen_stratum_asm_inner(
     packed_data_ptr_addr: usize,
     packed_recent_ptr_addr: usize,
     use_jit_native: bool,
+    jit_rel_data_grow_addr: usize,
+    jit_tuple_set_grow_addr: usize,
 ) -> Result<AsmStratum, String> {
     // ── Eligibility ──────────────────────────────────────────────────────────
     for (ri, (clauses, heads, conds)) in rules.iter().enumerate() {
@@ -1649,6 +1900,8 @@ fn codegen_stratum_asm_inner(
             rule_handle_bases[rule_i],
             rule_head_bases[rule_i],
             use_jit_native,
+            jit_rel_data_grow_addr,
+            jit_tuple_set_grow_addr,
         )?;
     }
 
@@ -1671,6 +1924,8 @@ fn codegen_stratum_asm_inner(
                 rule_handle_bases[rule_i],
                 rule_head_bases[rule_i],
                 use_jit_native,
+                jit_rel_data_grow_addr,
+                jit_tuple_set_grow_addr,
             )?;
         }
     }
@@ -1716,27 +1971,32 @@ pub fn codegen_stratum_asm(
         packed_data_ptr_addr,
         packed_recent_ptr_addr,
         false,
+        0, // jit_rel_data_grow_addr unused in non-native path
+        0, // jit_tuple_set_grow_addr unused in non-native path
     )
 }
 
-/// Native entry point: reads scan data directly from `JitRelData` fields (Step 4).
+/// Native entry point: reads scan data and writes heads directly via `JitRelData` fields
+/// (Steps 4 + 5).
 ///
 /// The generated function takes `*mut StratumStage4NativeCtx` as its argument.
 /// `advance_native_addr` is the address of `jit_advance_native`.
-/// `packed_try_insert_addr` is still used for head insertion (write side; Step 5 will replace this).
+/// Head writes are fully inline: `jit_rel_data_grow` and `jit_tuple_set_grow` are called
+/// only on capacity overflow; no Rust call occurs in the common case.
 pub fn codegen_stratum_asm_native(
     rules: &[(&[CClause], &[CHeadClause], &[CExpr])],
     var_count: usize,
     advance_native_addr: usize,
-    packed_try_insert_addr: usize,
 ) -> Result<AsmStratum, String> {
     codegen_stratum_asm_inner(
         rules, var_count,
         advance_native_addr,
-        packed_try_insert_addr,
+        0, // packed_try_insert_addr unused in native path (Step 5)
         0, // packed_count_addr unused in native path
         0, // packed_data_ptr_addr unused in native path
         0, // packed_recent_ptr_addr unused in native path
         true,
+        storage::jit_rel_data_grow as usize,
+        storage::jit_tuple_set_grow as usize,
     )
 }
