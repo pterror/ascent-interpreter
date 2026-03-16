@@ -1033,7 +1033,7 @@ fn gen_full_scan_v3(
     ptr_type: cranelift_codegen::ir::Type,
     next_var: &mut usize,
     conditions: &[&CExpr],
-    _is_recursive: bool,
+    is_recursive: bool,
     precomputed_packed_bufs: &[Option<CValue>],
     tuple_sets_ptr: Option<CValue>,
     jit_rels: Option<CValue>,
@@ -1048,7 +1048,10 @@ fn gen_full_scan_v3(
     // jit_native.recent, which is a contiguous buffer of recent tuples.
     // We iterate directly (index i = tuple index in recent), eliminating the
     // packed_recent_ptr + recent_ptr[i] indirection.
-    let (count, cached_data_ptr_for_direct) = if let Some(jrel_arr) = jit_rels {
+    // jit_rels entries for IDB (recursive) relations have null pointers (no lean init).
+    // Fall back to callbacks for those clauses to avoid per-iteration rebuild cost.
+    let effective_jit_rels = if is_recursive { None } else { jit_rels };
+    let (count, cached_data_ptr_for_direct) = if let Some(jrel_arr) = effective_jit_rels {
         let use_recent_bit = use_recent as usize;
         let jrel_byte_off = ((clause_offset * 2 + use_recent_bit) as i64) * 8;
         let jrel_arr_addr = if jrel_byte_off == 0 {
@@ -1444,10 +1447,10 @@ fn gen_index_scan_v3(
         } else {
             // Tuple-index linked-list (arity > 2): v0 is tuple_idx.
             let tuple_idx = builder.ins().uextend(ptr_type, v0);
-            // Get data pointer. Stage 4: load from jit_rels[clause_offset*2+use_recent].data (@ 0).
-            // Stage 3: call packed_data_ptr callback. Recursive head insert may have reallocated
-            // on Stage 3; on Stage 4 the JitRelData.data pointer is refreshed each iteration.
-            let packed_buf = if let Some(jrel_arr) = jit_rels {
+            // Get data pointer. Stage 4 EDB: load from jit_rels[clause_offset*2+use_recent].data (@ 0).
+            // IDB (is_recursive=true): jit_rels has a null entry — fall back to packed_data_ptr.
+            // Stage 3: call packed_data_ptr callback always.
+            let packed_buf = if let Some(jrel_arr) = if is_recursive { None } else { jit_rels } {
                 let use_recent_bit = use_recent as usize;
                 let jrel_byte_off = ((clause_offset * 2 + use_recent_bit) as i64) * 8;
                 let jrel_arr_addr = if jrel_byte_off == 0 {

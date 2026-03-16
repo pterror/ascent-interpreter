@@ -1113,14 +1113,17 @@ impl Engine {
         }
 
         // For the Cranelift direct-load path (Step 6): initialize lean jit_native projections
-        // on all body-clause relations so jit_rel_ptrs can point into jit_native.total / .recent.
+        // on EDB (jit_is_edb=true) body-clause relations so jit_rel_ptrs can point into
+        // jit_native.total / .recent.  IDB relations are skipped: their per-iteration
+        // recent-JitRelData rebuild costs more than the callback savings.
         // Only when native_fn_available=false (i.e. the asm path won't manage jit_native for us).
         if !native_fn_available {
             for rule in rules {
                 for item in &rule.body {
                     if let CBodyItem::Clause(c) = item
                         && let Some(Relation::Packed(ps)) = self.relations.get_mut(&c.relation)
-                        && ps.jit_native.is_none() {
+                        && ps.jit_native.is_none()
+                        && ps.jit_is_edb {
                         ps.jit_native = Some(ps.build_native_projection_lean());
                     }
                 }
