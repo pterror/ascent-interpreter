@@ -338,6 +338,9 @@ struct StratumStage4Runtime {
     _head_write_bufs: Box<[*mut crate::jit::packed_helpers::JitHeadBuf]>,
     /// Flat pointer array: head_rel_ptrs in ctx.
     _head_rel_ptrs: Box<[*mut crate::specialized::PackedStorage]>,
+    /// Optional native fast-path runtime (Step 3). `None` if any relation lacks `jit_native`.
+    /// TODO: compile native JIT function (Step 4)
+    stage4_native_runtime: Option<crate::jit::packed_helpers::StratumStage4NativeRuntime>,
 }
 
 #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -1277,6 +1280,9 @@ impl Engine {
             _pad4: 0,
         });
 
+        // Build the native runtime (opt-in fast path; None if any relation lacks jit_native).
+        let native_runtime = self.build_stratum_stage4_native_runtime(rules);
+
         Some(StratumStage4Runtime {
             stage4_ctx,
             _per_rule_clause_rels: per_rule_clause_rels,
@@ -1293,6 +1299,131 @@ impl Engine {
             _head_buf_data: head_buf_data,
             _head_write_bufs: head_write_bufs_box,
             _head_rel_ptrs: head_rel_ptrs_box,
+            stage4_native_runtime: native_runtime,
+        })
+    }
+
+    /// Build the native runtime context for Stage 4 stratum execution.
+    ///
+    /// Returns `None` if any clause or head relation lacks `jit_native` (i.e., `advance_jit()`
+    /// has not yet been called), or if any relation is not packed.
+    ///
+    /// The returned `StratumStage4NativeRuntime` holds the `StratumStage4NativeCtx` and
+    /// all backing allocations.  `jit_advance_native` refreshes the pointer buffers
+    /// after each `advance_jit()` call.
+    ///
+    /// TODO: compile native JIT function (Step 4)
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    fn build_stratum_stage4_native_runtime(
+        &self,
+        rules: &[&CRule],
+    ) -> Option<crate::jit::packed_helpers::StratumStage4NativeRuntime> {
+        use crate::jit::packed_helpers::{
+            NativeHeadSpec, NativeScanSpec, StratumStage4NativeCtx, StratumStage4NativeRuntime,
+        };
+        use crate::jit::storage::JitRelData;
+        use crate::relation::Relation;
+        use crate::specialized::PackedStorage;
+
+        let mut scan_rels_vec:   Vec<*mut JitRelData>   = Vec::new();
+        let mut total_rels_vec:  Vec<*mut JitRelData>   = Vec::new();
+        let mut head_rels_vec:   Vec<*mut JitRelData>   = Vec::new();
+        let mut scan_specs_vec:  Vec<NativeScanSpec>    = Vec::new();
+        let mut head_specs_vec:  Vec<NativeHeadSpec>    = Vec::new();
+
+        for rule in rules {
+            // Collect clause packed relations in order.
+            let rule_clauses: Vec<&crate::compiled::CClause> = rule
+                .body
+                .iter()
+                .filter_map(|item| match item {
+                    CBodyItem::Clause(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+
+            for clause in &rule_clauses {
+                let ps = match self.relations.get(&clause.relation)? {
+                    Relation::Packed(p) => p,
+                    Relation::Generic(_) => return None,
+                };
+                let native = ps.jit_native.as_ref()?;
+                let ps_ptr = ps as *const PackedStorage as *mut PackedStorage;
+
+                // use_recent = 0 (total scan)
+                let total_ptr = native.total.as_ref() as *const JitRelData as *mut JitRelData;
+                scan_rels_vec.push(total_ptr);
+                total_rels_vec.push(total_ptr);
+                scan_specs_vec.push(NativeScanSpec { rel: ps_ptr, use_recent: 0, _pad: 0 });
+
+                // use_recent = 1 (recent scan)
+                let recent_ptr = native.recent.as_ref() as *const JitRelData as *mut JitRelData;
+                scan_rels_vec.push(recent_ptr);
+                total_rels_vec.push(total_ptr);
+                scan_specs_vec.push(NativeScanSpec { rel: ps_ptr, use_recent: 1, _pad: 0 });
+            }
+
+            // Collect head packed relations.
+            for head in &rule.heads {
+                let ps = match self.relations.get(&head.relation)? {
+                    Relation::Packed(p) => p,
+                    Relation::Generic(_) => return None,
+                };
+                let native = ps.jit_native.as_ref()?;
+                let ps_ptr = ps as *const PackedStorage as *mut PackedStorage;
+                let new_ptr = native.new.as_ref() as *const JitRelData as *mut JitRelData;
+                head_rels_vec.push(new_ptr);
+                head_specs_vec.push(NativeHeadSpec { rel: ps_ptr });
+            }
+        }
+
+        // All unique PackedStorage relations for advance.
+        let mut advance_set: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let mut advance_rels_vec: Vec<*mut PackedStorage> = Vec::new();
+        for (_, rel) in self.relations.iter() {
+            if let Relation::Packed(ps) = rel {
+                let ptr = ps as *const PackedStorage as *mut PackedStorage;
+                let addr = ptr as usize;
+                if advance_set.insert(addr) {
+                    advance_rels_vec.push(ptr);
+                }
+            }
+        }
+
+        let n_scan_rels = scan_rels_vec.len() as u32;
+        let n_head_rels = head_rels_vec.len() as u32;
+        let n_advance_rels = advance_rels_vec.len() as u32;
+
+        let mut scan_rels_buf:   Box<[*mut JitRelData]>   = scan_rels_vec.into_boxed_slice();
+        let mut total_rels_buf:  Box<[*mut JitRelData]>   = total_rels_vec.into_boxed_slice();
+        let mut head_rels_buf:   Box<[*mut JitRelData]>   = head_rels_vec.into_boxed_slice();
+        let     advance_rels_buf: Box<[*mut PackedStorage]> = advance_rels_vec.into_boxed_slice();
+        let     scan_specs_buf:  Box<[NativeScanSpec]>    = scan_specs_vec.into_boxed_slice();
+        let     head_specs_buf:  Box<[NativeHeadSpec]>    = head_specs_vec.into_boxed_slice();
+
+        let ctx = Box::new(StratumStage4NativeCtx {
+            scan_rels:      scan_rels_buf.as_mut_ptr(),
+            total_rels:     total_rels_buf.as_mut_ptr(),
+            n_scan_rels,
+            _pad0: 0,
+            head_rels:      head_rels_buf.as_mut_ptr(),
+            n_head_rels,
+            _pad1: 0,
+            advance_rels:   advance_rels_buf.as_ptr(),
+            n_advance_rels,
+            _pad2: 0,
+            scan_specs:     scan_specs_buf.as_ptr(),
+            head_specs:     head_specs_buf.as_ptr(),
+        });
+
+        Some(StratumStage4NativeRuntime {
+            ctx,
+            _scan_rels_buf:    scan_rels_buf,
+            _total_rels_buf:   total_rels_buf,
+            _head_rels_buf:    head_rels_buf,
+            _advance_rels_buf: advance_rels_buf,
+            _scan_specs_buf:   scan_specs_buf,
+            _head_specs_buf:   head_specs_buf,
         })
     }
 

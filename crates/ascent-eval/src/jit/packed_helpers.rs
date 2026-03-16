@@ -9,7 +9,7 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ptr;
 
-use crate::jit::storage;
+use crate::jit::storage::{self, JitRelData};
 use crate::jit_index::{JitDedupHandle, JitLookupHandle};
 use crate::specialized::PackedStorage;
 
@@ -546,6 +546,181 @@ pub unsafe extern "C" fn jit_flush_head_bufs(ctx: *mut StratumStage4Ctx) {
         }
         buf.len = 0;
     }
+}
+
+// ─── Stage 4 native: JitRelData-direct hot path ──────────────────────────────
+
+/// Spec for one slot in the `scan_rels` / `total_rels` buffer.
+///
+/// Used by `jit_advance_native` to refresh stale `*mut JitRelData` pointers
+/// after `advance_jit()` rebuilds `PackedStorage::jit_native`.
+///
+/// repr(C) layout (16 bytes on 64-bit):
+///   offset  0: rel        *mut PackedStorage  (8 bytes)
+///   offset  8: use_recent u32                 (4 bytes; non-zero = recent)
+///   offset 12: _pad       u32
+#[repr(C)]
+pub struct NativeScanSpec {
+    pub rel: *mut PackedStorage,
+    pub use_recent: u32,
+    pub _pad: u32,
+}
+
+unsafe impl Send for NativeScanSpec {}
+unsafe impl Sync for NativeScanSpec {}
+
+/// Spec for one slot in the `head_rels` buffer.
+///
+/// repr(C) layout (8 bytes on 64-bit):
+///   offset 0: rel *mut PackedStorage  (8 bytes)
+#[repr(C)]
+pub struct NativeHeadSpec {
+    pub rel: *mut PackedStorage,
+}
+
+unsafe impl Send for NativeHeadSpec {}
+unsafe impl Sync for NativeHeadSpec {}
+
+/// Context for the JIT-native Stage 4 hot path.
+///
+/// All clause scan sources and head write targets are `JitRelData` pointers.
+/// The `scan_rels` and `head_rels` buffers are refreshed by `jit_advance_native`
+/// after each `advance_jit()` call.
+///
+/// The C-visible region ends at offset 56. Fields beyond that are private
+/// bookkeeping used by `jit_advance_native` and are NOT accessed by JIT code.
+///
+/// repr(C) layout (64-bit):
+///   offset  0: scan_rels      *mut *mut JitRelData    (8 bytes) — mutable buffer, refreshed each iter
+///   offset  8: total_rels     *mut *mut JitRelData    (8 bytes) — mutable buffer, refreshed each iter
+///   offset 16: n_scan_rels    u32                     (4 bytes)
+///   offset 20: _pad0          u32
+///   offset 24: head_rels      *mut *mut JitRelData    (8 bytes) — mutable buffer, refreshed each iter
+///   offset 32: n_head_rels    u32                     (4 bytes)
+///   offset 36: _pad1          u32
+///   offset 40: advance_rels   *const *mut PackedStorage (8 bytes)
+///   offset 48: n_advance_rels u32                     (4 bytes)
+///   offset 52: _pad2          u32
+///   -- private (not JIT-visible) --
+///   scan_specs  *const NativeScanSpec  (n_scan_rels entries)
+///   head_specs  *const NativeHeadSpec  (n_head_rels entries)
+#[repr(C)]
+pub struct StratumStage4NativeCtx {
+    /// Mutable flat array: `scan_rels[rule_handle_start + clause_i * 2 + use_recent]`
+    /// = `*mut JitRelData` to scan. Refreshed by `jit_advance_native` each iteration.
+    pub scan_rels: *mut *mut JitRelData,      // @ 0
+    /// Parallel to scan_rels: total-version `JitRelData` for existence probes.
+    pub total_rels: *mut *mut JitRelData,     // @ 8
+    /// Number of entries in scan_rels / total_rels.
+    pub n_scan_rels: u32,                     // @ 16
+    pub _pad0: u32,                           // @ 20
+    /// Mutable flat array: `head_rels[rule_head_start + head_i]` = `*mut JitRelData` to write.
+    /// Refreshed by `jit_advance_native` each iteration.
+    pub head_rels: *mut *mut JitRelData,      // @ 24
+    /// Total number of head slots.
+    pub n_head_rels: u32,                     // @ 32
+    pub _pad1: u32,                           // @ 36
+    /// All relations for advance: `advance_rels[i]` = `*mut PackedStorage`.
+    pub advance_rels: *const *mut PackedStorage, // @ 40
+    pub n_advance_rels: u32,                  // @ 48
+    pub _pad2: u32,                           // @ 52
+    // ── private: not JIT-visible ────────────────────────────────────────────
+    /// Parallel to scan_rels / total_rels: tells `jit_advance_native` which
+    /// `PackedStorage` and `use_recent` flag maps to each slot so the buffer
+    /// can be refreshed after `advance_jit()` rebuilds `jit_native`.
+    pub scan_specs: *const NativeScanSpec,
+    /// Parallel to head_rels: tells `jit_advance_native` which `PackedStorage`
+    /// maps to each head slot so `head_rels[i]` can be refreshed.
+    pub head_specs: *const NativeHeadSpec,
+}
+
+unsafe impl Send for StratumStage4NativeCtx {}
+unsafe impl Sync for StratumStage4NativeCtx {}
+
+/// Type alias for the JIT-native Stage 4 function pointer.
+#[allow(dead_code)]
+pub type StratumStage4NativeFn = unsafe extern "C" fn(*mut StratumStage4NativeCtx);
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use std::mem::offset_of;
+    assert!(offset_of!(StratumStage4NativeCtx, scan_rels) == 0);
+    assert!(offset_of!(StratumStage4NativeCtx, total_rels) == 8);
+    assert!(offset_of!(StratumStage4NativeCtx, n_scan_rels) == 16);
+    assert!(offset_of!(StratumStage4NativeCtx, head_rels) == 24);
+    assert!(offset_of!(StratumStage4NativeCtx, n_head_rels) == 32);
+    assert!(offset_of!(StratumStage4NativeCtx, advance_rels) == 40);
+    assert!(offset_of!(StratumStage4NativeCtx, n_advance_rels) == 48);
+};
+
+/// Pinned runtime data keeping all backing allocations alive for a native Stage 4 context.
+#[allow(dead_code)]
+pub struct StratumStage4NativeRuntime {
+    pub ctx: Box<StratumStage4NativeCtx>,
+    // Keep all the Boxes alive so pointers remain valid:
+    pub(crate) _scan_rels_buf:    Box<[*mut JitRelData]>,
+    pub(crate) _total_rels_buf:   Box<[*mut JitRelData]>,
+    pub(crate) _head_rels_buf:    Box<[*mut JitRelData]>,
+    pub(crate) _advance_rels_buf: Box<[*mut PackedStorage]>,
+    pub(crate) _scan_specs_buf:   Box<[NativeScanSpec]>,
+    pub(crate) _head_specs_buf:   Box<[NativeHeadSpec]>,
+}
+
+/// Called from JIT once per fixpoint iteration.
+///
+/// Advances all `PackedStorage` relations via `advance_jit()` (which also rebuilds
+/// `jit_native`), then refreshes the `scan_rels`, `total_rels`, and `head_rels`
+/// pointer buffers so JIT code on the next iteration sees valid `JitRelData` pointers.
+///
+/// Returns 1 if any relation changed, 0 otherwise.
+///
+/// # Safety
+/// `ctx` must point to a valid `StratumStage4NativeCtx` with all sub-pointers valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_advance_native(ctx: *mut StratumStage4NativeCtx) -> u8 {
+    let ctx = unsafe { &mut *ctx };
+
+    // Advance all relations; advance_jit() rebuilds jit_native on each.
+    let advance_slice =
+        unsafe { std::slice::from_raw_parts(ctx.advance_rels, ctx.n_advance_rels as usize) };
+    let mut changed = false;
+    for &rel_ptr in advance_slice {
+        let rel = unsafe { &mut *rel_ptr };
+        if rel.advance_jit() {
+            changed = true;
+        }
+    }
+
+    // Refresh scan_rels and total_rels: jit_native was just rebuilt.
+    let scan_specs =
+        unsafe { std::slice::from_raw_parts(ctx.scan_specs, ctx.n_scan_rels as usize) };
+    for (i, spec) in scan_specs.iter().enumerate() {
+        let ps = unsafe { &*spec.rel };
+        if let Some(native) = ps.jit_native.as_ref() {
+            let jit_rel_ptr = if spec.use_recent != 0 {
+                native.recent.as_ref() as *const JitRelData as *mut JitRelData
+            } else {
+                native.total.as_ref() as *const JitRelData as *mut JitRelData
+            };
+            unsafe { *ctx.scan_rels.add(i) = jit_rel_ptr };
+            // total_rels always points at the total version.
+            let total_ptr = native.total.as_ref() as *const JitRelData as *mut JitRelData;
+            unsafe { *ctx.total_rels.add(i) = total_ptr };
+        }
+    }
+
+    // Refresh head_rels: new JitRelData for writes was created by advance_jit().
+    let head_specs =
+        unsafe { std::slice::from_raw_parts(ctx.head_specs, ctx.n_head_rels as usize) };
+    for (i, spec) in head_specs.iter().enumerate() {
+        let ps = unsafe { &*spec.rel };
+        if let Some(native) = ps.jit_native.as_ref() {
+            let new_ptr = native.new.as_ref() as *const JitRelData as *mut JitRelData;
+            unsafe { *ctx.head_rels.add(i) = new_ptr };
+        }
+    }
+
+    u8::from(changed)
 }
 
 /// Advance all packed relations and refresh all JIT lookup handles.
