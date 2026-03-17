@@ -1022,8 +1022,23 @@ impl Engine {
         #[cfg(not(feature = "jit-asm"))]
         let native_fn_available = false;
 
+        // Whether the stage4_fn was compiled by the non-native asm backend.
+        // Non-native asm uses packed_data_ptr callbacks (not JitHashIndex), so it doesn't
+        // need `jit_used_in_cranelift_strata` marking — only Cranelift does.
+        #[cfg(feature = "jit-asm")]
+        let stage4_fn_is_asm = self.jit.as_ref()
+            .map(|jit_cell| jit_cell.lock().unwrap().stratum_stage4_fn_is_asm(stratum_key))
+            .unwrap_or(false);
+        // When jit-asm is not enabled, stage4_fn always comes from Cranelift.
+        #[cfg(not(feature = "jit-asm"))]
+        let stage4_fn_is_asm = false;
+
+        // `uses_cranelift`: the stage4_fn is a Cranelift function (not non-native asm).
+        // Only Cranelift strata probe JitHashIndex, so only they need the flag set.
+        let uses_cranelift = !stage4_fn_is_asm && !native_fn_available;
+
         if !self.stratum_stage4_cache.contains_key(&stratum_key) {
-            let runtime = match self.build_stratum_stage4_runtime(rules, native_fn_available) {
+            let runtime = match self.build_stratum_stage4_runtime(rules, native_fn_available, uses_cranelift) {
                 Some(r) => r,
                 None => return false,
             };
@@ -1128,7 +1143,7 @@ impl Engine {
     ///
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule], native_fn_available: bool) -> Option<StratumStage4Runtime> {
+    fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule], native_fn_available: bool, _uses_cranelift: bool) -> Option<StratumStage4Runtime> {
         use crate::jit::packed_helpers::{JitRelSpec, LookupSpec, PackedJitContextV3, StratumStage4Ctx};
         use crate::jit::storage::JitRelData;
         use crate::jit_index::JitLookupHandle;
@@ -4819,4 +4834,5 @@ mod jit_hot_tests {
             );
         }
     }
+
 }

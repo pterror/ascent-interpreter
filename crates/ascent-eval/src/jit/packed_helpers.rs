@@ -685,14 +685,19 @@ pub unsafe extern "C" fn jit_advance_native(ctx: *mut StratumStage4NativeCtx) ->
 /// `ctx` must point to a valid `StratumStage4Ctx` with all sub-pointers valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_stratum_advance_s4(ctx: *mut StratumStage4Ctx) -> u8 {
+    unsafe { jit_stratum_advance_s4_inner(ctx) }
+}
+
+unsafe fn jit_stratum_advance_s4_inner(ctx: *mut StratumStage4Ctx) -> u8 {
     let ctx = unsafe { &*ctx };
     // Stage 4 uses advance_jit() which skips recent_col_indices rebuild.
     // recent_col_indices is interpreter-only; Stage 4 uses jit_recent_indices instead.
     let mut changed = false;
     for i in 0..ctx.n_all_rels as usize {
         let rel = unsafe { &mut **ctx.all_rels.add(i) };
-        // skip_jit_hash_indices=false: the Cranelift path uses jit_indices / jit_recent_indices.
-        if rel.advance_jit() {
+        // Non-native asm reads packed_data_ptr + JitHashIndex, never jit_native.
+        // Skip jit_native rebuild to avoid O(n³) JitColIndex full-rebuild each step.
+        if rel.advance_jit_no_native_rebuild() {
             changed = true;
         }
     }

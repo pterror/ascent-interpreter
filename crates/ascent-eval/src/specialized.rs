@@ -587,7 +587,7 @@ impl PackedStorage {
     /// Use this on the asm native path, which reads `JitColIndex` directly and never
     /// touches `jit_indices` / `jit_recent_indices`.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) fn advance_jit_inner(&mut self, update_hash_indices: bool) -> bool {
+    pub(crate) fn advance_jit_inner(&mut self, update_hash_indices: bool, rebuild_jit_native: bool) -> bool {
         // Flush any tuples the JIT wrote to jit_native.new into this relation's delta.
         // Takes only the `new` buffer from jit_native so we can update jit_native in-place
         // when nothing changed (avoids a full rebuild of total + recent).
@@ -623,7 +623,6 @@ impl PackedStorage {
         } else {
             false
         };
-
         let had_delta = !self.delta.is_empty();
         self.recent = std::mem::take(&mut self.delta);
         // Skip recent_col_indices rebuild — JIT uses jit_recent_indices.
@@ -640,7 +639,7 @@ impl PackedStorage {
         // Exception: the Cranelift direct-load path (Step 6) also initializes jit_native,
         // but with build_indices=false (lean projection). The build_indices flag is respected
         // below so lean projections never build JitColIndex.
-        if self.jit_native.is_some() {
+        if rebuild_jit_native && self.jit_native.is_some() {
             use crate::jit::storage::JitRelData;
             let arity = self.arity;
             // Use the build_indices flag stored in jit_native to preserve lean vs full mode.
@@ -704,7 +703,18 @@ impl PackedStorage {
     /// Advance for the Cranelift JIT path (rebuilds `jit_indices` / `jit_recent_indices`).
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) fn advance_jit(&mut self) -> bool {
-        self.advance_jit_inner(true)
+        self.advance_jit_inner(true, true)
+    }
+
+    /// Advance for the non-native asm Stage 4 path.
+    ///
+    /// Like `advance_jit` but skips the `jit_native` rebuild: the non-native asm path reads
+    /// packed_data_ptr + JitHashIndex — it never reads `jit_native.total/recent`. Rebuilding
+    /// JitColIndex inside `jit_native` on every fixpoint step would be O(total_tuples) per call
+    /// (O(n³) for TC), wasted work since the non-native asm never uses it.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) fn advance_jit_no_native_rebuild(&mut self) -> bool {
+        self.advance_jit_inner(true, false)
     }
 
     /// Advance for the asm native path: skips `JitHashIndex` rebuild when safe.
@@ -717,7 +727,7 @@ impl PackedStorage {
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) fn advance_jit_skip_hash_indices(&mut self) -> bool {
         let update = self.jit_used_in_cranelift_strata;
-        self.advance_jit_inner(update)
+        self.advance_jit_inner(update, true)
     }
 
     pub fn advance_peek(&mut self) -> bool {
