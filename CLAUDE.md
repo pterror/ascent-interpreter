@@ -50,7 +50,7 @@ cd docs && bun dev # Local docs
 
 When evaluating a JIT optimization, profile with `perf stat -e instructions,cycles,cache-misses` and compare *per-iteration* numbers against the `ascent_macro` benchmark. The gap is closed when both instruction count and cache behavior converge, not just one.
 
-Current state (2026-03-17): fibonacci jit_hot/20 = ~16µs vs ascent_macro ~10µs (**1.6×**); triangle jit_hot/20 = ~165µs vs ascent_macro ~35µs (**4.7×**); TC jit_hot/50 = ~200µs at parity with ascent_macro ~196µs (**1.0×** — closed). IDB inner clause rejection removed (commit f7e503d); non-native asm linked-list path is correct after f2901fc. The EDB contiguous index is already in place, reducing triangle cache misses from 116× to ~13× (estimated). Primary remaining bottleneck for triangle is the `JitHashIndex` pointer-chased structure — see TODO.md § "New architecture" for the compact JitColIndex replacement plan.
+Current state (2026-03-17): fibonacci jit_hot/20 = ~14µs vs ascent_macro ~8µs (**1.76×**); triangle jit_hot/20 = ~158µs (eval=133µs) vs ascent_macro ~39µs (**3.4×** eval); triangle jit_hot/30 = ~324µs (eval=276µs) vs ascent_macro ~161µs (**1.7×** eval); TC jit_hot/50 = ~200µs at parity with ascent_macro ~196µs (**1.0×** — closed). Phase 2 (sort-based build_contiguous + dedup capacity hints, commit 5fa6362) reduced triangle gap further by eliminating index-build allocs and dedup reallocs. Primary remaining bottleneck per symbolized perf profile: `JitDedupTable::insert_if_new` (~18%) + `stratum_stage4_0` JIT eval (~29%) + PackedStorage inserts (~9%). The `build_contiguous` and `maybe_grow` costs are now negligible (<2% each).
 
 **ABI scan callbacks (`packed_data_ptr`, `packed_count`, `packed_recent_ptr`) are NOT the bottleneck.** These functions access warm cache lines (offsets 24, 72, 112 in `PackedStorage`). Any scheme that replaces them with direct loads risks adding cache misses from `PackedScanInfo` fields at cold offsets, or disrupts the overall layout. Attempted 2026-03-16 as `PackedScanInfo` in `PackedStorage` — regressed fibonacci 1.49× → 1.56–1.73× in all configurations. Do not retry.
 
@@ -60,7 +60,7 @@ Current state (2026-03-17): fibonacci jit_hot/20 = ~16µs vs ascent_macro ~10µs
 
 **The end state is zero Cranelift dependency.** The asm backend (`jit-asm`) must handle every rule shape; Cranelift is a temporary fallback to be deleted once asm coverage is complete. Any work that keeps rules falling through to Cranelift is unfinished work, not a solution.
 
-Current blocker: IDB inner clauses (recursive rules like TC and fibonacci) fall through to Cranelift because the asm linked-list traversal for IDB inner clauses had a bug (TC 17.8×, `tc_shared_jit` hanging). The rejection was restored as a temporary fix (2026-03-17). Next step: fix the asm IDB linked-list path, verify correctness and performance, then delete Cranelift.
+Current state (2026-03-17): IDB inner clause rejection was removed (commit f7e503d) after commit f2901fc fixed bound clause arg expressions. All rules now handled by asm without Cranelift fallthrough. TC at parity (1.0×). Remaining blocker to deleting Cranelift: expression completeness (3c), aggregation (3d), negation (3e) — see TODO.md § Step 3.
 
 ## JIT Design Rule
 
