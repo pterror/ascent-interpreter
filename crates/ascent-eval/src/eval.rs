@@ -3038,10 +3038,13 @@ impl Engine {
         }
 
         if let Some((primary_col, primary_val)) = primary {
-            for &idx in rel.lookup(primary_col, primary_val) {
+            let indices = rel.lookup(primary_col, primary_val);
+            flat.reserve(indices.len() * n_bv.max(1));
+            for &idx in indices {
                 scan_tuple!(rel.get(idx));
             }
         } else {
+            flat.reserve(rel.len() * n_bv.max(1));
             for tuple in rel.iter_full() {
                 scan_tuple!(tuple);
             }
