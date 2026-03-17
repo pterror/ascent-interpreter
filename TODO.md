@@ -184,6 +184,8 @@ Current JIT architecture (context for what needs to change):
 
 - [x] **Cache `packed_data_ptr` for non-recursive rules** — `gen_full_scan_v3` calls `packed_data_ptr` inside the scan loop on every iteration to handle the case where head relation == clause relation (recursive insert can reallocate). For non-recursive rules (head ∉ clause relations), the pointer is stable. Pass a `is_recursive: bool` flag through codegen; only re-fetch inside the loop when true. Applies to Stage 3 and Stage 4. Would reduce inner loop body size by one runtime call.
 
+- [x] **SIGSEGV in Cranelift Stage 4 for mutually recursive strata (2026-03-17, fixed `69711da`)** — in strata with mutual recursion (e.g. `odd <-- even, even <-- odd`), body-clause relations are IDB (written by another rule in the same stratum) even though the CURRENT rule's head doesn't write to them. The `is_recursive` check in `stratum_codegen.rs` (`precomputed_packed_bufs`) and `gen_clauses_v3` (`effective_jit_rels`) only examined the current rule's heads, so mutual-recursion IDB relations were treated as EDB. `jit_rels` entries are null for IDB relations (no `jit_native`), causing a null pointer dereference → SIGSEGV. Fix: in `stratum_codegen.rs`, use strat-wide heads (all rules) for `is_recursive` in `precomputed_packed_bufs`. In `gen_clauses_v3`, derive the IDB flag from `precomputed_packed_bufs[clause_offset].is_none() && jit_rels.is_some()` to also set `is_recursive=true` for jit_rels usage. The asm backend (jit-asm feature) was not affected.
+
 #### Remaining inner-loop Rust calls (the real floor)
 
 The true minimum is **zero per-iteration calls + one per rule-invocation for insertion**:
