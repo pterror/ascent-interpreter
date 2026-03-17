@@ -993,7 +993,17 @@ pub(crate) fn gen_clauses_v3(
     // must be re-fetched inside the scan loop because a direct head insert can
     // reallocate the buffer.  When non-recursive the pointer is stable and can
     // be cached once before the loop.
-    let is_recursive = heads.iter().any(|h| h.relation == clause.relation);
+    //
+    // In Stage 4 with mutually recursive strata, a clause's relation may be IDB
+    // (written by another rule in the same stratum) even if the CURRENT rule's head
+    // doesn't write to it.  In that case jit_rels[clause_offset*2+…] is null (no
+    // jit_native for IDB relations).  Detect this via precomputed_packed_bufs: if
+    // the entry is None AND jit_rels was provided, the relation is IDB strat-wide
+    // and we must fall back to callbacks to avoid dereferencing a null jit_rels entry.
+    let is_recursive_local = heads.iter().any(|h| h.relation == clause.relation);
+    let jit_rels_would_be_null = jit_rels.is_some()
+        && precomputed_packed_bufs.get(clause_offset).is_none_or(|v| v.is_none());
+    let is_recursive = is_recursive_local || jit_rels_would_be_null;
 
     if clause.bound_cols.is_empty() {
         gen_full_scan_v3(

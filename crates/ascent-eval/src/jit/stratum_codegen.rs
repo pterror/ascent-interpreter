@@ -580,7 +580,10 @@ fn emit_rule_bodies(
             .iter()
             .enumerate()
             .map(|(clause_offset, (_, clause))| {
-                let is_recursive = heads.iter().any(|h| h.relation == clause.relation);
+                // A relation is IDB if it appears as a head of ANY rule in this stratum
+                // (not just the current rule). For mutual recursion, e.g. `odd <-- even`
+                // where another rule writes `even`, `even` is IDB and jit_rels[..] is null.
+                let is_recursive = rules.iter().any(|(_, hs, _)| hs.iter().any(|h| h.relation == clause.relation));
                 if !is_recursive {
                     // Stage 4: load data from jit_rels[clause_offset * 2 + 0].data @ 0.
                     // use_recent=0 (total) for the precomputed pointer used in the full-scan
@@ -696,7 +699,9 @@ fn emit_recent_rule_bodies(
             .iter()
             .enumerate()
             .map(|(clause_offset, (_, clause))| {
-                let is_recursive = heads.iter().any(|h| h.relation == clause.relation);
+                // Check against all rules' heads (not just current rule) to correctly
+                // identify IDB relations in mutually recursive strata.
+                let is_recursive = rules.iter().any(|(_, hs, _)| hs.iter().any(|h| h.relation == clause.relation));
                 if !is_recursive {
                     let jrel_byte_off = ((clause_offset * 2) as i64) * 8;
                     let jrel_arr_addr = if jrel_byte_off == 0 {
