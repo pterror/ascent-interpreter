@@ -834,7 +834,7 @@ impl JitDedupTable {
     pub fn insert(&mut self, hash: u32, packed: &[u32]) {
         debug_assert_eq!(packed.len() + 1, self.stride);
         self.maybe_grow();
-        let cap = self.entries_vec.len() / self.stride;
+        let cap = self.handle.cap as usize;
         let mask = cap - 1;
         let mut slot = (hash as usize) & mask;
         loop {
@@ -849,34 +849,41 @@ impl JitDedupTable {
         }
     }
 
+    #[inline(always)]
     fn maybe_grow(&mut self) {
-        let cur_cap = if self.stride == 0 { 0 } else { self.entries_vec.len() / self.stride };
+        // Use handle.cap instead of entries_vec.len() / stride to avoid the division.
+        let cur_cap = self.handle.cap as usize;
         // Grow when load factor > 75 %.
         if cur_cap == 0 || (self.count + 1) * 4 > cur_cap * 3 {
-            let new_cap = if cur_cap == 0 { 16 } else { cur_cap * 2 };
-            let stride = self.stride;
-            let mut new_entries = vec![JITDEDUP_EMPTY; new_cap * stride];
-            let mask = new_cap - 1;
-            for i in 0..cur_cap {
-                let base = i * stride;
-                let h = self.entries_vec[base];
-                if h != JITDEDUP_EMPTY {
-                    let mut slot = (h as usize) & mask;
-                    loop {
-                        let nb = slot * stride;
-                        if new_entries[nb] == JITDEDUP_EMPTY {
-                            new_entries[nb..nb + stride]
-                                .copy_from_slice(&self.entries_vec[base..base + stride]);
-                            break;
-                        }
-                        slot = (slot + 1) & mask;
+            self.do_grow(cur_cap);
+        }
+    }
+
+    #[cold]
+    fn do_grow(&mut self, cur_cap: usize) {
+        let new_cap = if cur_cap == 0 { 16 } else { cur_cap * 2 };
+        let stride = self.stride;
+        let mut new_entries = vec![JITDEDUP_EMPTY; new_cap * stride];
+        let mask = new_cap - 1;
+        for i in 0..cur_cap {
+            let base = i * stride;
+            let h = self.entries_vec[base];
+            if h != JITDEDUP_EMPTY {
+                let mut slot = (h as usize) & mask;
+                loop {
+                    let nb = slot * stride;
+                    if new_entries[nb] == JITDEDUP_EMPTY {
+                        new_entries[nb..nb + stride]
+                            .copy_from_slice(&self.entries_vec[base..base + stride]);
+                        break;
                     }
+                    slot = (slot + 1) & mask;
                 }
             }
-            self.entries_vec = new_entries;
-            // Update handle in-place so the stable pointer sees fresh data.
-            self.handle.entries = self.entries_vec.as_mut_ptr();
-            self.handle.cap = new_cap as u32;
         }
+        self.entries_vec = new_entries;
+        // Update handle in-place so the stable pointer sees fresh data.
+        self.handle.entries = self.entries_vec.as_mut_ptr();
+        self.handle.cap = new_cap as u32;
     }
 }
