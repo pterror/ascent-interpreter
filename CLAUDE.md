@@ -56,6 +56,12 @@ Current state (2026-03-17): fibonacci jit_hot/20 = 16µs vs ascent_macro 10µs (
 
 **Parallelism must also be designed for max throughput.** When implementing parallel evaluation: zero shared state in the hot path (thread-local dedup tables, thread-local head buffers, read-only shared indices), batch merge only after all threads finish their scan. A parallel design that introduces lock contention or false sharing in the inner loop is worse than single-threaded. The test is: does the parallel version scale linearly with thread count on a join-heavy benchmark?
 
+## JIT Architecture Goal
+
+**The end state is zero Cranelift dependency.** The asm backend (`jit-asm`) must handle every rule shape; Cranelift is a temporary fallback to be deleted once asm coverage is complete. Any work that keeps rules falling through to Cranelift is unfinished work, not a solution.
+
+Current blocker: IDB inner clauses (recursive rules like TC and fibonacci) fall through to Cranelift because the asm linked-list traversal for IDB inner clauses had a bug (TC 17.8×, `tc_shared_jit` hanging). The rejection was restored as a temporary fix (2026-03-17). Next step: fix the asm IDB linked-list path, verify correctness and performance, then delete Cranelift.
+
 ## JIT Design Rule
 
 **Before implementing any JIT stage, trace the full hot-path and count Rust callbacks.**

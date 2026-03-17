@@ -333,10 +333,13 @@ non-dedup-failing cases. For recursive rules (head ∈ clause rels): flush at en
 iteration instead of end of inner loop. Note: dedup probe is already inline; this removes the
 remaining call for *new* tuples.
 
-**Step 3 — Complete the asm backend for ~100% rule coverage** *(closes the codegen gap)*
+**Step 3 — Complete the asm backend for ~100% rule coverage** *(closes the codegen gap; end goal: delete Cranelift)*
 
-Extends `asm_codegen.rs` with a proper register assigner and full pattern coverage. Keep Cranelift
-as fallback for anything the asm backend explicitly rejects.
+Extends `asm_codegen.rs` with a proper register assigner and full pattern coverage. **Goal: remove
+the Cranelift dependency entirely** — asm handles every rule shape, Cranelift fallback is deleted.
+Current state (2026-03-17): IDB inner clauses fall through to Cranelift because the asm linked-list
+path was buggy (TC 17.8×, tc_shared_jit hang). Rejection restored as temporary fix; see CLAUDE.md
+§ "JIT Architecture Goal".
 
 - **3a — Depth-priority register assignment** (~150 lines): ✅ IMPLEMENTED (2026-03-16).
   `compute_var_locs()` assigns outer-loop-stable variables to callee-saved registers (r13 for
