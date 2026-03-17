@@ -174,6 +174,12 @@ pub struct JitCompiler {
     /// on the next engine's first stratum execution, avoiding repeated reallocs.
     #[cfg(feature = "specialized")]
     pub(crate) dedup_cap_hints: rustc_hash::FxHashMap<String, u32>,
+    /// Peak tuple count observed per IDB head relation (relation name → count).
+    ///
+    /// Used to pre-size `packed_data` (capacity = count × arity) and `delta`
+    /// (capacity = count) before the stratum runs, eliminating Vec growth reallocs.
+    #[cfg(feature = "specialized")]
+    pub(crate) tuple_count_hints: rustc_hash::FxHashMap<String, u32>,
 }
 
 // Safety: JitCompiler is only accessed from one thread at a time (guarded by Mutex).
@@ -287,6 +293,8 @@ impl JitCompiler {
             var_count: 0,
             #[cfg(feature = "specialized")]
             dedup_cap_hints: FxHashMap::default(),
+            #[cfg(feature = "specialized")]
+            tuple_count_hints: FxHashMap::default(),
         })
     }
 

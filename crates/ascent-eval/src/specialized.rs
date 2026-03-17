@@ -875,6 +875,23 @@ impl PackedStorage {
         self.count
     }
 
+    /// Pre-allocate storage for at least `n` tuples without inserting data.
+    ///
+    /// Reserves `packed_data` (n × arity u32s) and `delta` (n entries).
+    /// Does nothing for dimensions already large enough.
+    pub fn reserve_tuples(&mut self, n: usize) {
+        if n == 0 || self.arity == 0 {
+            return;
+        }
+        let needed_packed = n * self.arity;
+        if self.packed_data.capacity() < needed_packed {
+            self.packed_data.reserve(needed_packed - self.packed_data.len());
+        }
+        if self.delta.capacity() < n {
+            self.delta.reserve(n - self.delta.len());
+        }
+    }
+
     pub fn source_of(&self, idx: usize) -> SourceId {
         self.source_tags
             .get(idx)

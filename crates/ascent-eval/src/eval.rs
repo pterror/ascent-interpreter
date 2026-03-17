@@ -1033,20 +1033,29 @@ impl Engine {
         // Otherwise fall back to the old path.
         let runtime = self.stratum_stage4_cache.get_mut(&stratum_key).unwrap();
 
-        // Step 3a: pre-size dedup tables for IDB head relations using hints from a
-        // previous run. This avoids 6–8 reallocs when a fresh engine derives the same
-        // number of tuples as the warmup run.
+        // Step 3a: pre-size IDB head relations using hints from a previous run.
+        // Avoids 6–8 dedup reallocs and ~13 packed_data/delta reallocs on each
+        // fresh-engine iteration, eliminating malloc/memmove overhead.
         if let Some(jit_cell) = self.jit.as_ref() {
             let jit = jit_cell.lock().unwrap();
-            if !jit.dedup_cap_hints.is_empty() {
+            let has_hints = !jit.dedup_cap_hints.is_empty() || !jit.tuple_count_hints.is_empty();
+            if has_hints {
                 use crate::relation::Relation;
                 for rule in rules {
                     for head in &rule.heads {
-                        if let Some(&hint) = jit.dedup_cap_hints.get(head.relation.as_str())
-                            && let Some(Relation::Packed(ps)) =
-                                self.relations.get_mut(&head.relation)
+                        if let Some(Relation::Packed(ps)) =
+                            self.relations.get_mut(&head.relation)
                         {
-                            ps.jit_dedup.reserve(hint);
+                            if let Some(&dedup_hint) =
+                                jit.dedup_cap_hints.get(head.relation.as_str())
+                            {
+                                ps.jit_dedup.reserve(dedup_hint);
+                            }
+                            if let Some(&count_hint) =
+                                jit.tuple_count_hints.get(head.relation.as_str())
+                            {
+                                ps.reserve_tuples(count_hint as usize);
+                            }
                         }
                     }
                 }
@@ -1076,21 +1085,22 @@ impl Engine {
         true
     }
 
-    /// Record the peak dedup-table capacity for each IDB head relation into
-    /// `JitCompiler::dedup_cap_hints`.  Called after each stratum run completes.
+    /// Record the peak dedup-table capacity and tuple count for each IDB head
+    /// relation into `JitCompiler`.  Called after each stratum run completes.
     /// After the final fixpoint advance, `jit_dedup.clear()` zeroes the count but
     /// preserves the capacity allocation — so `handle.cap` is the peak capacity.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     fn update_dedup_cap_hints(&self, rules: &[&crate::compiled::CRule]) {
         let Some(jit_cell) = self.jit.as_ref() else { return };
         use crate::relation::Relation;
-        let mut hints: Vec<(String, u32)> = Vec::new();
+        let mut hints: Vec<(String, u32, u32)> = Vec::new(); // (name, dedup_cap, tuple_count)
         for rule in rules {
             for head in &rule.heads {
                 if let Some(Relation::Packed(ps)) = self.relations.get(&head.relation) {
                     let cap = ps.jit_dedup.handle.cap;
-                    if cap > 0 {
-                        hints.push((head.relation.clone(), cap));
+                    let count = ps.count as u32;
+                    if cap > 0 || count > 0 {
+                        hints.push((head.relation.clone(), cap, count));
                     }
                 }
             }
@@ -1099,9 +1109,15 @@ impl Engine {
             return;
         }
         let mut jit = jit_cell.lock().unwrap();
-        for (name, cap) in hints {
-            let entry = jit.dedup_cap_hints.entry(name).or_insert(0);
-            *entry = (*entry).max(cap);
+        for (name, cap, count) in hints {
+            if cap > 0 {
+                let entry = jit.dedup_cap_hints.entry(name.clone()).or_insert(0);
+                *entry = (*entry).max(cap);
+            }
+            if count > 0 {
+                let entry = jit.tuple_count_hints.entry(name).or_insert(0);
+                *entry = (*entry).max(count);
+            }
         }
     }
 
