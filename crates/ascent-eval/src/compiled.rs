@@ -111,6 +111,10 @@ pub(crate) struct CClause {
     /// Pre-computed: column indices + VarId where the arg is a fresh variable.
     /// Used for direct binding without `match_clause` overhead.
     pub fresh_cols: Vec<(usize, VarId)>,
+    /// Subset of fresh_cols: fresh variables referenced in any subsequent body item or head.
+    /// A fresh var NOT in this set is a "wildcard" — bound but never used downstream.
+    /// Used to dedup the outer full-scan: same meaningful_fresh_cols values → same result.
+    pub meaningful_fresh_cols: Vec<(usize, VarId)>,
 }
 
 /// Pre-compiled condition.
@@ -178,17 +182,16 @@ pub(crate) fn compile_rule(rule: &Rule, interner: &VarInterner) -> CRule {
         .map(|item| compile_body_item(item, interner))
         .collect();
 
-    CRule {
-        heads: rule
-            .heads
-            .iter()
-            .map(|h| CHeadClause {
-                relation: h.relation.clone(),
-                args: h.args.iter().map(|a| compile_expr(a, interner)).collect(),
-            })
-            .collect(),
-        body: optimize_body(body),
-    }
+    let heads: Vec<CHeadClause> = rule
+        .heads
+        .iter()
+        .map(|h| CHeadClause {
+            relation: h.relation.clone(),
+            args: h.args.iter().map(|a| compile_expr(a, interner)).collect(),
+        })
+        .collect();
+    let body = optimize_body(body, &heads);
+    CRule { heads, body }
 }
 
 fn compile_body_item(item: &BodyItem, interner: &VarInterner) -> CBodyItem {
@@ -213,9 +216,10 @@ fn compile_clause(clause: &Clause, interner: &VarInterner) -> CClause {
             .iter()
             .map(|c| compile_condition(c, interner))
             .collect(),
-        all_args_bound: false,  // computed by optimize_body
-        bound_cols: Vec::new(), // computed by optimize_body
-        fresh_cols: Vec::new(), // computed by optimize_body
+        all_args_bound: false,         // computed by optimize_body
+        bound_cols: Vec::new(),        // computed by optimize_body
+        fresh_cols: Vec::new(),        // computed by optimize_body
+        meaningful_fresh_cols: Vec::new(), // computed by optimize_body
     }
 }
 
@@ -396,13 +400,63 @@ fn add_defined_vars(item: &CBodyItem, defined: &mut FxHashSet<VarId>) {
     }
 }
 
+/// Collect all VarIds referenced (read) in a body item — both bound inputs and
+/// freshly-defined outputs. Used by Phase 4 of `optimize_body`.
+fn body_item_all_vars(item: &CBodyItem, vars: &mut FxHashSet<VarId>) {
+    match item {
+        CBodyItem::Clause(c) => {
+            for arg in &c.args {
+                match arg {
+                    CClauseArg::Var(id) => {
+                        vars.insert(*id);
+                    }
+                    CClauseArg::Expr(expr) => cexpr_referenced_vars(expr, vars),
+                }
+            }
+            for cond in &c.conditions {
+                match cond {
+                    CCondition::If(e) | CCondition::IfLet { expr: e, .. } | CCondition::Let { expr: e, .. } => {
+                        cexpr_referenced_vars(e, vars);
+                    }
+                }
+            }
+        }
+        CBodyItem::Generator(g) => {
+            for &id in &g.vars {
+                vars.insert(id);
+            }
+            cexpr_referenced_vars(&g.expr, vars);
+        }
+        CBodyItem::Condition(cond) => {
+            match cond {
+                CCondition::If(e) | CCondition::IfLet { expr: e, .. } | CCondition::Let { expr: e, .. } => {
+                    cexpr_referenced_vars(e, vars);
+                }
+            }
+        }
+        CBodyItem::Aggregation(a) => {
+            for &id in &a.bound_vars {
+                vars.insert(id);
+            }
+            for arg in &a.args {
+                match arg {
+                    CAggArg::Var(id) => {
+                        vars.insert(*id);
+                    }
+                    CAggArg::Expr(expr) => cexpr_referenced_vars(expr, vars),
+                }
+            }
+        }
+    }
+}
+
 /// Optimize compiled rule body: reorder conditions and compute bound flags.
 ///
 /// Pure `if expr` conditions are moved to the earliest position where all their
 /// referenced variables are defined, filtering tuples before expensive joins.
 /// Additionally, computes `all_args_bound` flags for clauses to enable the
 /// fast-path contains check without runtime `find_bound_columns` allocation.
-fn optimize_body(body: Vec<CBodyItem>) -> Vec<CBodyItem> {
+fn optimize_body(body: Vec<CBodyItem>, heads: &[CHeadClause]) -> Vec<CBodyItem> {
     // Phase 1: Condition reordering.
     // Only reorder pure `if expr` conditions without Dynamic subexpressions,
     // since Dynamic expressions may reference variables we can't detect.
@@ -508,6 +562,33 @@ fn optimize_body(body: Vec<CBodyItem>) -> Vec<CBodyItem> {
             }
         }
         add_defined_vars(item, &mut defined);
+    }
+
+    // Phase 4: Compute meaningful_fresh_cols.
+    // Backwards pass: for each clause at index i, determine which of its fresh_cols vars
+    // are actually referenced in body[i+1..] or heads. Fresh vars never used downstream
+    // are wildcards — dedup on meaningful cols only.
+    {
+        let mut downstream: FxHashSet<VarId> = FxHashSet::default();
+        for head in heads {
+            for arg in &head.args {
+                cexpr_referenced_vars(arg, &mut downstream);
+            }
+        }
+        for i in (0..result.len()).rev() {
+            if let CBodyItem::Clause(c) = &mut result[i] {
+                c.meaningful_fresh_cols = c
+                    .fresh_cols
+                    .iter()
+                    .filter(|(_, var_id)| downstream.contains(var_id))
+                    .copied()
+                    .collect();
+            }
+            let item = &result[i];
+            let mut item_vars: FxHashSet<VarId> = FxHashSet::default();
+            body_item_all_vars(item, &mut item_vars);
+            downstream.extend(item_vars);
+        }
     }
 
     result

@@ -2689,6 +2689,67 @@ impl Engine {
         } else if clause.bound_cols.is_empty() && !clause.fresh_cols.is_empty() {
             // All args are fresh vars (first clause in body, or all new vars).
             // Skip match_clause: directly bind fresh vars from tuples.
+            //
+            // Dedup optimization: when meaningful_fresh_cols is a proper subset of fresh_cols
+            // (i.e., some fresh vars are wildcards never used downstream) and there are no
+            // conditions referencing those wildcards, tuples differing only in wildcard
+            // columns produce identical downstream results — we can skip the duplicates.
+            let can_dedup = clause.conditions.is_empty()
+                && !clause.meaningful_fresh_cols.is_empty()
+                && clause.meaningful_fresh_cols.len() < clause.fresh_cols.len();
+            if can_dedup && !use_recent {
+                if clause.meaningful_fresh_cols.len() == 1 {
+                    let (col, var_id) = clause.meaningful_fresh_cols[0];
+                    let mut seen: FxHashSet<Value> = FxHashSet::default();
+                    for tuple in rel.iter_full() {
+                        let val = tuple[col].clone();
+                        if seen.insert(val.clone()) {
+                            let cp = undo.len();
+                            binding.insert(var_id, val);
+                            undo.push((var_id, None));
+                            self.process_body_recursive(
+                                body,
+                                offset + 1,
+                                heads,
+                                binding,
+                                undo,
+                                recent_clause_idx,
+                                results,
+                                scratch,
+                            );
+                            rollback(binding, undo, cp);
+                        }
+                    }
+                } else {
+                    let mut seen: FxHashSet<Vec<Value>> = FxHashSet::default();
+                    for tuple in rel.iter_full() {
+                        let key: Vec<Value> = clause
+                            .meaningful_fresh_cols
+                            .iter()
+                            .map(|&(c, _)| tuple[c].clone())
+                            .collect();
+                        if seen.insert(key) {
+                            let cp = undo.len();
+                            for &(c, var_id) in &clause.meaningful_fresh_cols {
+                                binding.insert(var_id, tuple[c].clone());
+                                undo.push((var_id, None));
+                            }
+                            self.process_body_recursive(
+                                body,
+                                offset + 1,
+                                heads,
+                                binding,
+                                undo,
+                                recent_clause_idx,
+                                results,
+                                scratch,
+                            );
+                            rollback(binding, undo, cp);
+                        }
+                    }
+                }
+                return;
+            }
             macro_rules! bind_fresh_and_recurse {
                 ($tuple:expr) => {{
                     let cp = undo.len();
