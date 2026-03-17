@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::fmt;
+#[cfg(feature = "jit")]
 use std::sync::{Arc, Mutex};
 
 use ascent_ir::{BodyItem, Program};
@@ -786,6 +787,7 @@ impl Engine {
     }
 
     /// Run a set of rules to fixpoint.
+    #[allow(unused_variables)]
     fn run_stratum(&mut self, rules: &[&CRule], scc_key: usize, rule_indices: &[usize]) {
         if rules.is_empty() {
             return;
