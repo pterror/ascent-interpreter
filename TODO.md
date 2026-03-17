@@ -337,9 +337,10 @@ remaining call for *new* tuples.
 
 Extends `asm_codegen.rs` with a proper register assigner and full pattern coverage. **Goal: remove
 the Cranelift dependency entirely** — asm handles every rule shape, Cranelift fallback is deleted.
-Current state (2026-03-17): IDB inner clauses fall through to Cranelift because the asm linked-list
-path was buggy (TC 17.8×, tc_shared_jit hang). Rejection restored as temporary fix; see CLAUDE.md
-§ "JIT Architecture Goal".
+Current state (2026-03-17): IDB inner clauses now handled by the non-native asm linked-list path.
+The stale rejection (which fell through to Cranelift) was removed after commit f2901fc fixed
+expression handling in bound clause arg positions. TC jit_hot/50 at ~200µs (parity with ascent_macro
+~196µs). Triangle gap remains 4.7× (~165µs vs ~35µs) — see Step 1 / Step 4.
 
 - **3a — Depth-priority register assignment** (~150 lines): ✅ IMPLEMENTED (2026-03-16).
   `compute_var_locs()` assigns outer-loop-stable variables to callee-saved registers (r13 for
@@ -479,13 +480,12 @@ new stack slot; inner loop loads from that slot (1 load) instead of 4-level poin
 Remaining gap: level-1-bound variables (c for triangle) still store/load via stack — all 5
 callee-saved regs are occupied by loop machinery; no register remains for c.
 
-**Bug fixed (2026-03-17):** `tc_shared_jit` test was hanging infinitely with `jit-asm` feature.
-Root cause: `codegen_stratum_asm_inner` had removed the IDB inner clause rejection (comment said
-"linked-list traversal is now supported"), so TC fell into the non-native asm linked-list path
-which was buggy — TC ran at 2.47ms (17.8×) and `tc_shared_jit` hung. Fix: re-added IDB inner
-clause rejection for the non-native asm path (`!use_jit_native` guard), so TC falls through to
-Cranelift's working linked-list. **Result:** TC jit_hot/50 = 196µs vs macro 122µs → **1.6×**
-(was 17.8×). `tc_shared_jit` tests pass. fibonacci/triangle unaffected.
+**IDB inner clause rejection — full history (2026-03-17):** The non-native asm linked-list path
+was buggy — TC ran at 2.47ms (17.8×) and `tc_shared_jit` hung. The rejection was re-added so TC
+fell through to Cranelift. Root cause of the original bug: bound clause arg expressions (like
+`fib(nn-1, b)`) were mis-handled before commit f2901fc. After f2901fc, the rejection was confirmed
+stale and permanently removed (commit f7e503d). **Result:** TC jit_hot/50 = ~200µs at parity with
+ascent_macro ~196µs. All 261 tests pass. fibonacci/triangle unaffected.
 
 ### Relation storage optimizations
 
