@@ -5,6 +5,7 @@ use std::fmt;
 #[cfg(feature = "jit")]
 use std::sync::{Arc, Mutex};
 
+
 use ascent_ir::{BodyItem, Program};
 use petgraph::algo::{condensation, toposort};
 use petgraph::graph::DiGraph;
@@ -2869,61 +2870,73 @@ impl Engine {
             return;
         };
 
-        let mut collected: Vec<Vec<Value>> = Vec::new();
-        let bound_cols = self.find_bound_agg_columns(agg, binding);
-
-        if !bound_cols.is_empty() {
-            // Use index lookup: pick most selective column
-            let (primary_pos, _) = bound_cols
-                .iter()
-                .enumerate()
-                .min_by_key(|&(_, (col, val))| rel.lookup(*col, val).len())
-                .unwrap();
-            let (primary_col, primary_val) = &bound_cols[primary_pos];
-            let indices = rel.lookup(*primary_col, primary_val);
-
-            for &idx in indices {
-                let tuple = rel.get(idx);
-                // Pre-filter secondary bound columns
-                if bound_cols.len() > 1 {
-                    let pre_match = bound_cols
-                        .iter()
-                        .enumerate()
-                        .all(|(i, (col, val))| i == primary_pos || tuple[*col] == *val);
-                    if !pre_match {
-                        continue;
-                    }
-                }
-                let cp = undo.len();
-                if self.match_agg_args(agg, tuple, binding, undo) {
-                    collected.push(
-                        agg.bound_vars
-                            .iter()
-                            .filter_map(|var_id| binding.get(var_id).cloned())
-                            .collect(),
-                    );
-                }
-                rollback(binding, undo, cp);
-            }
+        // Fast path: all-Var args — skip binding/undo machinery, avoid per-tuple Vec alloc.
+        let (agg_results, _flat_storage);
+        if let Some(flat) = self.collect_agg_flat_vars(agg, binding) {
+            let stride = agg.bound_vars.len().max(1);
+            _flat_storage = flat;
+            agg_results = apply_aggregator(
+                &agg.aggregator_name,
+                _flat_storage.chunks(stride),
+            );
         } else {
-            // No bound columns: full scan
-            for tuple in rel.iter_full() {
-                let cp = undo.len();
-                if self.match_agg_args(agg, tuple, binding, undo) {
-                    collected.push(
-                        agg.bound_vars
+            _flat_storage = Vec::new();
+            let mut collected: Vec<Vec<Value>> = Vec::new();
+            let bound_cols = self.find_bound_agg_columns(agg, binding);
+
+            if !bound_cols.is_empty() {
+                let (primary_pos, _) = bound_cols
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, (col, val))| rel.lookup(*col, val).len())
+                    .unwrap();
+                let (primary_col, primary_val) = &bound_cols[primary_pos];
+                let indices = rel.lookup(*primary_col, primary_val);
+
+                for &idx in indices {
+                    let tuple = rel.get(idx);
+                    if bound_cols.len() > 1 {
+                        let pre_match = bound_cols
                             .iter()
-                            .filter_map(|var_id| binding.get(var_id).cloned())
-                            .collect(),
-                    );
+                            .enumerate()
+                            .all(|(i, (col, val))| i == primary_pos || tuple[*col] == *val);
+                        if !pre_match {
+                            continue;
+                        }
+                    }
+                    let cp = undo.len();
+                    if self.match_agg_args(agg, tuple, binding, undo) {
+                        collected.push(
+                            agg.bound_vars
+                                .iter()
+                                .filter_map(|var_id| binding.get(var_id).cloned())
+                                .collect(),
+                        );
+                    }
+                    rollback(binding, undo, cp);
                 }
-                rollback(binding, undo, cp);
+            } else {
+                for tuple in rel.iter_full() {
+                    let cp = undo.len();
+                    if self.match_agg_args(agg, tuple, binding, undo) {
+                        collected.push(
+                            agg.bound_vars
+                                .iter()
+                                .filter_map(|var_id| binding.get(var_id).cloned())
+                                .collect(),
+                        );
+                    }
+                    rollback(binding, undo, cp);
+                }
             }
+
+            agg_results = apply_aggregator(
+                &agg.aggregator_name,
+                collected.iter().map(|v| v.as_slice()),
+            );
         }
 
         // Apply aggregator and recurse for each result
-        let agg_results =
-            apply_aggregator(&agg.aggregator_name, collected.iter().map(|v| v.as_slice()));
 
         for result_tuple in agg_results {
             let cp = undo.len();
@@ -2943,6 +2956,98 @@ impl Engine {
             );
             rollback(binding, undo, cp);
         }
+    }
+
+    /// Fast-path: collect aggregation values when all agg.args are plain Vars.
+    ///
+    /// Returns `Some(flat)` where `flat` is a flat buffer of values, stride = `agg.bound_vars.len()`,
+    /// each stride encoding one matching tuple's bound-var values — ready to pass to
+    /// `apply_aggregator` via `.chunks(stride)`.  Returns `None` if any arg is an Expr.
+    ///
+    /// This avoids per-match binding mutations and inner `Vec<Value>` allocations.
+    fn collect_agg_flat_vars(&self, agg: &CAggregation, binding: &Bindings) -> Option<Vec<Value>> {
+        use crate::compiled::CAggArg;
+
+        // Require all args to be plain Vars.
+        if !agg.args.iter().all(|a| matches!(a, CAggArg::Var(_))) {
+            return None;
+        }
+
+        let rel = self.relations.get(&agg.relation)?;
+        let n_bv = agg.bound_vars.len();
+
+        // Per-column plan: either filter by a pre-bound value, or extract to a bound_var slot.
+        enum ColPlan {
+            Filter(Value),
+            Extract(usize), // index into bound_vars
+            Skip,           // free var not in bound_vars (wildcard-like, ignored)
+        }
+        let col_plans: Vec<ColPlan> = agg
+            .args
+            .iter()
+            .map(|arg| {
+                let CAggArg::Var(var_id) = arg else { unreachable!() };
+                if let Some(val) = binding.get(var_id) {
+                    ColPlan::Filter(val.clone())
+                } else if let Some(pos) = agg.bound_vars.iter().position(|v| v == var_id) {
+                    ColPlan::Extract(pos)
+                } else {
+                    ColPlan::Skip
+                }
+            })
+            .collect();
+
+        // Primary filter column for index lookup (first Filter column).
+        let primary = col_plans.iter().enumerate().find_map(|(col, plan)| {
+            if let ColPlan::Filter(val) = plan {
+                Some((col, val))
+            } else {
+                None
+            }
+        });
+
+        let mut flat: Vec<Value> = Vec::new();
+
+        // Shared inline scan body: append one stride to flat if tuple passes all filters.
+        macro_rules! scan_tuple {
+            ($tuple:expr) => {{
+                let tuple = $tuple;
+                let start = flat.len();
+                flat.resize(start + n_bv.max(1), Value::Unit);
+                let mut ok = true;
+                for (col, plan) in col_plans.iter().enumerate() {
+                    match plan {
+                        ColPlan::Filter(expected) => {
+                            if tuple.get(col) != Some(expected) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        ColPlan::Extract(pos) => {
+                            if let Some(v) = tuple.get(col) {
+                                flat[start + pos] = v.clone();
+                            }
+                        }
+                        ColPlan::Skip => {}
+                    }
+                }
+                if !ok {
+                    flat.truncate(start);
+                }
+            }};
+        }
+
+        if let Some((primary_col, primary_val)) = primary {
+            for &idx in rel.lookup(primary_col, primary_val) {
+                scan_tuple!(rel.get(idx));
+            }
+        } else {
+            for tuple in rel.iter_full() {
+                scan_tuple!(tuple);
+            }
+        }
+
+        Some(flat)
     }
 
     /// Find aggregation columns that are already bound in the given bindings.
