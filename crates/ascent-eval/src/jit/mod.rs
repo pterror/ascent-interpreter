@@ -168,6 +168,12 @@ pub struct JitCompiler {
     /// Used to declare the right number of Cranelift Variables in JIT-compiled functions.
     #[cfg(feature = "specialized")]
     pub(crate) var_count: usize,
+    /// Peak dedup-table capacity observed per relation (relation name → cap).
+    ///
+    /// Updated after each stratum run completes; used to pre-size dedup tables
+    /// on the next engine's first stratum execution, avoiding repeated reallocs.
+    #[cfg(feature = "specialized")]
+    pub(crate) dedup_cap_hints: rustc_hash::FxHashMap<String, u32>,
 }
 
 // Safety: JitCompiler is only accessed from one thread at a time (guarded by Mutex).
@@ -279,6 +285,8 @@ impl JitCompiler {
             asm_buffers: Vec::new(),
             #[cfg(feature = "specialized")]
             var_count: 0,
+            #[cfg(feature = "specialized")]
+            dedup_cap_hints: FxHashMap::default(),
         })
     }
 

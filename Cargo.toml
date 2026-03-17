@@ -53,3 +53,7 @@ harness = false
 
 [profile.dev]
 debug = 0
+
+[profile.bench]
+debug = 2
+strip = "none"

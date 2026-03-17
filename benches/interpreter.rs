@@ -230,6 +230,32 @@ fn bench_triangle(c: &mut Criterion) {
             });
         });
 
+        // Setup-only: Engine::new + insert facts, no run. Subtract from jit_hot to isolate eval cost.
+        #[cfg(feature = "jit")]
+        group.bench_with_input(BenchmarkId::new("jit_setup_only", n), &n, |b, &n| {
+            let source = triangle_source_no_facts();
+            let (program, _) = prepare_program(&source);
+            let mut warmup = Engine::new(&program);
+            warmup.enable_jit();
+            for i in 1..=n {
+                for j in (i + 1)..=n {
+                    warmup.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                }
+            }
+            warmup.run(&program);
+            let compiled = warmup.share_jit_compiler().unwrap();
+            b.iter(|| {
+                let mut engine = Engine::new(&program);
+                engine.with_jit_compiler(compiled.clone());
+                for i in 1..=n {
+                    for j in (i + 1)..=n {
+                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                    }
+                }
+                engine
+            });
+        });
+
         group.bench_with_input(BenchmarkId::new("ascent_macro", n), &n, |b, &n| {
             b.iter(|| {
                 ascent! {

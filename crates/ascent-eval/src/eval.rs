@@ -1033,6 +1033,26 @@ impl Engine {
         // Otherwise fall back to the old path.
         let runtime = self.stratum_stage4_cache.get_mut(&stratum_key).unwrap();
 
+        // Step 3a: pre-size dedup tables for IDB head relations using hints from a
+        // previous run. This avoids 6–8 reallocs when a fresh engine derives the same
+        // number of tuples as the warmup run.
+        if let Some(jit_cell) = self.jit.as_ref() {
+            let jit = jit_cell.lock().unwrap();
+            if !jit.dedup_cap_hints.is_empty() {
+                use crate::relation::Relation;
+                for rule in rules {
+                    for head in &rule.heads {
+                        if let Some(&hint) = jit.dedup_cap_hints.get(head.relation.as_str())
+                            && let Some(Relation::Packed(ps)) =
+                                self.relations.get_mut(&head.relation)
+                        {
+                            ps.jit_dedup.reserve(hint);
+                        }
+                    }
+                }
+            }
+        }
+
         #[cfg(feature = "jit-asm")]
         if let (Some(native_fn), Some(native_runtime)) =
             (stage4_native_fn, runtime.stage4_native_runtime.as_mut())
@@ -1043,12 +1063,46 @@ impl Engine {
             type NativeFn = unsafe extern "C" fn(*mut crate::jit::packed_helpers::StratumStage4NativeCtx);
             let native_fn_typed: NativeFn = unsafe { std::mem::transmute(native_fn) };
             unsafe { native_fn_typed(&raw mut *native_runtime.ctx) };
+            // Update dedup capacity hints after the native path run.
+            self.update_dedup_cap_hints(rules);
             return true;
         }
 
         unsafe { stage4_fn(&raw mut *runtime.stage4_ctx) };
 
+        // Update dedup capacity hints for the next engine's first run.
+        self.update_dedup_cap_hints(rules);
+
         true
+    }
+
+    /// Record the peak dedup-table capacity for each IDB head relation into
+    /// `JitCompiler::dedup_cap_hints`.  Called after each stratum run completes.
+    /// After the final fixpoint advance, `jit_dedup.clear()` zeroes the count but
+    /// preserves the capacity allocation — so `handle.cap` is the peak capacity.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    fn update_dedup_cap_hints(&self, rules: &[&crate::compiled::CRule]) {
+        let Some(jit_cell) = self.jit.as_ref() else { return };
+        use crate::relation::Relation;
+        let mut hints: Vec<(String, u32)> = Vec::new();
+        for rule in rules {
+            for head in &rule.heads {
+                if let Some(Relation::Packed(ps)) = self.relations.get(&head.relation) {
+                    let cap = ps.jit_dedup.handle.cap;
+                    if cap > 0 {
+                        hints.push((head.relation.clone(), cap));
+                    }
+                }
+            }
+        }
+        if hints.is_empty() {
+            return;
+        }
+        let mut jit = jit_cell.lock().unwrap();
+        for (name, cap) in hints {
+            let entry = jit.dedup_cap_hints.entry(name).or_insert(0);
+            *entry = (*entry).max(cap);
+        }
     }
 
     /// Build the runtime context for Stage 4 stratum execution.

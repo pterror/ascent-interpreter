@@ -244,14 +244,13 @@ impl JitHashIndex {
             };
         }
 
-        // Group by key using a temporary FxHashMap.
-        let mut groups: rustc_hash::FxHashMap<u32, Vec<u32>> =
-            rustc_hash::FxHashMap::default();
-        for &(key, tuple_idx) in pairs {
-            groups.entry(key).or_default().push(tuple_idx);
-        }
+        // Sort by (key, value) — one allocation replaces FxHashMap + N group Vecs.
+        // Values within each key group end up sorted automatically.
+        let mut sorted: Vec<(u32, u32)> = pairs.to_vec();
+        sorted.sort_unstable();
 
-        let n = groups.len();
+        // Count distinct keys to size the hash table.
+        let n = 1 + sorted.windows(2).filter(|w| w[0].0 != w[1].0).count();
         let cap = (n * 2).next_power_of_two().max(4);
         let mask = (cap - 1) as u32;
 
@@ -261,26 +260,31 @@ impl JitHashIndex {
         let mut values: Vec<u32> = Vec::with_capacity(pairs.len());
         let mut len: u32 = 0;
 
-        for (key, group) in &mut groups {
-            group.sort_unstable();
+        // Walk sorted pairs, emitting each key group directly into entries + values.
+        let mut i = 0;
+        while i < sorted.len() {
+            let key = sorted[i].0;
             let start = values.len() as u32;
-            let count = group.len() as u32;
-            values.extend_from_slice(group);
+            while i < sorted.len() && sorted[i].0 == key {
+                values.push(sorted[i].1);
+                i += 1;
+            }
+            let count = values.len() as u32 - start;
 
-            if *key == EMPTY_KEY {
+            if key == EMPTY_KEY {
                 // Store in overflow slot at index cap.
                 let slot = &mut entries[cap];
-                slot.key = *key;
+                slot.key = key;
                 slot.head = start;
                 slot.count = count;
                 len += 1;
             } else {
-                let hash = knuth_hash(*key);
+                let hash = knuth_hash(key);
                 let mut slot_idx = hash & (cap - 1);
                 loop {
                     let slot = &mut entries[slot_idx];
                     if slot.key == EMPTY_KEY {
-                        slot.key = *key;
+                        slot.key = key;
                         slot.head = start;
                         slot.count = count;
                         len += 1;
@@ -804,6 +808,26 @@ impl JitDedupTable {
     pub fn clear(&mut self) {
         self.entries_vec.fill(JITDEDUP_EMPTY);
         self.count = 0;
+    }
+
+    /// Pre-allocate at least `hint_cap` slots without inserting any data.
+    ///
+    /// Does nothing if the table already has at least `hint_cap` capacity.
+    /// Used to avoid repeated reallocs when the expected number of unique tuples
+    /// is known from a previous run.
+    pub fn reserve(&mut self, hint_cap: u32) {
+        let cur_cap = self.handle.cap;
+        if cur_cap >= hint_cap {
+            return;
+        }
+        // Round up to the next power of two >= hint_cap.
+        let new_cap = (hint_cap as usize).next_power_of_two();
+        let stride = self.stride;
+        let mut new_entries = vec![JITDEDUP_EMPTY; new_cap * stride];
+        self.handle.entries = new_entries.as_mut_ptr();
+        self.handle.cap = new_cap as u32;
+        self.entries_vec = new_entries;
+        // count stays at 0.
     }
 
     /// Insert a packed tuple (unconditional — caller guarantees no duplicate).
