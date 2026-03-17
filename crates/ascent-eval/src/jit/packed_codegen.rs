@@ -1544,31 +1544,38 @@ fn gen_index_scan_v3(
         // values_ptr[entry_head .. entry_head+entry_count]:
         //   EDB arity-2: col-value mode — value IS free column data.
         //   All other non-recursive: tuple_idx mode.
+        //
+        // Use pointer-increment loop: pre-compute start_ptr/end_ptr once before
+        // the loop (hoisting uextend + imul + iadd out of the hot path), then
+        // advance elem_ptr by 4 bytes each iteration instead of recomputing the
+        // address from (entry_head + j) * 4 on every iteration.
         let entry_count = builder.block_params(after_probe)[1];
+
+        // Hoist address computation out of the loop body.
+        let head_ext    = builder.ins().uextend(ptr_type, entry_head);
+        let start_off   = builder.ins().imul_imm(head_ext, 4_i64);
+        let start_ptr   = builder.ins().iadd(values_ptr, start_off);
+        let count_ext   = builder.ins().uextend(ptr_type, entry_count);
+        let count_bytes = builder.ins().imul_imm(count_ext, 4_i64);
+        let end_ptr     = builder.ins().iadd(start_ptr, count_bytes);
+
         let loop_header = builder.create_block();
         let loop_body   = builder.create_block();
         let loop_exit   = builder.create_block();
 
-        let var_j = Variable::new(*next_var);
+        let var_elem_ptr = Variable::new(*next_var);
         *next_var += 1;
-        builder.declare_var(var_j, I32);
-        let zero_i32_j = builder.ins().iconst(I32, 0);
-        builder.def_var(var_j, zero_i32_j);
+        builder.declare_var(var_elem_ptr, ptr_type);
+        builder.def_var(var_elem_ptr, start_ptr);
         builder.ins().jump(loop_header, &[]);
 
         builder.switch_to_block(loop_header);
-        let j = builder.use_var(var_j);
-        let is_done = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, j, entry_count);
+        let elem_ptr = builder.use_var(var_elem_ptr);
+        let is_done  = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, elem_ptr, end_ptr);
         builder.ins().brif(is_done, loop_exit, &[], loop_body, &[]);
 
         builder.switch_to_block(loop_body);
-        let j = builder.use_var(var_j);
-        // byte_offset = (entry_head + j) * 4
-        let j_ext       = builder.ins().uextend(ptr_type, j);
-        let start_ext   = builder.ins().uextend(ptr_type, entry_head);
-        let idx_in_vals = builder.ins().iadd(start_ext, j_ext);
-        let byte_off    = builder.ins().imul_imm(idx_in_vals, 4_i64);
-        let elem_addr   = builder.ins().iadd(values_ptr, byte_off);
+        let elem_addr = builder.use_var(var_elem_ptr);
 
         let continue_block = builder.create_block();
         let mut inner_blocks_to_seal = Vec::new();
@@ -1686,11 +1693,10 @@ fn gen_index_scan_v3(
         }
         builder.seal_block(continue_block);
 
-        // j++
-        let j = builder.use_var(var_j);
-        let one_i32 = builder.ins().iconst(I32, 1);
-        let j_next  = builder.ins().iadd(j, one_i32);
-        builder.def_var(var_j, j_next);
+        // elem_ptr += 4 (advance to next element)
+        let elem_ptr      = builder.use_var(var_elem_ptr);
+        let elem_ptr_next = builder.ins().iadd_imm(elem_ptr, 4_i64);
+        builder.def_var(var_elem_ptr, elem_ptr_next);
         builder.ins().jump(loop_header, &[]);
 
         builder.switch_to_block(loop_exit);
