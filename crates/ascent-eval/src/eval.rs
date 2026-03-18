@@ -266,6 +266,10 @@ struct StratumStage4Runtime {
     _all_rels: Box<[*mut crate::specialized::PackedStorage]>,
     /// Per-rule dedup handle pointer arrays (one *mut JitDedupHandle per head relation per rule).
     _per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>>,
+    /// Inline hash-probe lookup handles; stage4_ctx.handles_buf points into this.
+    _handles_buf: Box<[crate::jit_index::JitLookupHandle]>,
+    /// Lookup specs parallel to _handles_buf; stage4_ctx.lookup_specs points into this.
+    _lookup_specs: Box<[crate::jit::packed_helpers::LookupSpec]>,
     /// Optional native fast-path runtime (Step 3). `None` if any relation lacks `jit_native`.
     stage4_native_runtime: Option<crate::jit::packed_helpers::StratumStage4NativeRuntime>,
 }
@@ -975,11 +979,24 @@ impl Engine {
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule], native_fn_available: bool) -> Option<StratumStage4Runtime> {
-        use crate::jit::packed_helpers::{JitRelSpec, LookupSpec, PackedJitContextV3, StratumStage4Ctx};
-        use crate::jit::storage::JitRelData;
+        use crate::jit::packed_helpers::{LookupSpec, PackedJitContextV3, StratumStage4Ctx};
         use crate::jit_index::JitLookupHandle;
         use crate::relation::Relation;
         use crate::specialized::PackedStorage;
+
+        // Rebuild stale JIT indices before building handles: asm-native strata may have
+        // skipped update_jit_indices(), leaving jit_indices/jit_recent_indices stale for IDB rels.
+        if !native_fn_available {
+            for rule in rules {
+                for item in &rule.body {
+                    if let CBodyItem::Clause(c) = item
+                        && let Some(Relation::Packed(ps)) = self.relations.get_mut(&c.relation)
+                    {
+                        ps.update_jit_indices();
+                    }
+                }
+            }
+        }
 
         let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
         let mut per_rule_head_rels: Vec<Box<[*mut PackedStorage]>> = Vec::new();
@@ -993,25 +1010,6 @@ impl Engine {
         let mut specs_flat: Vec<LookupSpec> = Vec::new();
         // Starting handle index for each rule (for setting lookup_handles ptr later).
         let mut rule_handle_offsets: Vec<usize> = Vec::new();
-
-        // Flat JitRelSpec array parallel to handles_flat (for jit_rel_ptrs refresh).
-        // Starting offset per rule (same as rule_handle_offsets since parallel layout).
-        let mut jit_rel_specs_flat: Vec<JitRelSpec> = Vec::new();
-
-        // Initialize lean jit_native projections on EDB body-clause relations so
-        // jit_rel_ptrs can point into jit_native.total / .recent when native path is absent.
-        if !native_fn_available {
-            for rule in rules {
-                for item in &rule.body {
-                    if let CBodyItem::Clause(c) = item
-                        && let Some(Relation::Packed(ps)) = self.relations.get_mut(&c.relation)
-                        && ps.jit_native.is_none()
-                        && ps.jit_is_edb {
-                        ps.jit_native = Some(ps.build_native_projection_lean());
-                    }
-                }
-            }
-        }
 
         for rule in rules {
             // Clause rel pointers
@@ -1138,13 +1136,6 @@ impl Engine {
                             use_recent: use_recent_flag,
                         });
                     }
-                    // jit_rel_specs: one entry per (clause_offset * 2 + use_recent), parallel to handles.
-                    jit_rel_specs_flat.push(JitRelSpec {
-                        rel: rel_ptr as *mut PackedStorage,
-                        use_recent: use_recent_flag,
-                        _pad: 0,
-                    });
-                    let _ = clause_offset; // already used above
                 }
             }
 
@@ -1183,87 +1174,11 @@ impl Engine {
         let mut handles_box: Box<[JitLookupHandle]> = handles_flat.into_boxed_slice();
         let specs_box: Box<[LookupSpec]> = specs_flat.into_boxed_slice();
 
-        // Build tuple_sets_buf: parallel to handles_buf.
-        // For fully-bound clauses (clause_offset > 0 and fresh_cols.is_empty()),
-        // store a pointer to a JitTupleSet built from the total relation's packed data.
-        // All other slots are null.
-        let mut tuple_sets_storage: Vec<*const crate::jit::storage::JitTupleSet> =
-            vec![std::ptr::null(); total_handles as usize];
-        let mut tuple_set_boxes: Vec<Box<crate::jit::storage::JitTupleSet>> = Vec::new();
-        for (rule_i, rule) in rules.iter().enumerate() {
-            let rule_handle_start = rule_handle_offsets[rule_i];
-            let rule_clauses: Vec<&crate::compiled::CClause> = rule
-                .body
-                .iter()
-                .filter_map(|item| match item {
-                    CBodyItem::Clause(c) => Some(c),
-                    _ => None,
-                })
-                .collect();
-            for (clause_offset, clause) in rule_clauses.iter().enumerate() {
-                if clause_offset == 0 {
-                    // Clause 0 is always a full scan; skip.
-                    continue;
-                }
-                if !clause.fresh_cols.is_empty() {
-                    // Not fully-bound; no tuple set needed.
-                    continue;
-                }
-                // Fully-bound inner clause: build JitTupleSet from total relation.
-                let ps = match self.relations.get(&clause.relation) {
-                    Some(Relation::Packed(p)) => p,
-                    _ => continue,
-                };
-                let arity = ps.arity;
-                let ts = crate::jit::storage::JitTupleSet::build(&ps.packed_data, arity);
-                tuple_set_boxes.push(ts);
-                let ts_ptr = tuple_set_boxes.last().unwrap().as_ref() as *const crate::jit::storage::JitTupleSet;
-                // Store for both use_recent variants (the tuple set is for total, correct
-                // for existence checks regardless of which delta is being iterated).
-                let base = rule_handle_start + clause_offset * 2;
-                tuple_sets_storage[base] = ts_ptr;
-                tuple_sets_storage[base + 1] = ts_ptr;
-            }
-        }
-        let tuple_sets_box: Box<[*const crate::jit::storage::JitTupleSet]> =
-            tuple_sets_storage.into_boxed_slice();
-
         // Fix up per-rule ctx lookup_handles pointers now that handles_box is stable.
         for (rule_i, ctx) in per_rule_ctxs.iter_mut().enumerate() {
             let offset = rule_handle_offsets[rule_i];
             // SAFETY: handles_box is pinned in a Box which won't move.
             ctx.lookup_handles = unsafe { handles_box.as_mut_ptr().add(offset) };
-        }
-
-        // Build jit_rel_ptrs flat buffer and jit_rel_specs box.
-        // jit_rel_specs is parallel to handles_flat (same indexing: clause_offset * 2 + use_recent).
-        // jit_rel_ptrs is a mutable buffer initialized from the current jit_native state.
-        let total_jit_rels = jit_rel_specs_flat.len() as u32;
-        let jit_rel_specs_box: Box<[JitRelSpec]> = jit_rel_specs_flat.into_boxed_slice();
-        // Initialize jit_rel_ptrs: for each spec, resolve the current jit_native pointer.
-        let mut jit_rel_ptrs_init: Vec<*const JitRelData> =
-            Vec::with_capacity(total_jit_rels as usize);
-        for spec in jit_rel_specs_box.iter() {
-            let ps = unsafe { &*spec.rel };
-            let jrel: *const JitRelData = if let Some(native) = ps.jit_native.as_ref() {
-                if spec.use_recent != 0 {
-                    native.recent.as_ref() as *const JitRelData
-                } else {
-                    native.total.as_ref() as *const JitRelData
-                }
-            } else {
-                std::ptr::null()
-            };
-            jit_rel_ptrs_init.push(jrel);
-        }
-        let mut jit_rel_ptrs_box: Box<[*const JitRelData]> =
-            jit_rel_ptrs_init.into_boxed_slice();
-
-        // Fix up per-rule ctx jit_rels pointers into jit_rel_ptrs_box.
-        // Each rule's slice starts at the same offset as its handles (rule_handle_offsets).
-        for (rule_i, ctx) in per_rule_ctxs.iter_mut().enumerate() {
-            let offset = rule_handle_offsets[rule_i];
-            ctx.jit_rels = unsafe { jit_rel_ptrs_box.as_mut_ptr().add(offset) };
         }
 
         // All packed rels for advance()
@@ -1291,10 +1206,11 @@ impl Engine {
             lookup_specs: specs_box.as_ptr(),
             total_handles,
             _pad3: 0,
-            tuple_sets_buf: tuple_sets_box.as_ptr(),
-            jit_rel_specs: jit_rel_specs_box.as_ptr(),
-            jit_rel_ptrs: jit_rel_ptrs_box.as_mut_ptr(),
-            total_jit_rels,
+            // Cranelift-only fields: not used by asm backend.
+            tuple_sets_buf: std::ptr::null(),
+            jit_rel_specs: std::ptr::null(),
+            jit_rel_ptrs: std::ptr::null_mut(),
+            total_jit_rels: 0,
             _pad5: 0,
         });
 
@@ -1316,6 +1232,8 @@ impl Engine {
             _rule_ctx_ptrs: rule_ctx_ptrs_box,
             _all_rels: all_rels_box,
             _per_rule_dedup_handles: per_rule_dedup_handles,
+            _handles_buf: handles_box,
+            _lookup_specs: specs_box,
             stage4_native_runtime: native_runtime,
         })
     }

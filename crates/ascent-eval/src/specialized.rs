@@ -323,33 +323,7 @@ impl PackedStorage {
     ///
     /// Used for Cranelift strata that only read `data` and `len` directly from
     /// `JitRelData` and never probe `col_indices`.
-    pub(crate) fn build_native_projection_lean(
-        &self,
-    ) -> crate::jit::storage::JitNativeRelData {
-        use crate::jit::storage::{JitNativeRelData, JitRelData};
-
-        let arity = self.arity;
-        let total_slice = &self.packed_data[0..self.count * arity.max(1)];
-
-        let mut recent_buf: Vec<u32> = Vec::with_capacity(self.recent.len() * arity.max(1));
-        for &idx in &self.recent {
-            let start = idx * arity;
-            recent_buf.extend_from_slice(&self.packed_data[start..start + arity]);
-        }
-
-        JitNativeRelData {
-            // build_indices=false: Cranelift path never probes JitColIndex.
-            total: JitRelData::build_from_packed(total_slice, arity, false),
-            // `recent` is only iterated, never probed — skip tuple_set too.
-            recent: JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, false),
-            // The Cranelift path does not write to jit_native.new; keep an empty placeholder.
-            new: JitRelData::build_from_packed(&[], arity, false),
-            total_built_count: self.count,
-            build_indices: false,
-        }
-    }
-
-    #[inline]
+#[inline]
     fn value_slice(&self, idx: usize) -> &[Value] {
         &self.value_data[idx * self.arity..(idx + 1) * self.arity]
     }
