@@ -8,6 +8,7 @@ use crate::value::Value;
 pub const VALUE_SIZE: usize = mem::size_of::<Value>();
 
 /// Alignment of a `Value` enum in bytes.
+#[allow(dead_code)]
 pub const VALUE_ALIGN: usize = mem::align_of::<Value>();
 
 /// Size of an `Option<Value>` (one binding slot) in bytes.

@@ -341,6 +341,7 @@ const _: () = {
 };
 
 /// Type alias for the stratum meta-function pointer.
+#[allow(dead_code)]
 pub type StratumMetaFn = unsafe extern "C" fn(*mut StratumMetaCtx);
 
 // ─── Stage 3: direct-insert rule variants ───────────────────────────
@@ -417,6 +418,7 @@ pub struct StratumStage3Ctx {
     pub _pad: u32,
 }
 
+#[allow(dead_code)]
 pub type StratumStage3Fn = unsafe extern "C" fn(*mut StratumStage3Ctx);
 
 #[cfg(target_pointer_width = "64")]

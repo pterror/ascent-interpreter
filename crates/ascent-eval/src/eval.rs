@@ -253,64 +253,6 @@ impl Stratification {
     }
 }
 
-/// Buffer type for per-rule JIT results: (head_rel_idx, packed_tuple).
-#[cfg(all(feature = "jit", feature = "specialized"))]
-type RuleResultsBuf = Vec<(usize, Vec<u32>)>;
-
-/// Pinned heap allocations backing a stratum meta-function's context.
-///
-/// Raw pointers inside `StratumMetaCtx` point into these allocations, so they
-/// must all outlive the `StratumMetaCtx` they support.  The struct is intentionally
-/// not `Send`/`Sync`; Engine is single-threaded.
-#[cfg(all(feature = "jit", feature = "specialized"))]
-// Box<Vec<T>> is intentional: stable heap address for raw-pointer aliasing.
-#[allow(dead_code, clippy::vec_box)]
-struct StratumMetaRuntime {
-    meta_ctx: Box<crate::jit::packed_helpers::StratumMetaCtx>,
-    // Fields prefixed with `_` are kept alive for their raw pointers; not read directly.
-    _per_rule_bindings: Vec<Box<[u32]>>,
-    _per_rule_results: Vec<Box<RuleResultsBuf>>,
-    _per_rule_clause_rels: Vec<Box<[*const crate::specialized::PackedStorage]>>,
-    _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContext>>,
-    _full_fns: Box<[crate::jit::packed_helpers::PackedJitFn]>,
-    _full_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContext]>,
-    _recent_fns: Box<[crate::jit::packed_helpers::PackedJitFn]>,
-    _recent_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContext]>,
-    _flusher: Box<crate::jit::packed_helpers::StratumFlusher>,
-}
-
-#[cfg(all(feature = "jit", feature = "specialized"))]
-impl std::fmt::Debug for StratumMetaRuntime {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StratumMetaRuntime").finish_non_exhaustive()
-    }
-}
-
-/// Pinned runtime data for a Stage 3 stratum function (direct-insert, no results buffer).
-/// All raw pointers in `stage3_ctx` point into the boxes below.
-#[cfg(all(feature = "jit", feature = "specialized"))]
-#[allow(dead_code, clippy::vec_box)]
-struct StratumStage3Runtime {
-    stage3_ctx: Box<crate::jit::packed_helpers::StratumStage3Ctx>,
-    _per_rule_clause_rels: Vec<Box<[*const crate::specialized::PackedStorage]>>,
-    _per_rule_head_rels: Vec<Box<[*mut crate::specialized::PackedStorage]>>,
-    _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContextV3>>,
-    _full_fns: Box<[crate::jit::packed_helpers::PackedJitFnV3]>,
-    _full_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContextV3]>,
-    _recent_fns: Box<[crate::jit::packed_helpers::PackedJitFnV3]>,
-    _recent_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContextV3]>,
-    _all_rels: Box<[*mut crate::specialized::PackedStorage]>,
-    /// Per-rule dedup handle pointer arrays (one *mut JitDedupHandle per head relation per rule).
-    _per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>>,
-}
-
-#[cfg(all(feature = "jit", feature = "specialized"))]
-impl std::fmt::Debug for StratumStage3Runtime {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StratumStage3Runtime").finish_non_exhaustive()
-    }
-}
-
 /// Pinned runtime data for a Stage 4 stratum function (inlined rule bodies).
 /// All raw pointers in `stage4_ctx` point into the boxes below.
 #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -322,22 +264,9 @@ struct StratumStage4Runtime {
     _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContextV3>>,
     _rule_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContextV3]>,
     _all_rels: Box<[*mut crate::specialized::PackedStorage]>,
-    /// Flat buffer of all JitLookupHandle for all rules (handles_buf in ctx).
-    _handles_buf: Box<[crate::jit_index::JitLookupHandle]>,
-    /// Parallel spec array for handle refresh (lookup_specs in ctx).
-    _lookup_specs: Box<[crate::jit::packed_helpers::LookupSpec]>,
     /// Per-rule dedup handle pointer arrays (one *mut JitDedupHandle per head relation per rule).
     _per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>>,
-    /// Owned JitTupleSet boxes (one per fully-bound inner clause).
-    _tuple_sets: Vec<Box<crate::jit::storage::JitTupleSet>>,
-    /// Flat pointer array parallel to handles_buf (tuple_sets_buf in ctx).
-    _tuple_sets_buf: Box<[*const crate::jit::storage::JitTupleSet]>,
-    /// Flat spec array parallel to jit_rel_ptrs (jit_rel_specs in ctx).
-    _jit_rel_specs: Box<[crate::jit::packed_helpers::JitRelSpec]>,
-    /// Flat mutable pointer array (jit_rel_ptrs in ctx); refreshed by jit_stratum_advance_s4.
-    _jit_rel_ptrs: Box<[*const crate::jit::storage::JitRelData]>,
     /// Optional native fast-path runtime (Step 3). `None` if any relation lacks `jit_native`.
-    /// TODO: compile native JIT function (Step 4)
     stage4_native_runtime: Option<crate::jit::packed_helpers::StratumStage4NativeRuntime>,
 }
 
@@ -373,12 +302,6 @@ pub struct Engine {
     /// Arc<Mutex> allows sharing a pre-compiled JIT across Engine instances.
     #[cfg(feature = "jit")]
     jit: Option<Arc<Mutex<crate::jit::JitCompiler>>>,
-    /// Cache of stratum meta-function runtime contexts.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    stratum_meta_cache: FxHashMap<usize, StratumMetaRuntime>,
-    /// Cache of Stage 3 stratum runtime contexts.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    stratum_stage3_cache: FxHashMap<usize, StratumStage3Runtime>,
     /// Cache of Stage 4 stratum runtime contexts (inlined rule bodies).
     #[cfg(all(feature = "jit", feature = "specialized"))]
     stratum_stage4_cache: FxHashMap<usize, StratumStage4Runtime>,
@@ -430,10 +353,6 @@ impl Engine {
             stratification: None,
             #[cfg(feature = "jit")]
             jit: None,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
-            stratum_meta_cache: FxHashMap::default(),
-            #[cfg(all(feature = "jit", feature = "specialized"))]
-            stratum_stage3_cache: FxHashMap::default(),
             #[cfg(all(feature = "jit", feature = "specialized"))]
             stratum_stage4_cache: FxHashMap::default(),
         }
@@ -800,18 +719,6 @@ impl Engine {
             return;
         }
 
-        // Fast path: Stage 3 stratum (direct-insert, no results buffer)
-        #[cfg(all(feature = "jit", feature = "specialized"))]
-        if self.try_run_stratum_stage3(rules, scc_key, rule_indices) {
-            return;
-        }
-
-        // Fallback: Stage 2 stratum meta-function (buffered JIT loop)
-        #[cfg(all(feature = "jit", feature = "specialized"))]
-        if self.try_run_stratum_meta(rules, scc_key, rule_indices) {
-            return;
-        }
-
         // Interpreter fallback: sync interpreter state for all packed relations.
         // JIT strata skip updating indices/value_data/source_tags; the interpreter
         // reads those structures, so they must be synced before evaluation begins.
@@ -852,58 +759,6 @@ impl Engine {
                 }
             }
         }
-    }
-
-    /// Try to run the stratum via the compiled meta-function.
-    ///
-    /// Returns `true` if successful (all rules are packed-JIT eligible and the
-    /// meta-function was compiled), `false` to fall back to the interpreted loop.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn try_run_stratum_meta(&mut self, rules: &[&CRule], scc_key: usize, rule_indices: &[usize]) -> bool {
-        if rules.is_empty() {
-            return false;
-        }
-
-        let stratum_key = scc_key;
-
-        // Step 1: ensure all packed rules are compiled
-        {
-            let Some(jit_cell) = self.jit.as_ref() else {
-                return false;
-            };
-            let mut jit = jit_cell.lock().unwrap();
-            for (rule, &rule_idx) in rules.iter().zip(rule_indices.iter()) {
-                if jit.get_or_compile_packed(rule_idx, rule).is_none() {
-                    return false;
-                }
-            }
-        }
-
-        // Step 2: build the runtime context if not yet cached
-        if !self.stratum_meta_cache.contains_key(&stratum_key) {
-            let runtime = match self.build_stratum_meta_runtime(rules, rule_indices) {
-                Some(r) => r,
-                None => return false,
-            };
-            self.stratum_meta_cache.insert(stratum_key, runtime);
-        }
-
-        // Step 3: compile or retrieve the stratum meta-function
-        let meta_fn = {
-            let Some(jit_cell) = self.jit.as_ref() else {
-                return false;
-            };
-            let mut jit = jit_cell.lock().unwrap();
-            match jit.compile_stratum_meta(stratum_key, rules) {
-                Some(f) => f,
-                None => return false,
-            }
-        };
-
-        // Step 4: call the meta-function
-        let runtime = self.stratum_meta_cache.get_mut(&stratum_key).unwrap();
-        unsafe { meta_fn(&raw mut *runtime.meta_ctx) };
-        true
     }
 
     /// Try to run the stratum via the Stage 4 compiled function (inlined rule bodies).
@@ -1002,10 +857,8 @@ impl Engine {
             }
         };
 
-        // Step 1b: also compile the native function if the jit-asm feature is available.
-        // The native fn reads scan data directly from JitRelData (no packed_count/pdptr callbacks).
+        // Step 1b: also compile the native function (reads scan data directly from JitRelData).
         // This is compiled speculatively; it will only be used if stage4_native_runtime is Some.
-        #[cfg(feature = "jit-asm")]
         let stage4_native_fn: Option<crate::jit::packed_helpers::StratumStage4Fn> =
             self.jit.as_ref().and_then(|jit_cell| {
                 let mut jit = jit_cell.lock().unwrap();
@@ -1013,32 +866,11 @@ impl Engine {
                 jit.compile_stratum_stage4_native(stratum_key, rules)
             });
 
-        // Step 2: build the runtime context if not yet cached.
-        // Pass whether the native fn compiled so `build_stratum_stage4_runtime` can skip
-        // the expensive `build_stratum_stage4_native_runtime` call (and jit_native init)
-        // when the asm native path will never activate for this stratum.
-        #[cfg(feature = "jit-asm")]
         let native_fn_available = stage4_native_fn.is_some();
-        #[cfg(not(feature = "jit-asm"))]
-        let native_fn_available = false;
 
-        // Whether the stage4_fn was compiled by the non-native asm backend.
-        // Non-native asm uses packed_data_ptr callbacks (not JitHashIndex), so it doesn't
-        // need `jit_used_in_cranelift_strata` marking — only Cranelift does.
-        #[cfg(feature = "jit-asm")]
-        let stage4_fn_is_asm = self.jit.as_ref()
-            .map(|jit_cell| jit_cell.lock().unwrap().stratum_stage4_fn_is_asm(stratum_key))
-            .unwrap_or(false);
-        // When jit-asm is not enabled, stage4_fn always comes from Cranelift.
-        #[cfg(not(feature = "jit-asm"))]
-        let stage4_fn_is_asm = false;
-
-        // `uses_cranelift`: the stage4_fn is a Cranelift function (not non-native asm).
-        // Only Cranelift strata probe JitHashIndex, so only they need the flag set.
-        let uses_cranelift = !stage4_fn_is_asm && !native_fn_available;
-
+        // Step 2: build the runtime context if not yet cached.
         if !self.stratum_stage4_cache.contains_key(&stratum_key) {
-            let runtime = match self.build_stratum_stage4_runtime(rules, native_fn_available, uses_cranelift) {
+            let runtime = match self.build_stratum_stage4_runtime(rules, native_fn_available) {
                 Some(r) => r,
                 None => return false,
             };
@@ -1080,7 +912,6 @@ impl Engine {
             }
         }
 
-        #[cfg(feature = "jit-asm")]
         if let (Some(native_fn), Some(native_runtime)) =
             (stage4_native_fn, runtime.stage4_native_runtime.as_mut())
         {
@@ -1143,7 +974,7 @@ impl Engine {
     ///
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule], native_fn_available: bool, _uses_cranelift: bool) -> Option<StratumStage4Runtime> {
+    fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule], native_fn_available: bool) -> Option<StratumStage4Runtime> {
         use crate::jit::packed_helpers::{JitRelSpec, LookupSpec, PackedJitContextV3, StratumStage4Ctx};
         use crate::jit::storage::JitRelData;
         use crate::jit_index::JitLookupHandle;
@@ -1167,36 +998,8 @@ impl Engine {
         // Starting offset per rule (same as rule_handle_offsets since parallel layout).
         let mut jit_rel_specs_flat: Vec<JitRelSpec> = Vec::new();
 
-        // When the Cranelift path will be used (native not available), mark all body-clause
-        // relations as needing hash indices.  This prevents `advance_jit_skip_hash_indices`
-        // from skipping `update_jit_indices()` on asm-native strata that run before this
-        // stratum, which would leave stale handles in this Cranelift context.
-        // When the Cranelift path will be used (native not available), mark all body-clause
-        // relations as needing hash indices, and immediately rebuild any stale indices.
-        // This handles two cases:
-        //   1. An earlier asm-native stratum skipped update_jit_indices(), leaving stale indices.
-        //      We rebuild them now so handles below read correct data.
-        //   2. Future asm-native strata must NOT skip for these relations, so we set the sticky
-        //      jit_used_in_cranelift_strata flag.
-        #[cfg(feature = "jit-asm")]
-        if !native_fn_available {
-            for rule in rules {
-                for item in &rule.body {
-                    if let CBodyItem::Clause(c) = item
-                        && let Some(Relation::Packed(ps)) = self.relations.get_mut(&c.relation) {
-                        ps.jit_used_in_cranelift_strata = true;
-                        // Rebuild indices if stale (asm-native strata may have skipped them).
-                        ps.update_jit_indices();
-                    }
-                }
-            }
-        }
-
-        // For the Cranelift direct-load path (Step 6): initialize lean jit_native projections
-        // on EDB (jit_is_edb=true) body-clause relations so jit_rel_ptrs can point into
-        // jit_native.total / .recent.  IDB relations are skipped: their per-iteration
-        // recent-JitRelData rebuild costs more than the callback savings.
-        // Only when native_fn_available=false (i.e. the asm path won't manage jit_native for us).
+        // Initialize lean jit_native projections on EDB body-clause relations so
+        // jit_rel_ptrs can point into jit_native.total / .recent when native path is absent.
         if !native_fn_available {
             for rule in rules {
                 for item in &rule.body {
@@ -1499,14 +1302,11 @@ impl Engine {
         // Skipping this when native_fn_available=false avoids initializing jit_native on
         // every PackedStorage, which would then be rebuilt on every fixpoint iteration even
         // though the native asm path is never used (e.g. fibonacci unsupported exprs).
-        #[cfg(feature = "jit-asm")]
         let native_runtime = if native_fn_available {
             self.build_stratum_stage4_native_runtime(rules)
         } else {
             None
         };
-        #[cfg(not(feature = "jit-asm"))]
-        let native_runtime: Option<crate::jit::packed_helpers::StratumStage4NativeRuntime> = None;
 
         Some(StratumStage4Runtime {
             stage4_ctx,
@@ -1515,13 +1315,7 @@ impl Engine {
             _per_rule_ctxs: per_rule_ctxs,
             _rule_ctx_ptrs: rule_ctx_ptrs_box,
             _all_rels: all_rels_box,
-            _handles_buf: handles_box,
-            _lookup_specs: specs_box,
             _per_rule_dedup_handles: per_rule_dedup_handles,
-            _tuple_sets: tuple_set_boxes,
-            _tuple_sets_buf: tuple_sets_box,
-            _jit_rel_specs: jit_rel_specs_box,
-            _jit_rel_ptrs: jit_rel_ptrs_box,
             stage4_native_runtime: native_runtime,
         })
     }
@@ -1696,380 +1490,6 @@ impl Engine {
         })
     }
 
-    /// Try to run the stratum via the Stage 3 compiled function (direct-insert, no buffer).
-    ///
-    /// Returns `true` if successful, `false` to fall back to Stage 2 or interpreted.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn try_run_stratum_stage3(&mut self, rules: &[&CRule], scc_key: usize, rule_indices: &[usize]) -> bool {
-        if rules.is_empty() {
-            return false;
-        }
-
-        let stratum_key = scc_key;
-
-        // Step 1: ensure all V3 packed rules are compiled
-        {
-            let Some(jit_cell) = self.jit.as_ref() else {
-                return false;
-            };
-            let mut jit = jit_cell.lock().unwrap();
-            jit.var_count = self.var_count;
-            for (rule, &rule_idx) in rules.iter().zip(rule_indices.iter()) {
-                if jit.get_or_compile_packed_v3(rule_idx, rule).is_none() {
-                    return false;
-                }
-            }
-        }
-
-        // Step 2: build the runtime context if not yet cached
-        if !self.stratum_stage3_cache.contains_key(&stratum_key) {
-            let runtime = match self.build_stratum_stage3_runtime(rules, rule_indices) {
-                Some(r) => r,
-                None => return false,
-            };
-            self.stratum_stage3_cache.insert(stratum_key, runtime);
-        }
-
-        // Step 3: compile or retrieve the Stage 3 stratum function
-        let stage3_fn = {
-            let Some(jit_cell) = self.jit.as_ref() else {
-                return false;
-            };
-            let mut jit = jit_cell.lock().unwrap();
-            match jit.compile_stratum_stage3(stratum_key, rules) {
-                Some(f) => f,
-                None => return false,
-            }
-        };
-
-        // Step 4: call the Stage 3 stratum function
-        let runtime = self.stratum_stage3_cache.get_mut(&stratum_key).unwrap();
-        unsafe { stage3_fn(&raw mut *runtime.stage3_ctx) };
-        true
-    }
-
-    /// Build the runtime context for Stage 3 stratum execution.
-    ///
-    /// Returns `None` if any rule doesn't have all-packed clause or head relations.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn build_stratum_stage3_runtime(&self, rules: &[&CRule], rule_indices: &[usize]) -> Option<StratumStage3Runtime> {
-        use crate::jit::packed_helpers::{PackedJitContextV3, StratumStage3Ctx};
-        use crate::relation::Relation;
-        use crate::specialized::PackedStorage;
-
-        let jit_ref = self.jit.as_ref()?.lock().unwrap();
-
-        let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
-        let mut per_rule_head_rels: Vec<Box<[*mut PackedStorage]>> = Vec::new();
-        let mut per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>> =
-            Vec::new();
-        let mut per_rule_ctxs: Vec<Box<PackedJitContextV3>> = Vec::new();
-
-        let mut full_fns_vec: Vec<crate::jit::packed_helpers::PackedJitFnV3> = Vec::new();
-        let mut full_ctx_ptrs_vec: Vec<*mut PackedJitContextV3> = Vec::new();
-        let mut recent_fns_vec: Vec<crate::jit::packed_helpers::PackedJitFnV3> = Vec::new();
-        let mut recent_ctx_ptrs_vec: Vec<*mut PackedJitContextV3> = Vec::new();
-
-        for (rule, &rule_idx) in rules.iter().zip(rule_indices.iter()) {
-            let compiled = jit_ref.packed_cache_v3.get(&rule_idx)?.as_ref()?;
-
-            let full_fn = compiled.full_variant()?;
-
-            // Clause rel pointers
-            let clause_rels: Vec<*const PackedStorage> = rule
-                .body
-                .iter()
-                .filter_map(|item| match item {
-                    CBodyItem::Clause(c) => match self.relations.get(&c.relation)? {
-                        Relation::Packed(p) => Some(p as *const PackedStorage),
-                        Relation::Generic(_) => None,
-                    },
-                    _ => None,
-                })
-                .collect();
-
-            let clause_count = rule
-                .body
-                .iter()
-                .filter(|i| matches!(i, CBodyItem::Clause(_)))
-                .count();
-
-            if clause_rels.len() != clause_count {
-                return None;
-            }
-
-            // Head rel pointers
-            let head_rels: Vec<*mut PackedStorage> = rule
-                .heads
-                .iter()
-                .filter_map(|head| match self.relations.get(&head.relation)? {
-                    Relation::Packed(p) => {
-                        Some(p as *const PackedStorage as *mut PackedStorage)
-                    }
-                    Relation::Generic(_) => None,
-                })
-                .collect();
-
-            if head_rels.len() != rule.heads.len() {
-                return None;
-            }
-
-            let clause_rels_box: Box<[*const PackedStorage]> = clause_rels.into_boxed_slice();
-            let head_rels_box: Box<[*mut PackedStorage]> = head_rels.into_boxed_slice();
-            let head_rels_ptr: *const *mut PackedStorage = head_rels_box.as_ptr();
-
-            // Build dedup handle pointers (one per head relation).
-            let dedup_handles: Box<[*mut crate::jit_index::JitDedupHandle]> = head_rels_box
-                .iter()
-                .map(|&ps| unsafe { &raw mut (*ps).jit_dedup.handle })
-                .collect();
-            let head_dedup_handles_ptr = dedup_handles.as_ptr();
-
-            let ctx = Box::new(PackedJitContextV3 {
-                rels: clause_rels_box.as_ptr(),
-                rels_len: clause_rels_box.len() as u32,
-                _pad: 0,
-                head_rels: head_rels_ptr,
-                lookup_handles: std::ptr::null(),
-                head_dedup_handles: head_dedup_handles_ptr,
-                jit_rels: std::ptr::null(),
-            });
-
-            // Build recent variants for this rule
-            let mut clause_seq = 0usize;
-            for item in rule.body.iter() {
-                if !matches!(item, CBodyItem::Clause(_)) {
-                    continue;
-                }
-                if let Some(recent_fn) = compiled.recent_variant(clause_seq) {
-                    recent_fns_vec.push(recent_fn);
-                    recent_ctx_ptrs_vec
-                        .push(&*ctx as *const PackedJitContextV3 as *mut PackedJitContextV3);
-                }
-                clause_seq += 1;
-            }
-
-            full_fns_vec.push(full_fn);
-            full_ctx_ptrs_vec
-                .push(&*ctx as *const PackedJitContextV3 as *mut PackedJitContextV3);
-
-            per_rule_clause_rels.push(clause_rels_box);
-            per_rule_head_rels.push(head_rels_box);
-            per_rule_dedup_handles.push(dedup_handles);
-            per_rule_ctxs.push(ctx);
-        }
-
-        // All packed rels for advance()
-        let all_rels: Vec<*mut PackedStorage> = self
-            .relations
-            .values()
-            .filter_map(|rel| match rel {
-                Relation::Packed(p) => Some(p as *const PackedStorage as *mut PackedStorage),
-                Relation::Generic(_) => None,
-            })
-            .collect();
-
-        let all_rels_box: Box<[*mut PackedStorage]> = all_rels.into_boxed_slice();
-        let full_fns_box = full_fns_vec.into_boxed_slice();
-        let full_ctx_ptrs_box = full_ctx_ptrs_vec.into_boxed_slice();
-        let recent_fns_box = recent_fns_vec.into_boxed_slice();
-        let recent_ctx_ptrs_box = recent_ctx_ptrs_vec.into_boxed_slice();
-
-        let stage3_ctx = Box::new(StratumStage3Ctx {
-            full_fns: full_fns_box.as_ptr(),
-            full_ctxs: full_ctx_ptrs_box.as_ptr(),
-            num_full: full_fns_box.len() as u32,
-            num_recent: recent_fns_box.len() as u32,
-            recent_fns: recent_fns_box.as_ptr(),
-            recent_ctxs: recent_ctx_ptrs_box.as_ptr(),
-            all_rels: all_rels_box.as_ptr(),
-            n_all_rels: all_rels_box.len() as u32,
-            _pad: 0,
-        });
-
-        Some(StratumStage3Runtime {
-            stage3_ctx,
-            _per_rule_clause_rels: per_rule_clause_rels,
-            _per_rule_head_rels: per_rule_head_rels,
-            _per_rule_ctxs: per_rule_ctxs,
-            _full_fns: full_fns_box,
-            _full_ctx_ptrs: full_ctx_ptrs_box,
-            _recent_fns: recent_fns_box,
-            _recent_ctx_ptrs: recent_ctx_ptrs_box,
-            _all_rels: all_rels_box,
-            _per_rule_dedup_handles: per_rule_dedup_handles,
-        })
-    }
-
-    /// Build the runtime context for the stratum meta-function.
-    ///
-    /// Returns `None` if any rule doesn't have all-packed clause or head relations.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn build_stratum_meta_runtime(&self, rules: &[&CRule], rule_indices: &[usize]) -> Option<StratumMetaRuntime> {
-        use crate::jit::packed_helpers::{
-            PackedJitContext, RuleFlushInfo, StratumFlusher, StratumMetaCtx,
-        };
-        use crate::relation::Relation;
-        use crate::specialized::PackedStorage;
-
-        let jit_ref = self.jit.as_ref()?.lock().unwrap();
-
-        // Box<RuleResultsBuf>: stable heap address so the raw *mut pointer remains valid.
-        #[allow(clippy::vec_box)]
-        let mut per_rule_results: Vec<Box<RuleResultsBuf>> = Vec::new();
-        let mut per_rule_bindings: Vec<Box<[u32]>> = Vec::new();
-        let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
-        let mut per_rule_ctxs: Vec<Box<PackedJitContext>> = Vec::new();
-
-        let mut flush_rules: Vec<RuleFlushInfo> = Vec::new();
-
-        // full variant: one per rule
-        let mut full_fns_vec: Vec<crate::jit::packed_helpers::PackedJitFn> = Vec::new();
-        let mut full_ctx_ptrs_vec: Vec<*mut PackedJitContext> = Vec::new();
-
-        // recent variants: (rule_idx, clause_seq) pairs — flattened
-        let mut recent_fns_vec: Vec<crate::jit::packed_helpers::PackedJitFn> = Vec::new();
-        let mut recent_ctx_ptrs_vec: Vec<*mut PackedJitContext> = Vec::new();
-
-        for (rule, &rule_idx) in rules.iter().zip(rule_indices.iter()) {
-            let compiled = jit_ref.packed_cache.get(&rule_idx)?.as_ref()?;
-
-            // Require full variant
-            let full_fn = compiled.full_variant()?;
-
-            // Collect clause storage pointers
-            let clause_rels: Vec<*const PackedStorage> = rule
-                .body
-                .iter()
-                .filter_map(|item| match item {
-                    CBodyItem::Clause(c) => match self.relations.get(&c.relation)? {
-                        Relation::Packed(p) => Some(p as *const PackedStorage),
-                        Relation::Generic(_) => None,
-                    },
-                    _ => None,
-                })
-                .collect();
-
-            let clause_count = rule
-                .body
-                .iter()
-                .filter(|i| matches!(i, CBodyItem::Clause(_)))
-                .count();
-
-            // Bail if any clause relation is not packed
-            if clause_rels.len() != clause_count {
-                return None;
-            }
-
-            // Collect head storage pointers
-            let head_rels: Vec<*mut PackedStorage> = rule
-                .heads
-                .iter()
-                .filter_map(|head| match self.relations.get(&head.relation)? {
-                    Relation::Packed(p) => Some(p as *const PackedStorage as *mut PackedStorage),
-                    Relation::Generic(_) => None,
-                })
-                .collect();
-
-            if head_rels.len() != rule.heads.len() {
-                return None;
-            }
-
-            let clause_rels_box: Box<[*const PackedStorage]> = clause_rels.into_boxed_slice();
-            let bindings_box: Box<[u32]> = vec![0u32; self.var_count].into_boxed_slice();
-            #[allow(clippy::vec_box)]
-            let results_box: Box<RuleResultsBuf> = Box::default();
-
-            let bindings_ptr: *mut u32 = bindings_box.as_ptr() as *mut u32;
-            let results_ptr: *mut Vec<(usize, Vec<u32>)> =
-                std::ptr::addr_of!(*results_box) as *mut _;
-
-            let ctx = Box::new(PackedJitContext {
-                rels: clause_rels_box.as_ptr(),
-                rels_len: clause_rels_box.len() as u32,
-                _pad: 0,
-                bindings: bindings_ptr,
-                results: results_ptr,
-            });
-
-            // Build recent variants for this rule: one per clause
-            let mut clause_seq = 0usize;
-            for item in rule.body.iter() {
-                if !matches!(item, CBodyItem::Clause(_)) {
-                    continue;
-                }
-                if let Some(recent_fn) = compiled.recent_variant(clause_seq) {
-                    recent_fns_vec.push(recent_fn);
-                    // ctx ptr will be filled after we push to per_rule_ctxs; use placeholder
-                    // We need the ptr to ctx before we move it into the vec — get it first
-                    recent_ctx_ptrs_vec.push(&*ctx as *const PackedJitContext as *mut PackedJitContext);
-                }
-                clause_seq += 1;
-            }
-
-            full_fns_vec.push(full_fn);
-            full_ctx_ptrs_vec.push(&*ctx as *const PackedJitContext as *mut PackedJitContext);
-
-            flush_rules.push(RuleFlushInfo {
-                results: results_ptr,
-                head_rels,
-            });
-
-            per_rule_bindings.push(bindings_box);
-            per_rule_results.push(results_box);
-            per_rule_clause_rels.push(clause_rels_box);
-            per_rule_ctxs.push(ctx);
-        }
-
-        // Collect all packed relations for advance()
-        let all_packed_rels: Vec<*mut PackedStorage> = self
-            .relations
-            .values()
-            .filter_map(|rel| match rel {
-                Relation::Packed(p) => Some(p as *const PackedStorage as *mut PackedStorage),
-                Relation::Generic(_) => None,
-            })
-            .collect();
-
-        // Box all arrays for stable addresses
-        let full_fns_box: Box<[crate::jit::packed_helpers::PackedJitFn]> =
-            full_fns_vec.into_boxed_slice();
-        let full_ctx_ptrs_box: Box<[*mut PackedJitContext]> =
-            full_ctx_ptrs_vec.into_boxed_slice();
-        let recent_fns_box: Box<[crate::jit::packed_helpers::PackedJitFn]> =
-            recent_fns_vec.into_boxed_slice();
-        let recent_ctx_ptrs_box: Box<[*mut PackedJitContext]> =
-            recent_ctx_ptrs_vec.into_boxed_slice();
-
-        let flusher = Box::new(StratumFlusher {
-            rules: flush_rules,
-            all_packed_rels,
-        });
-
-        let meta_ctx = Box::new(StratumMetaCtx {
-            full_fns: full_fns_box.as_ptr(),
-            full_ctxs: full_ctx_ptrs_box.as_ptr(),
-            num_full: full_fns_box.len() as u32,
-            num_recent: recent_fns_box.len() as u32,
-            recent_fns: recent_fns_box.as_ptr(),
-            recent_ctxs: recent_ctx_ptrs_box.as_ptr(),
-            flusher: &*flusher as *const StratumFlusher as *mut StratumFlusher,
-        });
-
-        Some(StratumMetaRuntime {
-            meta_ctx,
-            _per_rule_bindings: per_rule_bindings,
-            _per_rule_results: per_rule_results,
-            _per_rule_clause_rels: per_rule_clause_rels,
-            _per_rule_ctxs: per_rule_ctxs,
-            _full_fns: full_fns_box,
-            _full_ctx_ptrs: full_ctx_ptrs_box,
-            _recent_fns: recent_fns_box,
-            _recent_ctx_ptrs: recent_ctx_ptrs_box,
-            _flusher: flusher,
-        })
-    }
-
     /// Run a set of rules incrementally (delta-only, no initial full evaluation).
     ///
     /// Assumes new facts are already in `delta` on input relations.
@@ -2177,35 +1597,6 @@ impl Engine {
     /// Uses recursive body processing with undo log to avoid materializing
     /// intermediate `Vec<Bindings>` between body items.
     fn derive_tuples<'a>(&self, rule: &'a CRule, use_recent: bool) -> Vec<(&'a str, Tuple)> {
-        // Try JIT path first
-        #[cfg(feature = "jit")]
-        if let Some(ref jit_cell) = self.jit {
-            let rule_idx = rule as *const CRule as usize;
-
-            // Try typed packed JIT when all clause relations are PackedStorage
-            #[cfg(feature = "specialized")]
-            {
-                let packed_compiled = {
-                    let mut jit = jit_cell.lock().unwrap();
-                    jit.get_or_compile_packed(rule_idx, rule).is_some()
-                };
-                if packed_compiled
-                    && let Some(results) =
-                        self.derive_tuples_packed_jit(rule, use_recent, rule_idx)
-                {
-                    return results;
-                }
-            }
-
-            // Fall back to trampoline JIT
-            let compiled = {
-                let mut jit = jit_cell.lock().unwrap();
-                jit.get_or_compile(rule_idx, rule).is_some()
-            };
-            if compiled && let Some(results) = self.derive_tuples_jit(rule, use_recent, rule_idx) {
-                return results;
-            }
-        }
 
         let mut results = Vec::new();
         let mut binding = Bindings::new(self.var_count);
@@ -2250,178 +1641,6 @@ impl Engine {
         }
 
         results
-    }
-
-    /// JIT-compiled derive_tuples path.
-    #[cfg(feature = "jit")]
-    fn derive_tuples_jit<'a>(
-        &self,
-        rule: &'a CRule,
-        use_recent: bool,
-        rule_idx: usize,
-    ) -> Option<Vec<(&'a str, Tuple)>> {
-        use crate::jit::helpers::JitContext;
-
-        let jit = self.jit.as_ref()?.lock().unwrap();
-        let compiled = jit.cache.get(&rule_idx)?.as_ref()?;
-
-        // Resolve relation pointers for clauses in order
-        let clause_rels: Vec<*const Relation> = rule
-            .body
-            .iter()
-            .filter_map(|item| match item {
-                CBodyItem::Clause(c) => self
-                    .relations
-                    .get(&c.relation)
-                    .map(|r| r as *const Relation),
-                _ => None,
-            })
-            .collect();
-
-        // Resolve head clause pointers
-        let head_ptrs: Vec<*const CHeadClause> =
-            rule.heads.iter().map(|h| h as *const CHeadClause).collect();
-
-        let mut bindings = Bindings::new(self.var_count);
-        let mut indexed_results: Vec<(usize, Tuple)> = Vec::new();
-
-        let mut ctx = JitContext {
-            rels: clause_rels.as_ptr(),
-            rels_len: clause_rels.len() as u32,
-            bindings: &mut bindings,
-            results: &mut indexed_results,
-            heads: head_ptrs.as_ptr(),
-            heads_len: head_ptrs.len() as u32,
-            registry: &self.type_registry,
-            interner: &self.var_interner,
-        };
-
-        if !use_recent {
-            if let Some(fn_ptr) = compiled.full_variant() {
-                unsafe { fn_ptr(&mut ctx) };
-            }
-        } else {
-            // Semi-naive: try each clause with recent data
-            let mut clause_seq = 0;
-            for item in rule.body.iter() {
-                let rel_name = match item {
-                    CBodyItem::Clause(c) => &c.relation,
-                    _ => continue,
-                };
-                if let Some(rel) = self.relations.get(rel_name)
-                    && rel.iter_recent().next().is_some()
-                    && let Some(fn_ptr) = compiled.recent_variant(clause_seq)
-                {
-                    unsafe { fn_ptr(&mut ctx) };
-                }
-                clause_seq += 1;
-            }
-        }
-
-        // Convert indexed results to named results
-        let results: Vec<(&'a str, Tuple)> = indexed_results
-            .into_iter()
-            .map(|(head_idx, tuple)| (rule.heads[head_idx].relation.as_str(), tuple))
-            .collect();
-
-        Some(results)
-    }
-
-    /// Typed packed JIT path: reads u32 directly from PackedStorage.
-    ///
-    /// Returns None if any clause relation is not packed (fall through to trampoline JIT).
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn derive_tuples_packed_jit<'a>(
-        &self,
-        rule: &'a CRule,
-        use_recent: bool,
-        rule_idx: usize,
-    ) -> Option<Vec<(&'a str, Tuple)>> {
-        use crate::jit::packed_helpers::PackedJitContext;
-        use crate::relation::Relation;
-        use crate::specialized::PackedStorage;
-
-        // Collect PackedStorage pointers for each clause relation
-        let clause_packed: Vec<*const PackedStorage> = rule
-            .body
-            .iter()
-            .filter_map(|item| match item {
-                CBodyItem::Clause(c) => match self.relations.get(&c.relation)? {
-                    Relation::Packed(p) => Some(p as *const PackedStorage),
-                    Relation::Generic(_) => None,
-                },
-                _ => None,
-            })
-            .collect();
-
-        let clause_count = rule
-            .body
-            .iter()
-            .filter(|i| matches!(i, CBodyItem::Clause(_)))
-            .count();
-
-        // Bail if any relation is not packed
-        if clause_packed.len() != clause_count {
-            return None;
-        }
-
-        let jit = self.jit.as_ref()?.lock().unwrap();
-        let compiled = jit.packed_cache.get(&rule_idx)?.as_ref()?;
-
-        // Flat u32 binding scratch (one slot per var_id)
-        let mut bindings: Vec<u32> = vec![0u32; self.var_count];
-        let mut packed_results: Vec<(usize, Vec<u32>)> = Vec::new();
-
-        let mut ctx = PackedJitContext {
-            rels: clause_packed.as_ptr(),
-            rels_len: clause_packed.len() as u32,
-            _pad: 0,
-            bindings: bindings.as_mut_ptr(),
-            results: &mut packed_results,
-        };
-
-        if !use_recent {
-            if let Some(fn_ptr) = compiled.full_variant() {
-                unsafe { fn_ptr(&mut ctx) };
-            }
-        } else {
-            let mut clause_seq = 0;
-            for item in rule.body.iter() {
-                let rel_name = match item {
-                    CBodyItem::Clause(c) => &c.relation,
-                    _ => continue,
-                };
-                if let Some(rel) = self.relations.get(rel_name)
-                    && rel.iter_recent().next().is_some()
-                    && let Some(fn_ptr) = compiled.recent_variant(clause_seq)
-                {
-                    unsafe { fn_ptr(&mut ctx) };
-                }
-                clause_seq += 1;
-            }
-        }
-
-        // Convert packed u32 results back to (relation_name, Tuple)
-        let results: Vec<(&'a str, Tuple)> = packed_results
-            .into_iter()
-            .filter_map(|(head_idx, packed_tuple)| {
-                let head = &rule.heads[head_idx];
-                let rel_name = head.relation.as_str();
-                // Get the head relation's col_types for unpacking
-                let col_types = match self.relations.get(rel_name)? {
-                    Relation::Packed(p) => &p.col_types,
-                    Relation::Generic(_) => return None,
-                };
-                let tuple: Tuple = packed_tuple
-                    .iter()
-                    .zip(col_types.iter())
-                    .map(|(&raw, ty)| ty.unpack(raw))
-                    .collect();
-                Some((rel_name, tuple))
-            })
-            .collect();
-
-        Some(results)
     }
 
     /// Recursively process body items in streaming fashion.

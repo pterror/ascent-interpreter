@@ -39,7 +39,7 @@ ascent-eval.workspace = true
 syn.workspace = true
 
 [features]
-jit = ["ascent-eval/jit", "ascent-eval/specialized"]
+jit = ["ascent-eval/jit-asm"]
 jit-asm = ["ascent-eval/jit-asm"]
 specialized = ["ascent-eval/specialized"]
 
