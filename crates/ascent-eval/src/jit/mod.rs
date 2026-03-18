@@ -348,7 +348,7 @@ impl JitCompiler {
 #[cfg(feature = "specialized")]
 fn is_supported_packed_expr(expr: &CExpr) -> bool {
     match expr {
-        CExpr::Var(_) => true,
+        CExpr::Var(_) | CExpr::DerefVar(_) => true,
         CExpr::Literal(crate::value::Value::I32(_)) | CExpr::Literal(crate::value::Value::Bool(_)) => true,
         CExpr::VarBinVar(op, _, _) => is_supported_packed_binop(*op),
         CExpr::VarBinLit(op, _, crate::value::Value::I32(_))
@@ -360,8 +360,8 @@ fn is_supported_packed_expr(expr: &CExpr) -> bool {
                 && is_supported_packed_expr(a)
                 && is_supported_packed_expr(b)
         }
-        CExpr::Unary(CUnOp::Not, inner) | CExpr::Unary(CUnOp::Neg, inner) => {
-            is_supported_packed_expr(inner)
+        CExpr::Unary(op, inner) => {
+            matches!(op, CUnOp::Not | CUnOp::Neg | CUnOp::Deref) && is_supported_packed_expr(inner)
         }
         _ => false,
     }
@@ -380,5 +380,14 @@ fn is_supported_packed_binop(op: CBinOp) -> bool {
             | CBinOp::Add
             | CBinOp::Sub
             | CBinOp::Mul
+            | CBinOp::Div
+            | CBinOp::Rem
+            | CBinOp::BitAnd
+            | CBinOp::BitOr
+            | CBinOp::BitXor
+            | CBinOp::Shl
+            | CBinOp::Shr
+            | CBinOp::And
+            | CBinOp::Or
     )
 }
