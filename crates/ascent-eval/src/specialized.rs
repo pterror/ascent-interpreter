@@ -294,9 +294,10 @@ impl PackedStorage {
                 let start = idx * arity;
                 recent_buf.extend_from_slice(&self.packed_data[start..start + arity]);
             }
-            // `recent` is only iterated, never probed as a membership set.
-            // Skip tuple_set to avoid O(n) hash-build cost on every advance.
-            JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, build_indices)
+            // `recent` is only sequentially iterated (outer scan), never key-probed.
+            // Skip both tuple_set and JitColIndex (build_indices=false) to avoid
+            // O(n log n) sort cost on every stratum run.
+            JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, false)
         };
 
         JitNativeRelData {
@@ -690,19 +691,15 @@ impl PackedStorage {
                         recent_buf
                             .extend_from_slice(&self.packed_data[start..start + arity_max1]);
                     }
+                    // `recent` is only sequentially iterated (outer scan), never key-probed.
+                    // Skip JitColIndex (build_indices=false) to avoid O(n log n) sort cost.
                     native.recent =
-                        JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, build_indices);
+                        JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, false);
                 }
             }
         }
 
         had_delta
-    }
-
-    /// Advance for the Cranelift JIT path (rebuilds `jit_indices` / `jit_recent_indices`).
-    #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) fn advance_jit(&mut self) -> bool {
-        self.advance_jit_inner(true, true)
     }
 
     /// Advance for the non-native asm Stage 4 path.

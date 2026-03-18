@@ -613,6 +613,69 @@ impl JitRelData {
         }
     }
 
+    /// Pre-size the `new` buffer (data + tuple_set) to hold at least `n_tuples` without
+    /// growing during JIT execution.  Called once per stratum run using count hints from
+    /// a prior run to eliminate `jit_tuple_set_grow` calls in the hot inner loop.
+    ///
+    /// For triangle n=20: 1140 new tuples/iter → 7 tuple_set grows (16→2048) per iteration
+    /// without this hint.  Pre-sizing to 2048 replaces the 7 grow-rehash events with a
+    /// single upfront alloc + memset.
+    ///
+    /// # Safety
+    /// `self` must be a fully initialized `JitRelData` (len=0, built by `build_from_packed`).
+    pub unsafe fn pre_size_new(&mut self, n_tuples: usize) {
+        if n_tuples == 0 {
+            return;
+        }
+        let arity = self.arity as usize;
+        let arity_max1 = arity.max(1);
+
+        // Grow data buffer if needed (no zeroing needed — just capacity).
+        if n_tuples > self.cap as usize {
+            let old_cap = self.cap as usize;
+            let mut new_cap = old_cap.max(1);
+            while new_cap < n_tuples {
+                new_cap *= 2;
+            }
+            let old_layout = Layout::array::<u32>(old_cap * arity_max1).expect("layout");
+            let new_ptr = unsafe {
+                realloc(
+                    self.data as *mut u8,
+                    old_layout,
+                    new_cap * arity_max1 * std::mem::size_of::<u32>(),
+                ) as *mut u32
+            };
+            assert!(!new_ptr.is_null(), "pre_size_new: data realloc failed");
+            self.data = new_ptr;
+            self.cap = new_cap as u64;
+        }
+
+        // Grow tuple_set if needed.  Must be zeroed (open-addressed hash needs empty markers).
+        if arity > 0 {
+            let stride = arity + 1;
+            let needed_cap = next_pow2_min16((n_tuples * 10 / 7) + 1);
+            let current_cap = if !self.tuple_set.slots.is_null() {
+                // Mask encodes current capacity: cap = mask + 1.
+                (self.tuple_set.mask as usize) + 1
+            } else {
+                0
+            };
+            if needed_cap > current_cap {
+                // Free old allocation.
+                if !self.tuple_set.slots.is_null() && current_cap > 0 {
+                    let old_layout = Layout::array::<u32>(current_cap * stride).expect("layout");
+                    unsafe { dealloc(self.tuple_set.slots as *mut u8, old_layout) };
+                }
+                // Alloc new zeroed allocation.
+                let new_slots = alloc_u32_zeroed(needed_cap * stride);
+                self.tuple_set.slots = new_slots;
+                self.tuple_set.mask = (needed_cap - 1) as u64;
+                self.tuple_set.len = 0;
+                self._ts_slots_words = needed_cap * stride;
+            }
+        }
+    }
+
     /// Appends `new_tuples` (flat row-major, stride=arity) to this relation's data buffer,
     /// rebuilds all column indices from the extended data, and updates the `tuple_set`
     /// to include the new tuples (required for cross-iteration JIT head dedup).

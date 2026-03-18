@@ -909,6 +909,16 @@ impl Engine {
                                 jit.tuple_count_hints.get(head.relation.as_str())
                             {
                                 ps.reserve_tuples(count_hint as usize);
+                                // Also pre-size jit_native.new so the JIT doesn't pay
+                                // jit_tuple_set_grow during the hot inner loop.
+                                // For triangle n=20: eliminates 7 tuple_set grows per iter
+                                // (cap 16→2048 for 1140 tuples) and replaces them with a
+                                // single upfront alloc+memset.
+                                if let Some(native) = ps.jit_native.as_mut() {
+                                    // Safety: native.new is a fully initialized JitRelData
+                                    // built by build_native_projection (len=0, valid buffers).
+                                    unsafe { native.new.pre_size_new(count_hint as usize) };
+                                }
                             }
                         }
                     }
@@ -1285,16 +1295,20 @@ impl Engine {
             for name in &all_rels {
                 if let Some(Relation::Packed(ps)) = self.relations.get_mut(name) {
                     if ps.jit_native.is_none() {
-                        // Cold path: advance_jit() moves delta→recent and updates jit indices.
-                        // advance_jit() does NOT build jit_native when it's None (to avoid the
-                        // cost on the Cranelift path). Explicitly build it here.
-                        ps.advance_jit();
+                        // Cold path: move delta→recent, then build the native projection.
+                        // Use advance_jit_skip_hash_indices to skip JitHashIndex rebuild:
+                        // the native path uses JitColIndex (in jit_native) and never reads
+                        // jit_indices / jit_recent_indices. Cranelift was removed, so hash
+                        // indices are never consumed anywhere. Skipping the 4×O(n log n)
+                        // JitHashIndex builds saves ~20µs per stratum run for triangle n=20.
+                        ps.advance_jit_skip_hash_indices();
                         ps.jit_native = Some(ps.build_native_projection());
                     } else if !ps.delta.is_empty() {
                         // jit_native was deep-cloned (PackedStorage::clone) and new facts were
-                        // inserted into delta since the clone.  advance_jit() moves delta→recent
-                        // and refreshes jit_native so the first JIT iteration sees the new data.
-                        ps.advance_jit();
+                        // inserted into delta since the clone.  advance_jit_skip_hash_indices
+                        // moves delta→recent and refreshes jit_native without rebuilding the
+                        // unused JitHashIndex.
+                        ps.advance_jit_skip_hash_indices();
                     }
                 }
             }
