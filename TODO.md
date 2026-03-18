@@ -162,7 +162,7 @@ Current JIT architecture (context for what needs to change):
 
 - [x] **Tuple count hints for `packed_data`/`delta` pre-sizing (2026-03-17)** — extended `JitCompiler` with `tuple_count_hints: FxHashMap<String, u32>` tracking peak tuple counts per relation; pre-size `packed_data` and `delta` Vec capacity before each stratum run via `PackedStorage::reserve_tuples`. Eliminates realloc overhead for IDB relations with predictable sizes. **Results (2026-03-17):** ~6µs improvement (within noise), marginal win vs dedup cap hint elimination.
 
-- [x] **Pointer-increment loop in sequential index scan (2026-03-17)** — replaced `j = 0..count` with `elem_ptr = start_ptr..end_ptr, += 4`. Hoists 5 per-iteration ops (2 uextends + 1 imul_imm + 2 iadd) into one-time setup. Applies to EDB inner-clause scans (triangle, TC edge clause, connected_components). **Result:** triangle eval n=20 ~95µs → ~70µs on clean system (~11-25% improvement, commit `f43db74`).
+- [x] **Pointer-increment loop in sequential index scan (2026-03-17)** — replaced `j = 0..count` with `elem_ptr = start_ptr..end_ptr, += 4`. Hoists 5 per-iteration ops (2 uextends + 1 imul_imm + 2 iadd) into one-time setup. Applies to EDB inner-clause scans (triangle, TC edge clause, connected_components). **Result:** triangle eval n=20 ~95µs → ~70µs on clean system (~11-25% improvement, commit `f43db74`). **asm backend (2026-03-18, commit `70caf94`):** same optimization applied to `is_col_value=true` contiguous scan in `asm_codegen.rs`. Changes: (1) pre-loop: `lea r15, [r11+rsi*4]` (elem_ptr) + `lea rbx, [r15+rax*4]` (end_ptr) instead of saving vals_base to stack; (2) inner header: `cmp r15, rbx` pointer comparison instead of `cmp r15d, ebx` integer; (3) element load: `mov ecx, [r15]; add r15, 4` instead of `mov rax, [rbp+vs]; mov ecx, [rax+r15*4]; inc r15d`. Eliminates 1 stack load per inner iteration. Benchmark too noisy to measure cleanly (variance ±50% on this system).
 
 - [x] **Dedup probe CSE in gen_emit_heads_v3 (TRIED, REVERTED 2026-03-17)** — reuse `entry_ptr`/`entry_hash` from `probe_loop` in `probe_check_found`/`probe_verify` to avoid redundant imul_imm+iadd+load per probe. Regressed TC by 57% (102µs → 160µs). Root cause: keeping extra values live across the `probe_loop → probe_check_found` edge increases register pressure at the brif from ~6 to ~8 live values; Cranelift spills, costing more than the ~5 instructions eliminated. Do not retry without verifying register pressure stays within available registers.
 
@@ -395,10 +395,11 @@ expression handling in bound clause arg positions. TC jit_hot/50 at ~200µs (par
   iteration = 40 cycles serialized vs ascent_macro's Vec slice which is speculative/pipelined/
   vectorizable. Fix requires contiguous per-key values arrays (see Step 1 / Step 4).
 
-- **3c — Expression completeness** (~150 lines): `CUnOp::Deref` is a no-op in the packed
-  representation (trivial); add Div/Mod/bitwise; handle arbitrary user-defined function calls via
-  function pointer with caller-save spill/restore around the call site. Remove all `check_expr` /
-  `check_binop` `Err` returns for arithmetic ops.
+- **3c — Expression completeness** ✅ IMPLEMENTED (2026-03-18, commit `2f222bb`): expanded
+  `is_supported_packed_expr`/`is_supported_packed_binop` to match what `emit_expr` actually handles.
+  Added `CExpr::DerefVar` (identity in packed repr), `CUnOp::Deref`, and all missing binops
+  (Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, And, Or). Rules using these ops no longer fall
+  back to the interpreter. Arbitrary function calls (user-defined fn pointers) remain unimplemented.
 
 - **3d — Aggregation codegen** ✅ IMPLEMENTED (2026-03-18): `emit_aggregations` in `asm_codegen.rs`
   handles count/sum/min/max for pure-aggregation rules (0 positive clauses). Loads source relation
