@@ -450,9 +450,8 @@ fn check_expr(expr: &CExpr) -> Result<(), String> {
 fn check_binop(op: CBinOp) -> Result<(), String> {
     use CBinOp::*;
     match op {
-        Add | Sub | Mul | Eq | Ne | Lt | Le | Gt | Ge | And | Or
-        | BitXor | Shl | Shr => Ok(()),
-        _ => Err(format!("asm: unsupported binop: {op:?}")),
+        Add | Sub | Mul | Div | Rem | Eq | Ne | Lt | Le | Gt | Ge
+        | And | Or | BitAnd | BitOr | BitXor | Shl | Shr => Ok(()),
     }
 }
 
@@ -474,13 +473,21 @@ fn emit_expr(asm: &mut Assembler, expr: &CExpr, var_locs: &[VarLoc]) -> Result<(
             emit_load_var_ecx(asm, var_locs, *b);
             emit_binop(asm, *op)?;
         }
-        CExpr::VarBinLit(op, a, Value::I32(n)) => {
+        CExpr::VarBinLit(op, a, lit) => {
             emit_load_var(asm, var_locs, *a);
-            dynasm!(asm; mov ecx, *n);
+            match lit {
+                Value::I32(n) => dynasm!(asm; mov ecx, *n),
+                Value::Bool(b) => dynasm!(asm; mov ecx, if *b { 1i32 } else { 0i32 }),
+                _ => return Err(format!("asm: VarBinLit unsupported literal: {lit:?}")),
+            }
             emit_binop(asm, *op)?;
         }
-        CExpr::LitBinVar(op, Value::I32(n), b) => {
-            dynasm!(asm; mov eax, *n);
+        CExpr::LitBinVar(op, lit, b) => {
+            match lit {
+                Value::I32(n) => dynasm!(asm; mov eax, *n),
+                Value::Bool(bval) => dynasm!(asm; mov eax, if *bval { 1i32 } else { 0i32 }),
+                _ => return Err(format!("asm: LitBinVar unsupported literal: {lit:?}")),
+            }
             emit_load_var_ecx(asm, var_locs, *b);
             emit_binop(asm, *op)?;
         }
@@ -521,10 +528,15 @@ fn emit_binop(asm: &mut Assembler, op: CBinOp) -> Result<(), String> {
         Le     => dynasm!(asm; cmp eax, ecx; setle al; movzx eax, al),
         Gt     => dynasm!(asm; cmp eax, ecx; setg al; movzx eax, al),
         Ge     => dynasm!(asm; cmp eax, ecx; setge al; movzx eax, al),
+        BitAnd => dynasm!(asm; and eax, ecx),
+        BitOr  => dynasm!(asm; or eax, ecx),
         BitXor => dynasm!(asm; xor eax, ecx),
         Shl    => dynasm!(asm; shl eax, cl),
         Shr    => dynasm!(asm; sar eax, cl),
-        _      => return Err(format!("asm: unsupported binop: {op:?}")),
+        // cdq sign-extends eax into edx:eax; idiv ecx: quotient→eax, remainder→edx.
+        // rdx is documented as clobbered by emit_expr, so this is safe.
+        Div    => dynasm!(asm; cdq; idiv ecx),
+        Rem    => dynasm!(asm; cdq; idiv ecx; mov eax, edx),
     }
     Ok(())
 }

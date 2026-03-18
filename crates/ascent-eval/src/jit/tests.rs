@@ -724,3 +724,33 @@ fn test_stage4_fibonacci() {
         "fib",
     );
 }
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_div_rem_bitops() {
+    // Exercises Div, Rem, BitAnd, BitOr in asm backend conditions and head expressions.
+    assert_packed_jit_equivalence(
+        r#"
+            relation r(i32);
+            relation div2(i32, i32);   // (x, x/2)
+            relation mod3(i32, i32);   // (x, x%3)
+            relation band(i32, i32);   // (x, x & 6)
+            relation bor(i32, i32);    // (x, x | 1)
+            div2(x, x / 2) <-- r(x);
+            mod3(x, x % 3) <-- r(x);
+            band(x, x & 6) <-- r(x);
+            bor(x,  x | 1) <-- r(x);
+        "#,
+        &[(
+            "r",
+            vec![
+                vec![Value::I32(0)],
+                vec![Value::I32(1)],
+                vec![Value::I32(6)],
+                vec![Value::I32(7)],
+                vec![Value::I32(10)],
+            ],
+        )],
+        "div2",
+    );
+}
