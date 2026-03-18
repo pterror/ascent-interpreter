@@ -128,6 +128,45 @@ pub unsafe extern "C" fn packed_lookup(
     }
 }
 
+// ─── Anti-join (negation) probes ─────────────────────────────────────
+
+/// Returns 1 if `rel` does NOT contain the 1-tuple `(v0)`, 0 if it does.
+///
+/// Called from JIT-generated negation probes: `not r(x)`.
+///
+/// # Safety
+/// `rel` must point to a valid PackedStorage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn check_not_packed_1(rel: *const PackedStorage, v0: u32) -> u8 {
+    let rel = unsafe { &*rel };
+    !rel.contains_packed_raw(&[v0]) as u8
+}
+
+/// Returns 1 if `rel` does NOT contain the 2-tuple `(v0, v1)`, 0 if it does.
+///
+/// # Safety
+/// `rel` must point to a valid PackedStorage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn check_not_packed_2(rel: *const PackedStorage, v0: u32, v1: u32) -> u8 {
+    let rel = unsafe { &*rel };
+    !rel.contains_packed_raw(&[v0, v1]) as u8
+}
+
+/// Returns 1 if `rel` does NOT contain the 3-tuple `(v0, v1, v2)`, 0 if it does.
+///
+/// # Safety
+/// `rel` must point to a valid PackedStorage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn check_not_packed_3(
+    rel: *const PackedStorage,
+    v0: u32,
+    v1: u32,
+    v2: u32,
+) -> u8 {
+    let rel = unsafe { &*rel };
+    !rel.contains_packed_raw(&[v0, v1, v2]) as u8
+}
+
 /// Push a packed tuple into the results accumulator.
 ///
 /// Copies `arity` u32 words from `tuple` into a new Vec<u32> and pushes

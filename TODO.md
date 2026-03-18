@@ -516,6 +516,8 @@ ascent_macro ~196µs. All 261 tests pass. fibonacci/triangle unaffected.
 
 - [ ] **Sparse delta evaluation (LSP path)** — for incremental workloads where deltas are large relative to full relations, build selective delta indices only on columns actually used in downstream join clauses (determined at rule compile time). Avoids scanning delta tuples whose relevant columns don't match any current binding, reducing O(|delta|) inner loop iterations for non-matching tuples.
 
+- [ ] **SIMD inner-loop scan in asm backend** — for EDB contiguous indices, the middle scan loop iterates a flat `u32` array. LLVM auto-vectorizes this with AVX2 (~8 values/iteration); our asm backend emits scalar code. Emitting AVX2 `vmovdqu`/`vpcmpeqd`/`vmovmskps` for the scan + scalar fallback for the existence check would close the remaining vectorizable fraction of the triangle gap. Prerequisite: `target_feature = avx2` detection at JIT init; fallback to scalar for non-AVX2 targets. Estimated: ~150 lines in `asm_codegen.rs`. Do after existence-check register spill is resolved (need to know how much gap remains before committing to SIMD complexity).
+
 ### Not planned
 
 - ~Parallel SCC evaluation~ — strata are sequential by definition; intra-stratum parallelism is a research problem

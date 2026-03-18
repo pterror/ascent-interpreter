@@ -754,3 +754,69 @@ fn test_packed_jit_div_rem_bitops() {
         "div2",
     );
 }
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_negation() {
+    // Exercises negation (anti-join) in the asm backend.
+    // `filtered(x)` = base(x) that is not in `excluded`.
+    assert_packed_jit_equivalence(
+        r#"
+            relation base(i32);
+            relation excluded(i32);
+            relation filtered(i32);
+            filtered(x) <-- base(x), !excluded(x);
+        "#,
+        &[
+            (
+                "base",
+                vec![
+                    vec![Value::I32(1)],
+                    vec![Value::I32(2)],
+                    vec![Value::I32(3)],
+                    vec![Value::I32(4)],
+                    vec![Value::I32(5)],
+                ],
+            ),
+            (
+                "excluded",
+                vec![vec![Value::I32(2)], vec![Value::I32(4)]],
+            ),
+        ],
+        "filtered",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_negation_2tuple() {
+    // Exercises negation with a 2-tuple negated relation.
+    // `noedge(x, y)` = pair(x, y) where edge(x, y) does NOT exist.
+    assert_packed_jit_equivalence(
+        r#"
+            relation pair(i32, i32);
+            relation edge(i32, i32);
+            relation noedge(i32, i32);
+            noedge(x, y) <-- pair(x, y), !edge(x, y);
+        "#,
+        &[
+            (
+                "pair",
+                vec![
+                    vec![Value::I32(1), Value::I32(2)],
+                    vec![Value::I32(1), Value::I32(3)],
+                    vec![Value::I32(2), Value::I32(3)],
+                    vec![Value::I32(3), Value::I32(4)],
+                ],
+            ),
+            (
+                "edge",
+                vec![
+                    vec![Value::I32(1), Value::I32(2)],
+                    vec![Value::I32(3), Value::I32(4)],
+                ],
+            ),
+        ],
+        "noedge",
+    );
+}

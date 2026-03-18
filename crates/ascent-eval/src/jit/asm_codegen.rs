@@ -50,10 +50,13 @@
 use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi, DynamicLabel};
 use dynasmrt::x64::Assembler;
 
-use crate::compiled::{CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CUnOp};
+use crate::compiled::{CAggArg, CAggregation, CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CUnOp};
 use crate::jit::packed_helpers::StratumStage4Fn;
 use crate::jit::storage;
 use crate::value::Value;
+
+/// 4-tuple representing one rule for asm codegen: `(clauses, heads, conditions, not_clauses)`.
+pub(crate) type AsmRuleRef<'a> = (&'a [CClause], &'a [CHeadClause], &'a [CExpr], &'a [CAggregation]);
 
 /// A compiled stratum function produced by the asm backend.
 pub struct AsmStratum {
@@ -1043,6 +1046,67 @@ struct EmitParams<'a> {
     jit_rel_data_grow_addr: usize,
     /// Address of `jit_tuple_set_grow` (native path only).
     jit_tuple_set_grow_addr: usize,
+    /// Negation (anti-join) clauses for this rule.
+    /// `rels[clauses.len() + i]` points to the i-th negated relation.
+    negations: &'a [CAggregation],
+}
+
+/// Emit anti-join probes for all negation clauses of a rule.
+///
+/// For each `not rel(v0, v1, ...)` clause, emits:
+///   1. Load argument variable values into arg registers (esi/edx/ecx via eax).
+///   2. Load the negated relation pointer into rdi via `load_rel_rdi!`.
+///   3. Call `check_not_packed_N(rdi, esi, ...)`.
+///   4. `test eax, eax; jz =>skip_label` — skip if found in the relation.
+///
+/// `num_pos_clauses` = number of regular (positive) body clauses, used to compute
+/// the negation rel index (`rels[num_pos_clauses + neg_i]`).
+///
+/// Only supported in the non-native asm path (i.e. `use_jit_native = false`).
+fn emit_not_probes(
+    asm: &mut Assembler,
+    negations: &[CAggregation],
+    num_pos_clauses: usize,
+    rule_i: usize,
+    var_locs: &[VarLoc],
+    skip_label: DynamicLabel,
+) -> Result<(), String> {
+    use crate::jit::packed_helpers::{check_not_packed_1, check_not_packed_2, check_not_packed_3};
+    for (neg_i, neg) in negations.iter().enumerate() {
+        let arity = neg.args.len();
+        // Extract var ids (eligibility already checked — all args are Var).
+        let var_ids: Vec<u32> = neg.args.iter().map(|arg| match arg {
+            CAggArg::Var(id) => Ok(*id),
+            CAggArg::Expr(_) => Err(format!("not-clause '{}' has non-var arg", neg.relation)),
+        }).collect::<Result<Vec<_>, _>>()?;
+
+        let check_fn: usize = match arity {
+            1 => check_not_packed_1 as usize,
+            2 => check_not_packed_2 as usize,
+            3 => check_not_packed_3 as usize,
+            _ => return Err(format!("not-clause '{}' arity {arity} > 3", neg.relation)),
+        };
+
+        // Load arg values into argument registers via eax intermediary.
+        // load_rel_rdi! only clobbers rdi, so pre-loading esi/edx/ecx is safe.
+        for (i, &var_id) in var_ids.iter().enumerate() {
+            emit_load_var(asm, var_locs, var_id); // → eax
+            match i {
+                0 => dynasm!(asm; mov esi, eax),
+                1 => dynasm!(asm; mov edx, eax),
+                2 => dynasm!(asm; mov ecx, eax),
+                _ => unreachable!(),
+            }
+        }
+
+        // Load negated relation pointer into rdi.
+        load_rel_rdi!(asm, rule_i, num_pos_clauses + neg_i);
+
+        // Call: returns 1 if NOT found (proceed), 0 if found (skip).
+        call_abs!(asm, check_fn);
+        dynasm!(asm; test eax, eax; jz =>skip_label);
+    }
+    Ok(())
 }
 
 /// Emit code for clause `level` and all deeper clauses.
@@ -1155,6 +1219,7 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs)?;
                     dynasm!(asm; test eax, eax; jz =>outer_continue);
                 }
+                emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, outer_continue)?;
                 emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
             } else {
                 emit_clause_level(asm, p, 1, outer_exit, outer_continue)?;
@@ -1220,6 +1285,7 @@ fn emit_clause_level(
                 emit_expr(asm, expr, p.var_locs)?;
                 dynasm!(asm; test eax, eax; jz =>outer_continue);
             }
+            emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, outer_continue)?;
             emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
         } else {
             // Multi-clause: recurse into level 1.
@@ -1294,6 +1360,7 @@ fn emit_clause_level(
                         emit_expr(asm, expr, p.var_locs)?;
                         dynasm!(asm; test eax, eax; jz =>when_exhausted);
                     }
+                    emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, when_exhausted)?;
                     emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
                     dynasm!(asm; jmp =>when_exhausted);
                 } else {
@@ -1585,6 +1652,7 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
+                emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, inner_continue)?;
                 emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
                 if is_col_value && clause.fresh_cols.is_empty() {
                     dynasm!(asm; jmp =>when_exhausted);
@@ -1688,6 +1756,7 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
+                emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, inner_continue)?;
                 emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
             } else {
                 let sub_exhausted = asm.new_dynamic_label();
@@ -1720,6 +1789,7 @@ fn emit_rule_variant(
     clauses: &[CClause],
     heads: &[CHeadClause],
     rule_conds: &[CExpr],
+    negations: &[CAggregation],
     recent_idx: Option<usize>,
     var_count: usize,
     max_head_arity: usize,
@@ -1760,6 +1830,7 @@ fn emit_rule_variant(
             emit_expr(asm, expr, &var_locs)?;
             dynasm!(asm; test eax, eax; jz =>variant_exit);
         }
+        emit_not_probes(asm, negations, 0, rule_i, &var_locs, variant_exit)?;
         emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti, &var_locs, use_jit_native, rule_head_base, jit_rel_data_grow_addr, jit_tuple_set_grow_addr)?;
         dynasm!(asm; =>variant_exit);
         return Ok(());
@@ -1785,6 +1856,7 @@ fn emit_rule_variant(
         use_jit_native,
         jit_rel_data_grow_addr,
         jit_tuple_set_grow_addr,
+        negations,
     };
 
     emit_clause_level(asm, &p, 0, variant_exit, variant_exit)?;
@@ -1808,7 +1880,7 @@ fn emit_rule_variant(
 ///   - Loop body uses `packed_count` / `packed_data_ptr` / `packed_recent_ptr` callbacks.
 #[allow(clippy::too_many_arguments)]
 fn codegen_stratum_asm_inner(
-    rules: &[(&[CClause], &[CHeadClause], &[CExpr])],
+    rules: &[AsmRuleRef<'_>],
     var_count: usize,
     advance_addr: usize,
     packed_try_insert_addr: usize,
@@ -1820,7 +1892,11 @@ fn codegen_stratum_asm_inner(
     jit_tuple_set_grow_addr: usize,
 ) -> Result<AsmStratum, String> {
     // ── Eligibility ──────────────────────────────────────────────────────────
-    for (ri, (clauses, heads, conds)) in rules.iter().enumerate() {
+    for (ri, (clauses, heads, conds, nots)) in rules.iter().enumerate() {
+        // Native path does not support negation (load_rel_rdi! reads wrong ctx layout).
+        if use_jit_native && !nots.is_empty() {
+            return Err(format!("asm native: rule {ri} has negation clauses (unsupported)"));
+        }
         for head in *heads {
             if head.args.len() > 8 {
                 return Err(format!("asm: rule {ri} head arity {} > 8", head.args.len()));
@@ -1853,7 +1929,7 @@ fn codegen_stratum_asm_inner(
 
     let max_head_arity = rules
         .iter()
-        .flat_map(|(_, hs, _)| hs.iter().map(|h| h.args.len()))
+        .flat_map(|(_, hs, _, _)| hs.iter().map(|h| h.args.len()))
         .max()
         .unwrap_or(1);
     let max_head_arity = max_head_arity.max(1);
@@ -1862,7 +1938,7 @@ fn codegen_stratum_asm_inner(
     // Use at least 1 to keep the frame layout simple.
     let max_depth = rules
         .iter()
-        .map(|(clauses, _, _)| clauses.len().saturating_sub(1))
+        .map(|(clauses, _, _, _)| clauses.len().saturating_sub(1))
         .max()
         .unwrap_or(0)
         .max(1);
@@ -1893,7 +1969,7 @@ fn codegen_stratum_asm_inner(
     let rule_handle_bases: Vec<usize> = {
         let mut bases = Vec::with_capacity(rules.len());
         let mut offset = 0usize;
-        for (clauses, _, _) in rules.iter() {
+        for (clauses, _, _, _) in rules.iter() {
             bases.push(offset);
             offset += clauses.len() * 2;
         }
@@ -1904,7 +1980,7 @@ fn codegen_stratum_asm_inner(
     let rule_head_bases: Vec<usize> = {
         let mut bases = Vec::with_capacity(rules.len());
         let mut offset = 0usize;
-        for (_, heads, _) in rules.iter() {
+        for (_, heads, _, _) in rules.iter() {
             bases.push(offset);
             offset += heads.len();
         }
@@ -1922,9 +1998,9 @@ fn codegen_stratum_asm_inner(
     }
 
     // Full variants
-    for (rule_i, (clauses, heads, conds)) in rules.iter().enumerate() {
+    for (rule_i, (clauses, heads, conds, nots)) in rules.iter().enumerate() {
         emit_rule_variant(
-            &mut asm, rule_i, clauses, heads, conds, None,
+            &mut asm, rule_i, clauses, heads, conds, nots, None,
             var_count, max_head_arity, max_depth,
             packed_try_insert_addr, packed_count_addr,
             packed_data_ptr_addr, packed_recent_ptr_addr,
@@ -1945,10 +2021,10 @@ fn codegen_stratum_asm_inner(
     let inner_hdr = asm.new_dynamic_label();
     dynasm!(asm; =>inner_hdr);
 
-    for (rule_i, (clauses, heads, conds)) in rules.iter().enumerate() {
+    for (rule_i, (clauses, heads, conds, nots)) in rules.iter().enumerate() {
         for clause_seq in 0..clauses.len() {
             emit_rule_variant(
-                &mut asm, rule_i, clauses, heads, conds, Some(clause_seq),
+                &mut asm, rule_i, clauses, heads, conds, nots, Some(clause_seq),
                 var_count, max_head_arity, max_depth,
                 packed_try_insert_addr, packed_count_addr,
                 packed_data_ptr_addr, packed_recent_ptr_addr,
@@ -1985,8 +2061,11 @@ fn codegen_stratum_asm_inner(
 
 /// Old (non-native) entry point: uses `packed_count`/`packed_data_ptr`/`packed_recent_ptr`
 /// callbacks and the `StratumStage4Ctx` context.
+///
+/// `rules` is a 4-tuple per rule: `(clauses, heads, conditions, not_clauses)`.
+/// Not-clauses are anti-join checks emitted before head insertion.
 pub fn codegen_stratum_asm(
-    rules: &[(&[CClause], &[CHeadClause], &[CExpr])],
+    rules: &[AsmRuleRef<'_>],
     var_count: usize,
     advance_s4_addr: usize,
     packed_try_insert_addr: usize,
@@ -2014,13 +2093,21 @@ pub fn codegen_stratum_asm(
 /// `advance_native_addr` is the address of `jit_advance_native`.
 /// Head writes are fully inline: `jit_rel_data_grow` and `jit_tuple_set_grow` are called
 /// only on capacity overflow; no Rust call occurs in the common case.
+///
+/// Note: negation clauses are NOT supported in the native path. Rules with negation
+/// cause the native compile to fail, falling back to the non-native asm path.
 pub fn codegen_stratum_asm_native(
     rules: &[(&[CClause], &[CHeadClause], &[CExpr])],
     var_count: usize,
     advance_native_addr: usize,
 ) -> Result<AsmStratum, String> {
+    // Native path has no negation support; wrap 3-tuples with empty not-slices.
+    let rules_with_nots: Vec<AsmRuleRef<'_>> = rules
+        .iter()
+        .map(|(c, h, e)| (*c, *h, *e, &[] as &[CAggregation]))
+        .collect();
     codegen_stratum_asm_inner(
-        rules, var_count,
+        &rules_with_nots, var_count,
         advance_native_addr,
         0, // packed_try_insert_addr unused in native path (Step 5)
         0, // packed_count_addr unused in native path

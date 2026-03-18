@@ -520,6 +520,16 @@ impl PackedStorage {
         self.jit_dedup.probe(hash, &packed)
     }
 
+    /// Check membership by raw packed tuple (u32 slice).
+    /// Used by JIT-generated negation probes via `check_not_packed_N`.
+    pub fn contains_packed_raw(&self, packed: &[u32]) -> bool {
+        if self.arity == 0 {
+            return self.count > 0;
+        }
+        let hash = crate::jit_index::jit_dedup_hash(packed);
+        self.jit_dedup.probe(hash, packed)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &[Value]> {
         (0..self.count).map(move |i| self.value_slice(i))
     }

@@ -1212,7 +1212,7 @@ impl Engine {
 
         for rule in rules {
             // Clause rel pointers
-            let clause_rels: Vec<*const PackedStorage> = rule
+            let mut clause_rels: Vec<*const PackedStorage> = rule
                 .body
                 .iter()
                 .filter_map(|item| match item {
@@ -1231,6 +1231,26 @@ impl Engine {
                 .count();
 
             if clause_rels.len() != clause_count {
+                return None;
+            }
+
+            // Append negation relation pointers after clause rels.
+            // The asm backend accesses these as rels[clause_count + neg_i].
+            let not_count_expected = rule.body.iter()
+                .filter(|i| matches!(i, CBodyItem::Aggregation(a) if a.aggregator_name == "not"))
+                .count();
+            for item in &rule.body {
+                if let CBodyItem::Aggregation(a) = item
+                    && a.aggregator_name == "not" {
+                    match self.relations.get(&a.relation) {
+                        Some(Relation::Packed(p)) => {
+                            clause_rels.push(p as *const PackedStorage);
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            if clause_rels.len() != clause_count + not_count_expected {
                 return None;
             }
 

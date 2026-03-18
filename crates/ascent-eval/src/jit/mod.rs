@@ -29,7 +29,7 @@ use rustc_hash::FxHashMap;
 
 #[cfg(feature = "specialized")]
 use crate::compiled::{CBinOp, CClauseArg, CExpr, CUnOp};
-use crate::compiled::{CBodyItem, CCondition, CRule};
+use crate::compiled::{CAggArg, CAggregation, CBodyItem, CCondition, CRule};
 
 pub(crate) use self::helpers::JitContext;
 
@@ -161,6 +161,11 @@ pub struct JitCompiler {
     #[cfg(all(feature = "specialized", feature = "jit-asm"))]
     pub(crate) stratum_stage4_native_fn_cache:
         FxHashMap<usize, Option<packed_helpers::StratumStage4Fn>>,
+    /// Whether the stage4 fn for a given stratum was compiled by the non-native asm backend
+    /// (true) or Cranelift (false).  Used to skip unnecessary `jit_used_in_cranelift_strata`
+    /// marking: non-native asm uses packed_data_ptr callbacks and doesn't need JitHashIndex.
+    #[cfg(all(feature = "specialized", feature = "jit-asm"))]
+    pub(crate) stratum_stage4_fn_is_asm: FxHashMap<usize, bool>,
     /// Asm-backend stratum buffers: kept alive so the fn_ptr remains valid.
     #[cfg(all(feature = "specialized", feature = "jit-asm"))]
     pub(crate) asm_buffers: Vec<asm_codegen::AsmStratum>,
@@ -288,6 +293,8 @@ impl JitCompiler {
             #[cfg(all(feature = "specialized", feature = "jit-asm"))]
             stratum_stage4_native_fn_cache: FxHashMap::default(),
             #[cfg(all(feature = "specialized", feature = "jit-asm"))]
+            stratum_stage4_fn_is_asm: FxHashMap::default(),
+            #[cfg(all(feature = "specialized", feature = "jit-asm"))]
             asm_buffers: Vec::new(),
             #[cfg(feature = "specialized")]
             var_count: 0,
@@ -305,7 +312,26 @@ impl JitCompiler {
     ///
     /// Returns `Ok(())` if eligible, or `Err(reason)` explaining why not.
     #[cfg(feature = "specialized")]
+    /// Eligibility check for packed JIT (Stages 2–3, Cranelift path).
+    ///
+    /// Negation (`!rel(...)`) is NOT accepted here because the Cranelift
+    /// codegen does not implement anti-join probes.  Use
+    /// `packed_eligible_reason_stage4` for the asm Stage 4 path.
     pub fn packed_eligible_reason(rule: &CRule) -> Result<(), &'static str> {
+        Self::packed_eligible_reason_inner(rule, false)
+    }
+
+    /// Eligibility check for Stage 4 asm path.
+    ///
+    /// Extends the base check to accept `!rel(var...)` negation clauses (arity ≤ 3,
+    /// all args must be plain variables), which the asm backend handles via
+    /// `check_not_packed_N` probes.
+    #[cfg(all(feature = "specialized", feature = "jit-asm"))]
+    fn packed_eligible_reason_stage4(rule: &CRule) -> Result<(), &'static str> {
+        Self::packed_eligible_reason_inner(rule, true)
+    }
+
+    fn packed_eligible_reason_inner(rule: &CRule, allow_not: bool) -> Result<(), &'static str> {
         let clause_count = rule
             .body
             .iter()
@@ -344,6 +370,16 @@ impl JitCompiler {
                 CBodyItem::Condition(CCondition::If(expr)) => {
                     if !is_supported_packed_expr(expr) {
                         return Err("unsupported condition expression");
+                    }
+                }
+                CBodyItem::Aggregation(a) if allow_not && a.aggregator_name == "not" => {
+                    if a.args.len() > 3 {
+                        return Err("not-clause arity > 3 not supported in asm backend");
+                    }
+                    for arg in &a.args {
+                        if !matches!(arg, CAggArg::Var(_)) {
+                            return Err("not-clause has non-variable argument");
+                        }
                     }
                 }
                 _ => return Err("unsupported body item (aggregation or other)"),
@@ -643,7 +679,16 @@ impl JitCompiler {
             return *cached;
         }
 
-        // All rules must be packed-JIT eligible
+        // All rules must be packed-JIT eligible (Stage 4 asm allows negation).
+        #[cfg(feature = "jit-asm")]
+        for (i, rule) in rules.iter().enumerate() {
+            if let Err(reason) = Self::packed_eligible_reason_stage4(rule) {
+                eprintln!("JIT: stratum {stratum_key} rule {i} not eligible for stage4: {reason}");
+                self.stratum_stage4_fn_cache.insert(stratum_key, None);
+                return None;
+            }
+        }
+        #[cfg(not(feature = "jit-asm"))]
         for (i, rule) in rules.iter().enumerate() {
             if let Err(reason) = Self::packed_eligible_reason(rule) {
                 eprintln!("JIT: stratum {stratum_key} rule {i} not eligible for stage4: {reason}");
@@ -661,6 +706,14 @@ impl JitCompiler {
         }
     }
 
+    /// Returns `true` if the stage4 fn for this stratum was compiled by the non-native asm
+    /// backend, `false` if by Cranelift.  Panics if the stratum has not been compiled yet.
+    #[cfg(all(feature = "specialized", feature = "jit-asm"))]
+    pub(crate) fn stratum_stage4_fn_is_asm(&self, stratum_key: usize) -> bool {
+        *self.stratum_stage4_fn_is_asm.get(&stratum_key)
+            .expect("stratum_stage4_fn_is_asm queried before compilation")
+    }
+
     #[cfg(feature = "specialized")]
     fn compile_stratum_stage4_inner(
         &mut self,
@@ -670,7 +723,8 @@ impl JitCompiler {
         // Try the lightweight asm backend first; fall back to Cranelift on Err.
         #[cfg(feature = "jit-asm")]
         {
-            let rule_data: Vec<(Vec<crate::compiled::CClause>, Vec<crate::compiled::CHeadClause>, Vec<crate::compiled::CExpr>)> = rules
+            #[allow(clippy::type_complexity)]
+            let rule_data: Vec<(Vec<crate::compiled::CClause>, Vec<crate::compiled::CHeadClause>, Vec<crate::compiled::CExpr>, Vec<CAggregation>)> = rules
                 .iter()
                 .map(|rule| {
                     let clauses: Vec<crate::compiled::CClause> = rule
@@ -689,12 +743,22 @@ impl JitCompiler {
                             _ => None,
                         })
                         .collect();
-                    (clauses, rule.heads.clone(), conditions)
+                    let not_clauses: Vec<CAggregation> = rule
+                        .body
+                        .iter()
+                        .filter_map(|item| match item {
+                            CBodyItem::Aggregation(a) if a.aggregator_name == "not" => {
+                                Some(a.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    (clauses, rule.heads.clone(), conditions, not_clauses)
                 })
                 .collect();
-            let rules_refs: Vec<(&[crate::compiled::CClause], &[crate::compiled::CHeadClause], &[crate::compiled::CExpr])> = rule_data
+            let rules_refs: Vec<asm_codegen::AsmRuleRef<'_>> = rule_data
                 .iter()
-                .map(|(c, h, conds)| (c.as_slice(), h.as_slice(), conds.as_slice()))
+                .map(|(c, h, conds, nots)| (c.as_slice(), h.as_slice(), conds.as_slice(), nots.as_slice()))
                 .collect();
 
             match asm_codegen::codegen_stratum_asm(
@@ -709,6 +773,7 @@ impl JitCompiler {
                 Ok(asm_stratum) => {
                     let fn_ptr = asm_stratum.fn_ptr;
                     self.asm_buffers.push(asm_stratum);
+                    self.stratum_stage4_fn_is_asm.insert(stratum_key, true);
                     return Ok(fn_ptr);
                 }
                 Err(reason) => {
@@ -789,6 +854,8 @@ impl JitCompiler {
 
         let code_ptr = self.module.get_finalized_function(func_id);
         let fn_ptr: packed_helpers::StratumStage4Fn = unsafe { std::mem::transmute(code_ptr) };
+        #[cfg(feature = "jit-asm")]
+        self.stratum_stage4_fn_is_asm.insert(stratum_key, false);
         Ok(fn_ptr)
     }
 
@@ -806,6 +873,15 @@ impl JitCompiler {
     ) -> Option<packed_helpers::StratumStage4Fn> {
         if let Some(cached) = self.stratum_stage4_native_fn_cache.get(&stratum_key) {
             return *cached;
+        }
+
+        // Native path does not support negation: skip and use non-native asm instead.
+        let has_negation = rules.iter().any(|rule| {
+            rule.body.iter().any(|item| matches!(item, CBodyItem::Aggregation(a) if a.aggregator_name == "not"))
+        });
+        if has_negation {
+            self.stratum_stage4_native_fn_cache.insert(stratum_key, None);
+            return None;
         }
 
         let rule_data: Vec<(Vec<crate::compiled::CClause>, Vec<crate::compiled::CHeadClause>, Vec<crate::compiled::CExpr>)> = rules
