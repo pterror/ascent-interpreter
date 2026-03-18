@@ -1579,20 +1579,19 @@ fn emit_clause_level(
             dynasm!(asm
                 ; test eax, eax
                 ; jz =>when_exhausted
-                ; xor r15d, r15d         // j = 0
             );
             // Pre-compute vals_base = values_ptr + head*4.
-            // For col_value: keep count in rbx.
-            // For standard: spill count to cnt_slot, load data_ptr into rbx.
+            // For col_value: pointer-increment scan (r15 = elem_ptr, rbx = end_ptr).
+            // For standard: j = 0 in r15d, count on stack, data_ptr in rbx.
             if is_col_value {
                 dynasm!(asm
-                    ; mov rbx, rax                    // rbx = count
-                    ; lea r11, [r11 + rsi*4]          // r11 = vals_base
-                    ; mov [rbp + vs], r11             // save vals_base
+                    ; lea r15, [r11 + rsi*4]          // r15 = elem_ptr = vals_base + start*4
+                    ; lea rbx, [r15 + rax*4]          // rbx = end_ptr = elem_ptr + count*4
                 );
             } else {
                 let cnt_slot = level_count_slot(level, p.var_count, p.max_head_arity, p.max_depth);
                 dynasm!(asm
+                    ; xor r15d, r15d                  // j = 0
                     ; mov [rbp + cnt_slot], eax       // save count to stack
                     ; lea r11, [r11 + rsi*4]          // r11 = vals_base
                     ; mov [rbp + vs], r11             // save vals_base
@@ -1613,7 +1612,7 @@ fn emit_clause_level(
 
             dynasm!(asm; =>inner_hdr);
             if is_col_value {
-                dynasm!(asm; cmp r15d, ebx; jge =>when_exhausted);
+                dynasm!(asm; cmp r15, rbx; jge =>when_exhausted);
             } else {
                 let cnt_slot = level_count_slot(level, p.var_count, p.max_head_arity, p.max_depth);
                 dynasm!(asm
@@ -1623,12 +1622,19 @@ fn emit_clause_level(
                 );
             }
 
-            // Load vals_base[j] into ecx.
-            dynasm!(asm
-                ; mov rax, [rbp + vs]                   // vals_base
-                ; mov ecx, [rax + r15*4]                // vals_base[j]
-                ; inc r15d                              // j++
-            );
+            // Load next element into ecx and advance position.
+            if is_col_value {
+                dynasm!(asm
+                    ; mov ecx, [r15]                    // c = *elem_ptr (no stack load)
+                    ; add r15, 4                        // elem_ptr++
+                );
+            } else {
+                dynasm!(asm
+                    ; mov rax, [rbp + vs]               // vals_base
+                    ; mov ecx, [rax + r15*4]            // vals_base[j]
+                    ; inc r15d                          // j++
+                );
+            }
 
             if is_col_value {
                 let primary_col = clause.bound_cols[0];
