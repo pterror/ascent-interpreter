@@ -404,8 +404,13 @@ expression handling in bound clause arg positions. TC jit_hot/50 at ~200µs (par
   slot for non-scalar aggregators), emit result tuple after the loop. The aggregation function itself
   is a call (user-defined); the loop structure is simpler than a join.
 
-- **3e — Negation / anti-join** (~150 lines): probe the negated relation's index; branch to
-  `skip_label` on *hit* rather than miss. Reuses all probe infrastructure from 3b.
+- **3e — Negation / anti-join** ✅ IMPLEMENTED (2026-03-18, commit `8c7a3e1`): `check_not_packed_1/2/3`
+  extern C helpers probe `PackedStorage.jit_dedup`; `emit_not_probes` emits anti-join checks before
+  head insertion at all call sites; `packed_eligible_reason_stage4` accepts "not" aggregations (arity
+  ≤ 3, all-Var args); `build_stratum_stage4_runtime` appends negation rel pointers to `clause_rels`
+  at `[clause_count + neg_i]`; `compile_stratum_stage4_native` skips native path for negation rules
+  so the non-native asm path (which has probe code) is used. Bug: native path silently ignored
+  anti-joins by wrapping with empty nots.
 
 **Step 4 — EDB-contiguous index (implements Step 1 correctly)** ✅ DONE (2026-03-15)
 
