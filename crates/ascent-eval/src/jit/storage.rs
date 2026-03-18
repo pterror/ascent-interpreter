@@ -592,6 +592,27 @@ impl JitRelData {
 }
 
 impl JitRelData {
+    /// Reset this JitRelData's `new` buffer in-place for the next fixpoint iteration.
+    ///
+    /// Sets `len = 0` and zeros the `tuple_set` slots without reallocating, so the
+    /// JIT can reuse the same memory for the next iteration's batch of new tuples.
+    /// Called instead of `std::mem::replace(&mut native.new, build_from_packed(&[], …))`
+    /// to avoid one alloc+free per advance step per relation.
+    pub fn reset_for_new_iteration(&mut self) {
+        self.len = 0;
+        if !self.tuple_set.slots.is_null() && self.tuple_set.mask > 0 {
+            // Compute the actual slot count from mask (always in sync, even after
+            // jit_tuple_set_grow — unlike _ts_slots_words which isn't updated by grow).
+            let stride = self.arity as usize + 1;
+            let cap = (self.tuple_set.mask + 1) as usize;
+            // SAFETY: slots points to cap * stride u32 values.
+            unsafe {
+                std::ptr::write_bytes(self.tuple_set.slots, 0, cap * stride);
+            }
+            self.tuple_set.len = 0;
+        }
+    }
+
     /// Appends `new_tuples` (flat row-major, stride=arity) to this relation's data buffer,
     /// rebuilds all column indices from the extended data, and updates the `tuple_set`
     /// to include the new tuples (required for cross-iteration JIT head dedup).
@@ -747,8 +768,12 @@ impl Drop for JitRelData {
         }
 
         // Free tuple_set slots.
-        if !self.tuple_set.slots.is_null() && self._ts_slots_words > 0 {
-            unsafe { free_u32_slice(self.tuple_set.slots, self._ts_slots_words) };
+        // Use mask to compute the actual allocation size (mask is updated by
+        // jit_tuple_set_grow; _ts_slots_words is not, so mask is authoritative).
+        if !self.tuple_set.slots.is_null() && self.tuple_set.mask > 0 {
+            let stride = arity + 1;
+            let cap = (self.tuple_set.mask + 1) as usize;
+            unsafe { free_u32_slice(self.tuple_set.slots, cap * stride) };
             self.tuple_set.slots = ptr::null_mut();
         }
     }

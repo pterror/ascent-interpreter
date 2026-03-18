@@ -478,6 +478,24 @@ impl PackedStorage {
         true
     }
 
+    /// Insert a pre-packed tuple from the native JIT flush path.
+    ///
+    /// The native JIT already performed cross-iteration dedup via `total.tuple_set`
+    /// (which tracks the same set as `jit_dedup`), so this tuple is guaranteed new.
+    /// Uses `jit_dedup.insert` (unconditional) instead of `insert_if_new` to skip
+    /// the redundant probe, saving ~10% on triangle-class benchmarks.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    fn insert_packed_raw_native_flush(&mut self, packed: &[u32]) {
+        debug_assert_eq!(packed.len(), self.arity, "packed tuple arity mismatch");
+        let hash = crate::jit_index::jit_dedup_hash(packed);
+        // Unconditional insert: caller guarantees this tuple is not yet in jit_dedup.
+        self.jit_dedup.insert(hash, packed);
+        let idx = self.count;
+        self.packed_data.extend_from_slice(packed);
+        self.count += 1;
+        self.delta.push(idx);
+    }
+
     /// Insert a pre-packed tuple whose dedup entry has already been written by the JIT.
     ///
     /// Skips the `jit_dedup.insert_if_new` check (the JIT wrote to the dedup table inline).
@@ -577,33 +595,38 @@ impl PackedStorage {
         // when nothing changed (avoids a full rebuild of total + recent).
         let _new_written = if let Some(ref mut native) = self.jit_native {
             let arity = self.arity;
-            // Swap out the `new` buffer, replacing with a fresh empty one.
-            let new_buf = std::mem::replace(
-                &mut native.new,
-                crate::jit::storage::JitRelData::build_from_packed(&[], arity, false),
-            );
-            let new_len = new_buf.len as usize;
+            let new_len = native.new.len as usize;
+            // Capture raw pointer and data before dropping the borrow on `native`.
+            // NLL: `native` is last used here; the borrow ends at this point, allowing
+            // the `insert_packed_raw_native_flush` calls below to take `&mut self`.
+            let data_ptr: *const u32 = native.new.data;
+            let new_buf_ptr: *mut crate::jit::storage::JitRelData =
+                std::ptr::addr_of_mut!(*native.new);
             if new_len > 0 {
                 if arity == 0 {
                     // Zero-arity: the JIT wrote len=1 to signal "insert unit fact".
                     self.insert_packed_raw(&[]);
                 } else {
-                    let data_ptr = new_buf.data;
-                    // Safety: data_ptr points to new_len * arity u32 words allocated by
-                    // jit_rel_data_grow or build_from_packed.
+                    // Safety: data_ptr points to new_len * arity u32 words written by
+                    // the native JIT. All tuples are guaranteed new (native JIT deduped
+                    // via total.tuple_set which tracks the same set as jit_dedup), so
+                    // use unconditional insert to skip the redundant probe.
                     let data = unsafe {
                         std::slice::from_raw_parts(data_ptr, new_len * arity)
                     };
                     for i in 0..new_len {
                         let tuple = &data[i * arity..(i + 1) * arity];
-                        self.insert_packed_raw(tuple);
+                        self.insert_packed_raw_native_flush(tuple);
                     }
                 }
+                // Reset the `new` buffer in-place: zero len + tuple_set so the JIT
+                // can reuse the same allocation next iteration without alloc/free.
+                // Safety: new_buf_ptr is valid (we hold &mut self, no aliasing).
+                unsafe { (*new_buf_ptr).reset_for_new_iteration() };
                 true
             } else {
                 false
             }
-            // new_buf drops here, freeing the old `new` JitRelData allocation.
         } else {
             false
         };
