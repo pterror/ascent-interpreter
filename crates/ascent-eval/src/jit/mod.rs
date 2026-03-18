@@ -338,7 +338,53 @@ impl JitCompiler {
             .filter(|item| matches!(item, CBodyItem::Clause(_)))
             .count();
         if clause_count == 0 {
-            return Err("no clause body items");
+            if !allow_not {
+                return Err("no clause body items");
+            }
+            // Pure-aggregation rule: allow if all non-condition body items are count/sum/min/max.
+            let has_valid_agg = rule.body.iter().any(|item| {
+                matches!(item, CBodyItem::Aggregation(a) if matches!(a.aggregator_name.as_str(), "count" | "sum" | "min" | "max"))
+            });
+            if !has_valid_agg {
+                return Err("no clause body items and no supported aggregation");
+            }
+            for item in &rule.body {
+                match item {
+                    CBodyItem::Aggregation(a) => {
+                        match a.aggregator_name.as_str() {
+                            "count" => {
+                                if a.result_vars.len() != 1 {
+                                    return Err("count aggregation must have exactly 1 result var");
+                                }
+                            }
+                            "sum" | "min" | "max" => {
+                                if a.result_vars.len() != 1 {
+                                    return Err("sum/min/max must have exactly 1 result var");
+                                }
+                                if a.bound_vars.len() != 1 {
+                                    return Err("sum/min/max must have exactly 1 bound var");
+                                }
+                                for arg in &a.args {
+                                    if !matches!(arg, CAggArg::Var(_)) {
+                                        return Err("aggregation args must be plain variables");
+                                    }
+                                }
+                            }
+                            _ => return Err("unsupported aggregator in asm backend"),
+                        }
+                    }
+                    CBodyItem::Condition(CCondition::If(_)) => {}
+                    _ => return Err("unsupported body item in pure-aggregation rule"),
+                }
+            }
+            for head in &rule.heads {
+                for arg in &head.args {
+                    if !is_supported_packed_expr(arg) {
+                        return Err("head arg uses unsupported expression");
+                    }
+                }
+            }
+            return Ok(());
         }
         if clause_count > 4 {
             return Err("more than 4 clause body items");
@@ -724,7 +770,7 @@ impl JitCompiler {
         #[cfg(feature = "jit-asm")]
         {
             #[allow(clippy::type_complexity)]
-            let rule_data: Vec<(Vec<crate::compiled::CClause>, Vec<crate::compiled::CHeadClause>, Vec<crate::compiled::CExpr>, Vec<CAggregation>)> = rules
+            let rule_data: Vec<(Vec<crate::compiled::CClause>, Vec<crate::compiled::CHeadClause>, Vec<crate::compiled::CExpr>, Vec<CAggregation>, Vec<CAggregation>)> = rules
                 .iter()
                 .map(|rule| {
                     let clauses: Vec<crate::compiled::CClause> = rule
@@ -753,12 +799,22 @@ impl JitCompiler {
                             _ => None,
                         })
                         .collect();
-                    (clauses, rule.heads.clone(), conditions, not_clauses)
+                    let agg_clauses: Vec<CAggregation> = rule
+                        .body
+                        .iter()
+                        .filter_map(|item| match item {
+                            CBodyItem::Aggregation(a) if a.aggregator_name != "not" => {
+                                Some(a.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    (clauses, rule.heads.clone(), conditions, not_clauses, agg_clauses)
                 })
                 .collect();
             let rules_refs: Vec<asm_codegen::AsmRuleRef<'_>> = rule_data
                 .iter()
-                .map(|(c, h, conds, nots)| (c.as_slice(), h.as_slice(), conds.as_slice(), nots.as_slice()))
+                .map(|(c, h, conds, nots, aggs)| (c.as_slice(), h.as_slice(), conds.as_slice(), nots.as_slice(), aggs.as_slice()))
                 .collect();
 
             match asm_codegen::codegen_stratum_asm(
@@ -875,11 +931,11 @@ impl JitCompiler {
             return *cached;
         }
 
-        // Native path does not support negation: skip and use non-native asm instead.
-        let has_negation = rules.iter().any(|rule| {
-            rule.body.iter().any(|item| matches!(item, CBodyItem::Aggregation(a) if a.aggregator_name == "not"))
+        // Native path does not support negation or aggregation: skip and use non-native asm instead.
+        let has_negation_or_agg = rules.iter().any(|rule| {
+            rule.body.iter().any(|item| matches!(item, CBodyItem::Aggregation(_)))
         });
-        if has_negation {
+        if has_negation_or_agg {
             self.stratum_stage4_native_fn_cache.insert(stratum_key, None);
             return None;
         }

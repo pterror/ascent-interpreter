@@ -820,3 +820,93 @@ fn test_packed_jit_negation_2tuple() {
         "noedge",
     );
 }
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_agg_count() {
+    // Pure count() aggregation: count all tuples in `data`.
+    assert_packed_jit_equivalence(
+        r#"
+            relation data(i32);
+            relation total(i32);
+            total(n) <-- agg n = count() in data(_x);
+        "#,
+        &[(
+            "data",
+            vec![
+                vec![Value::I32(10)],
+                vec![Value::I32(20)],
+                vec![Value::I32(30)],
+            ],
+        )],
+        "total",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_agg_sum() {
+    // Pure sum() aggregation: sum all values in `data`.
+    assert_packed_jit_equivalence(
+        r#"
+            relation data(i32);
+            relation total(i32);
+            total(s) <-- agg s = sum(x) in data(x);
+        "#,
+        &[(
+            "data",
+            vec![
+                vec![Value::I32(10)],
+                vec![Value::I32(20)],
+                vec![Value::I32(30)],
+            ],
+        )],
+        "total",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_agg_max() {
+    // Pure max() aggregation: max value in `data`.
+    assert_packed_jit_equivalence(
+        r#"
+            relation data(i32);
+            relation result(i32);
+            result(m) <-- agg m = max(x) in data(x);
+        "#,
+        &[(
+            "data",
+            vec![
+                vec![Value::I32(5)],
+                vec![Value::I32(1)],
+                vec![Value::I32(9)],
+                vec![Value::I32(3)],
+            ],
+        )],
+        "result",
+    );
+}
+
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_agg_min() {
+    // Pure min() aggregation: min value in `data`.
+    assert_packed_jit_equivalence(
+        r#"
+            relation data(i32);
+            relation result(i32);
+            result(m) <-- agg m = min(x) in data(x);
+        "#,
+        &[(
+            "data",
+            vec![
+                vec![Value::I32(5)],
+                vec![Value::I32(1)],
+                vec![Value::I32(9)],
+                vec![Value::I32(3)],
+            ],
+        )],
+        "result",
+    );
+}

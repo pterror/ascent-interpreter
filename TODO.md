@@ -400,9 +400,15 @@ expression handling in bound clause arg positions. TC jit_hot/50 at ~200µs (par
   function pointer with caller-save spill/restore around the call site. Remove all `check_expr` /
   `check_binop` `Err` returns for arithmetic ops.
 
-- **3d — Aggregation codegen** (~250 lines): single scan loop, accumulate into a register (or stack
-  slot for non-scalar aggregators), emit result tuple after the loop. The aggregation function itself
-  is a call (user-defined); the loop structure is simpler than a join.
+- **3d — Aggregation codegen** ✅ IMPLEMENTED (2026-03-18): `emit_aggregations` in `asm_codegen.rs`
+  handles count/sum/min/max for pure-aggregation rules (0 positive clauses). Loads source relation
+  via `load_rel_rdi!` at `rels[clause_count + not_count + agg_i]`, calls `packed_agg_count/sum_i32/
+  max_i32/min_i32` helpers, stores result to `var_slot(result_var)`. AGG_EMPTY sentinel check skips
+  head emission for sum/min/max on empty relations. `build_stratum_stage4_runtime` appends agg rel
+  pointers after negation rels; `compile_stratum_stage4_native` skips native path for any rule with
+  `CBodyItem::Aggregation(_)` to prevent the do-nothing native function from pre-empting the asm
+  aggregation path. `packed_eligible_reason_inner` accepts pure-agg rules (count/sum/min/max with
+  validated structure). 4 new tests: test_packed_jit_agg_{count,sum,min,max} all pass.
 
 - **3e — Negation / anti-join** ✅ IMPLEMENTED (2026-03-18, commit `8c7a3e1`): `check_not_packed_1/2/3`
   extern C helpers probe `PackedStorage.jit_dedup`; `emit_not_probes` emits anti-join checks before

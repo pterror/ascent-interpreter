@@ -167,6 +167,77 @@ pub unsafe extern "C" fn check_not_packed_3(
     !rel.contains_packed_raw(&[v0, v1, v2]) as u8
 }
 
+// ─── Aggregation helpers ──────────────────────────────────────────────────
+
+/// Sentinel returned by sum/min/max helpers when the relation is empty.
+pub const AGG_EMPTY: i64 = i64::MIN;
+
+/// Returns the total tuple count of `rel` (full relation, never empty).
+///
+/// # Safety
+/// `rel` must point to a valid PackedStorage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn packed_agg_count(rel: *const PackedStorage) -> u32 {
+    let rel = unsafe { &*rel };
+    rel.count as u32
+}
+
+/// Returns the sum of column `col` (interpreted as i32) over all tuples in `rel`.
+/// Returns `AGG_EMPTY` if the relation is empty.
+///
+/// # Safety
+/// `rel` must point to a valid PackedStorage with arity > col.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn packed_agg_sum_i32(rel: *const PackedStorage, col: u32) -> i64 {
+    let rel = unsafe { &*rel };
+    if rel.count == 0 { return AGG_EMPTY; }
+    let col = col as usize;
+    let arity = rel.arity;
+    let mut acc: i64 = 0;
+    for i in 0..rel.count {
+        acc += rel.packed_data[i * arity + col] as i32 as i64;
+    }
+    acc
+}
+
+/// Returns the max of column `col` (interpreted as i32) over all tuples in `rel`.
+/// Returns `AGG_EMPTY` if the relation is empty.
+///
+/// # Safety
+/// `rel` must point to a valid PackedStorage with arity > col.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn packed_agg_max_i32(rel: *const PackedStorage, col: u32) -> i64 {
+    let rel = unsafe { &*rel };
+    if rel.count == 0 { return AGG_EMPTY; }
+    let col = col as usize;
+    let arity = rel.arity;
+    let mut best = rel.packed_data[col] as i32;
+    for i in 1..rel.count {
+        let v = rel.packed_data[i * arity + col] as i32;
+        if v > best { best = v; }
+    }
+    best as i64
+}
+
+/// Returns the min of column `col` (interpreted as i32) over all tuples in `rel`.
+/// Returns `AGG_EMPTY` if the relation is empty.
+///
+/// # Safety
+/// `rel` must point to a valid PackedStorage with arity > col.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn packed_agg_min_i32(rel: *const PackedStorage, col: u32) -> i64 {
+    let rel = unsafe { &*rel };
+    if rel.count == 0 { return AGG_EMPTY; }
+    let col = col as usize;
+    let arity = rel.arity;
+    let mut best = rel.packed_data[col] as i32;
+    for i in 1..rel.count {
+        let v = rel.packed_data[i * arity + col] as i32;
+        if v < best { best = v; }
+    }
+    best as i64
+}
+
 /// Push a packed tuple into the results accumulator.
 ///
 /// Copies `arity` u32 words from `tuple` into a new Vec<u32> and pushes

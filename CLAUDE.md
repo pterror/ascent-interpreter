@@ -62,7 +62,7 @@ Current state (2026-03-17): fibonacci jit_hot/20 ≈ 16µs vs ascent_macro ≈ 9
 
 **The end state is zero Cranelift dependency.** The asm backend (`jit-asm`) must handle every rule shape; Cranelift is a temporary fallback to be deleted once asm coverage is complete. Any work that keeps rules falling through to Cranelift is unfinished work, not a solution.
 
-Current state (2026-03-18): IDB inner clause rejection was removed (commit f7e503d) after commit f2901fc fixed bound clause arg expressions. All rules now handled by asm without Cranelift fallthrough. TC at parity (1.0×). 3c (Div/Rem/bitops) and 3e (negation/anti-join, commit 8c7a3e1) complete. Remaining blocker to deleting Cranelift: aggregation (3d) — see TODO.md § Step 3.
+Current state (2026-03-18): IDB inner clause rejection was removed (commit f7e503d) after commit f2901fc fixed bound clause arg expressions. All rules now handled by asm without Cranelift fallthrough. TC at parity (1.0×). Step 3 complete: 3c (Div/Rem/bitops), 3d (count/sum/min/max aggregation), 3e (negation/anti-join, commit 8c7a3e1) all implemented. No remaining Cranelift blockers — deleting Cranelift dependency is next (see TODO.md § Step 3).
 
 ## JIT Design Rule
 

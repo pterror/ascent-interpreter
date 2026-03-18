@@ -1254,6 +1254,26 @@ impl Engine {
                 return None;
             }
 
+            // Append real aggregation relation pointers after negation rels.
+            // The asm backend accesses these as rels[clause_count + not_count + agg_i].
+            let agg_count_expected = rule.body.iter()
+                .filter(|i| matches!(i, CBodyItem::Aggregation(a) if a.aggregator_name != "not"))
+                .count();
+            for item in &rule.body {
+                if let CBodyItem::Aggregation(a) = item
+                    && a.aggregator_name != "not" {
+                    match self.relations.get(&a.relation) {
+                        Some(Relation::Packed(p)) => {
+                            clause_rels.push(p as *const PackedStorage);
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            if clause_rels.len() != clause_count + not_count_expected + agg_count_expected {
+                return None;
+            }
+
             // Head rel pointers
             let head_rels: Vec<*mut PackedStorage> = rule
                 .heads

@@ -55,8 +55,11 @@ use crate::jit::packed_helpers::StratumStage4Fn;
 use crate::jit::storage;
 use crate::value::Value;
 
-/// 4-tuple representing one rule for asm codegen: `(clauses, heads, conditions, not_clauses)`.
-pub(crate) type AsmRuleRef<'a> = (&'a [CClause], &'a [CHeadClause], &'a [CExpr], &'a [CAggregation]);
+/// 5-tuple representing one rule for asm codegen:
+/// `(clauses, heads, conditions, not_clauses, agg_clauses)`.
+/// `not_clauses`: negation anti-joins (`aggregator_name == "not"`).
+/// `agg_clauses`: real aggregations (count/sum/min/max, pure-aggregation rules only).
+pub(crate) type AsmRuleRef<'a> = (&'a [CClause], &'a [CHeadClause], &'a [CExpr], &'a [CAggregation], &'a [CAggregation]);
 
 /// A compiled stratum function produced by the asm backend.
 pub struct AsmStratum {
@@ -1781,6 +1784,60 @@ fn emit_clause_level(
 
 // ─── Rule variant emission ─────────────────────────────────────────────────
 
+/// Emit aggregation computations for a pure-aggregation rule (0 positive clauses).
+///
+/// For each aggregation, loads the relation from `rels[num_pos_clauses + num_nots + agg_i]`,
+/// calls the appropriate helper, stores the result to `var_slot(result_var)`, and jumps
+/// to `variant_exit` if the relation is empty (for sum/min/max only; count always continues).
+fn emit_aggregations(
+    asm: &mut Assembler,
+    aggregations: &[CAggregation],
+    num_pos_clauses: usize,
+    num_nots: usize,
+    rule_i: usize,
+    variant_exit: DynamicLabel,
+) -> Result<(), String> {
+    use crate::jit::packed_helpers::{AGG_EMPTY, packed_agg_count, packed_agg_max_i32, packed_agg_min_i32, packed_agg_sum_i32};
+    for (agg_i, agg) in aggregations.iter().enumerate() {
+        let rel_seq = num_pos_clauses + num_nots + agg_i;
+        let result_var = *agg.result_vars.first()
+            .ok_or_else(|| format!("agg '{}': no result vars", agg.aggregator_name))?;
+        match agg.aggregator_name.as_str() {
+            "count" => {
+                load_rel_rdi!(asm, rule_i, rel_seq);
+                call_abs!(asm, packed_agg_count as usize);
+                // eax = u32 count; store to var_slot (always emit, count=0 is valid)
+                dynasm!(asm; mov [rbp + var_slot(result_var)], eax);
+            }
+            name @ ("sum" | "min" | "max") => {
+                let bv = *agg.bound_vars.first()
+                    .ok_or_else(|| format!("agg '{name}': no bound vars"))?;
+                let col = agg.args.iter().position(|a| matches!(a, CAggArg::Var(v) if *v == bv))
+                    .ok_or_else(|| format!("agg '{name}': bound var not found in args"))?;
+                let fn_addr = match name {
+                    "sum" => packed_agg_sum_i32 as usize,
+                    "max" => packed_agg_max_i32 as usize,
+                    "min" => packed_agg_min_i32 as usize,
+                    _ => unreachable!(),
+                };
+                load_rel_rdi!(asm, rule_i, rel_seq);
+                dynasm!(asm; mov esi, col as i32);
+                call_abs!(asm, fn_addr);
+                // rax = i64 result; skip if AGG_EMPTY (empty relation)
+                dynasm!(asm
+                    ; mov rcx, QWORD AGG_EMPTY
+                    ; cmp rax, rcx
+                    ; je =>variant_exit
+                );
+                // Store low 32 bits (bit-cast i32→u32) to var_slot
+                dynasm!(asm; mov [rbp + var_slot(result_var)], eax);
+            }
+            other => return Err(format!("unsupported aggregator '{other}' in asm backend")),
+        }
+    }
+    Ok(())
+}
+
 /// Emit one rule variant (full or recent).
 #[allow(clippy::too_many_arguments)]
 fn emit_rule_variant(
@@ -1790,6 +1847,7 @@ fn emit_rule_variant(
     heads: &[CHeadClause],
     rule_conds: &[CExpr],
     negations: &[CAggregation],
+    aggs: &[CAggregation],
     recent_idx: Option<usize>,
     var_count: usize,
     max_head_arity: usize,
@@ -1831,6 +1889,7 @@ fn emit_rule_variant(
             dynasm!(asm; test eax, eax; jz =>variant_exit);
         }
         emit_not_probes(asm, negations, 0, rule_i, &var_locs, variant_exit)?;
+        emit_aggregations(asm, aggs, 0, negations.len(), rule_i, variant_exit)?;
         emit_heads(asm, heads, rule_i, var_count, max_head_arity, pti, &var_locs, use_jit_native, rule_head_base, jit_rel_data_grow_addr, jit_tuple_set_grow_addr)?;
         dynasm!(asm; =>variant_exit);
         return Ok(());
@@ -1892,9 +1951,9 @@ fn codegen_stratum_asm_inner(
     jit_tuple_set_grow_addr: usize,
 ) -> Result<AsmStratum, String> {
     // ── Eligibility ──────────────────────────────────────────────────────────
-    for (ri, (clauses, heads, conds, nots)) in rules.iter().enumerate() {
-        // Native path does not support negation (load_rel_rdi! reads wrong ctx layout).
-        if use_jit_native && !nots.is_empty() {
+    for (ri, (clauses, heads, conds, nots, aggs)) in rules.iter().enumerate() {
+        // Native path does not support negation or aggregation.
+        if use_jit_native && (!nots.is_empty() || !aggs.is_empty()) {
             return Err(format!("asm native: rule {ri} has negation clauses (unsupported)"));
         }
         for head in *heads {
@@ -1929,7 +1988,7 @@ fn codegen_stratum_asm_inner(
 
     let max_head_arity = rules
         .iter()
-        .flat_map(|(_, hs, _, _)| hs.iter().map(|h| h.args.len()))
+        .flat_map(|(_, hs, _, _, _)| hs.iter().map(|h| h.args.len()))
         .max()
         .unwrap_or(1);
     let max_head_arity = max_head_arity.max(1);
@@ -1938,7 +1997,7 @@ fn codegen_stratum_asm_inner(
     // Use at least 1 to keep the frame layout simple.
     let max_depth = rules
         .iter()
-        .map(|(clauses, _, _, _)| clauses.len().saturating_sub(1))
+        .map(|(clauses, _, _, _, _)| clauses.len().saturating_sub(1))
         .max()
         .unwrap_or(0)
         .max(1);
@@ -1969,7 +2028,7 @@ fn codegen_stratum_asm_inner(
     let rule_handle_bases: Vec<usize> = {
         let mut bases = Vec::with_capacity(rules.len());
         let mut offset = 0usize;
-        for (clauses, _, _, _) in rules.iter() {
+        for (clauses, _, _, _, _) in rules.iter() {
             bases.push(offset);
             offset += clauses.len() * 2;
         }
@@ -1980,7 +2039,7 @@ fn codegen_stratum_asm_inner(
     let rule_head_bases: Vec<usize> = {
         let mut bases = Vec::with_capacity(rules.len());
         let mut offset = 0usize;
-        for (_, heads, _, _) in rules.iter() {
+        for (_, heads, _, _, _) in rules.iter() {
             bases.push(offset);
             offset += heads.len();
         }
@@ -1998,9 +2057,9 @@ fn codegen_stratum_asm_inner(
     }
 
     // Full variants
-    for (rule_i, (clauses, heads, conds, nots)) in rules.iter().enumerate() {
+    for (rule_i, (clauses, heads, conds, nots, aggs)) in rules.iter().enumerate() {
         emit_rule_variant(
-            &mut asm, rule_i, clauses, heads, conds, nots, None,
+            &mut asm, rule_i, clauses, heads, conds, nots, aggs, None,
             var_count, max_head_arity, max_depth,
             packed_try_insert_addr, packed_count_addr,
             packed_data_ptr_addr, packed_recent_ptr_addr,
@@ -2021,10 +2080,10 @@ fn codegen_stratum_asm_inner(
     let inner_hdr = asm.new_dynamic_label();
     dynasm!(asm; =>inner_hdr);
 
-    for (rule_i, (clauses, heads, conds, nots)) in rules.iter().enumerate() {
+    for (rule_i, (clauses, heads, conds, nots, aggs)) in rules.iter().enumerate() {
         for clause_seq in 0..clauses.len() {
             emit_rule_variant(
-                &mut asm, rule_i, clauses, heads, conds, nots, Some(clause_seq),
+                &mut asm, rule_i, clauses, heads, conds, nots, aggs, Some(clause_seq),
                 var_count, max_head_arity, max_depth,
                 packed_try_insert_addr, packed_count_addr,
                 packed_data_ptr_addr, packed_recent_ptr_addr,
@@ -2104,7 +2163,7 @@ pub fn codegen_stratum_asm_native(
     // Native path has no negation support; wrap 3-tuples with empty not-slices.
     let rules_with_nots: Vec<AsmRuleRef<'_>> = rules
         .iter()
-        .map(|(c, h, e)| (*c, *h, *e, &[] as &[CAggregation]))
+        .map(|(c, h, e)| (*c, *h, *e, &[] as &[CAggregation], &[] as &[CAggregation]))
         .collect();
     codegen_stratum_asm_inner(
         &rules_with_nots, var_count,
