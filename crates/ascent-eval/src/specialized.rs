@@ -292,15 +292,35 @@ impl PackedStorage {
             // Skip the gather + build entirely for sink relations.
             JitRelData::build_from_packed_no_tupleset(&[], arity, false)
         } else {
-            let mut recent_buf: Vec<u32> = Vec::with_capacity(self.recent.len() * arity.max(1));
-            for &idx in &self.recent {
-                let start = idx * arity;
-                recent_buf.extend_from_slice(&self.packed_data[start..start + arity]);
-            }
             // `recent` is only sequentially iterated (outer scan), never key-probed.
             // Skip both tuple_set and JitColIndex (build_indices=false) to avoid
             // O(n log n) sort cost on every stratum run.
-            JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, false)
+            //
+            // Fast path: when recent indices are contiguous (always true after batch
+            // native flush), pass a direct slice of packed_data — no gather, no allocation.
+            // O(1) check: indices are unique+monotone, so last-first+1==n ↔ contiguous.
+            let n_recent = self.recent.len();
+            let recent_buf: Vec<u32>;
+            let recent_data: &[u32] = if n_recent == 0 || arity == 0 {
+                &[]
+            } else {
+                let first = self.recent[0];
+                let last = self.recent[n_recent - 1];
+                if last - first + 1 == n_recent {
+                    let start = first * arity;
+                    &self.packed_data[start..start + n_recent * arity]
+                } else {
+                    recent_buf = {
+                        let mut buf = Vec::with_capacity(n_recent * arity);
+                        for &idx in &self.recent {
+                            buf.extend_from_slice(&self.packed_data[idx * arity..idx * arity + arity]);
+                        }
+                        buf
+                    };
+                    &recent_buf
+                }
+            };
+            JitRelData::build_from_packed_no_tupleset(recent_data, arity, false)
         };
 
         JitNativeRelData {
@@ -328,12 +348,29 @@ impl PackedStorage {
         let recent = if self.jit_is_sink {
             JitRelData::build_from_packed_no_tupleset(&[], arity, false)
         } else {
-            let mut recent_buf: Vec<u32> = Vec::with_capacity(self.recent.len() * arity.max(1));
-            for &idx in &self.recent {
-                let start = idx * arity;
-                recent_buf.extend_from_slice(&self.packed_data[start..start + arity]);
-            }
-            JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, false)
+            // Fast path: contiguous indices → direct slice, no gather, no allocation.
+            let n_recent = self.recent.len();
+            let recent_buf: Vec<u32>;
+            let recent_data: &[u32] = if n_recent == 0 || arity == 0 {
+                &[]
+            } else {
+                let first = self.recent[0];
+                let last = self.recent[n_recent - 1];
+                if last - first + 1 == n_recent {
+                    let start = first * arity;
+                    &self.packed_data[start..start + n_recent * arity]
+                } else {
+                    recent_buf = {
+                        let mut buf = Vec::with_capacity(n_recent * arity);
+                        for &idx in &self.recent {
+                            buf.extend_from_slice(&self.packed_data[idx * arity..idx * arity + arity]);
+                        }
+                        buf
+                    };
+                    &recent_buf
+                }
+            };
+            JitRelData::build_from_packed_no_tupleset(recent_data, arity, false)
         };
         JitNativeRelData {
             total,
@@ -722,17 +759,36 @@ impl PackedStorage {
                 // `recent` JitRelData is never scanned by the JIT. Skip the rebuild
                 // entirely for them (keep existing data; it is never accessed).
                 if !self.jit_is_sink {
-                    let arity_max1 = arity.max(1);
-                    let mut recent_buf = Vec::with_capacity(self.recent.len() * arity_max1);
-                    for &idx in &self.recent {
-                        let start = idx * arity_max1;
-                        recent_buf
-                            .extend_from_slice(&self.packed_data[start..start + arity_max1]);
-                    }
                     // `recent` is only sequentially iterated (outer scan), never key-probed.
                     // Skip JitColIndex (build_indices=false) to avoid O(n log n) sort cost.
+                    //
+                    // Fast path: contiguous recent indices (always true after batch native
+                    // flush) → direct slice into packed_data, no gather Vec needed.
+                    let n_recent = self.recent.len();
+                    let recent_buf: Vec<u32>;
+                    let recent_data: &[u32] = if n_recent == 0 || arity == 0 {
+                        &[]
+                    } else {
+                        let first = self.recent[0];
+                        let last = self.recent[n_recent - 1];
+                        if last - first + 1 == n_recent {
+                            let start = first * arity;
+                            &self.packed_data[start..start + n_recent * arity]
+                        } else {
+                            recent_buf = {
+                                let mut buf = Vec::with_capacity(n_recent * arity);
+                                for &idx in &self.recent {
+                                    buf.extend_from_slice(
+                                        &self.packed_data[idx * arity..idx * arity + arity],
+                                    );
+                                }
+                                buf
+                            };
+                            &recent_buf
+                        }
+                    };
                     native.recent =
-                        JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, false);
+                        JitRelData::build_from_packed_no_tupleset(recent_data, arity, false);
                 }
             }
         }
