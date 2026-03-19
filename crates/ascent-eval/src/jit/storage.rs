@@ -743,8 +743,9 @@ impl JitRelData {
 
         // ── Swiss table ───────────────────────────────────────────────────
         // SIMD existence probe for fully-bound body clauses.  Built alongside
-        // tuple_set for arity 1–3; null for arity 0 or arity > 3.
-        let swiss = if build_tuple_set && (1..=3).contains(&arity) {
+        // tuple_set for arity 1–2; null for arity 0, 3+.  (SIMD probe only
+        // supports arity 1–2; building for arity 3 is pure waste.)
+        let swiss = if build_tuple_set && (1..=2).contains(&arity) {
             JitSwissTable::build(data, arity)
         } else {
             JitSwissTable::NULL
@@ -1182,14 +1183,11 @@ pub(crate) unsafe fn clone_jit_rel_data_with_indices(
     };
 
     // ── Swiss table ──────────────────────────────────────────────────────────
-    // Rebuild from the copied data (cheaper than a byte-for-byte ctrl copy since
-    // the table is small relative to tuple data, and ensures correct state).
-    let data_slice = unsafe { std::slice::from_raw_parts(data_ptr, n * arity_max1) };
-    let swiss = if copy_tuple_set && (1..=3).contains(&arity) && n > 0 {
-        JitSwissTable::build(data_slice, arity)
-    } else {
-        JitSwissTable::NULL
-    };
+    // Do not rebuild in clone: for small hot tables the SIMD probe adds
+    // overhead vs scalar, and the rebuild cost (2 mallocs + N inserts) is
+    // paid every solve.  The JitTupleSet covers correctness; Swiss is an
+    // optional fast path that can be rebuilt on-demand if ever needed.
+    let swiss = JitSwissTable::NULL;
 
     Box::new(JitRelData {
         data: data_ptr,
