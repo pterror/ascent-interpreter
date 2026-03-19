@@ -255,6 +255,27 @@ impl JitColIndex {
         }
         total
     }
+
+    /// Clone by directly copying the underlying arrays without resorting.
+    ///
+    /// `n_vals` is the total number of values in the `vals` array (= number of tuples
+    /// stored in the source relation for arity-2; same for higher arities).
+    /// This is O(n) memcpy instead of O(n log n) sort+build.
+    pub fn clone_from_raw(&self, n_vals: usize) -> Box<Self> {
+        if self.keys.is_null() {
+            return Box::new(Self::new_empty());
+        }
+        let cap = (self.mask as usize) + 1;
+        let keys = alloc_u32_zeroed(cap);
+        let ranges = alloc_u64_zeroed(cap);
+        let vals = alloc_u32_zeroed(n_vals.max(1));
+        unsafe {
+            ptr::copy_nonoverlapping(self.keys, keys, cap);
+            ptr::copy_nonoverlapping(self.ranges, ranges, cap);
+            ptr::copy_nonoverlapping(self.vals, vals, n_vals.max(1));
+        }
+        Box::new(JitColIndex { keys, ranges, vals, mask: self.mask, len: self.len })
+    }
 }
 
 impl Drop for JitColIndex {
@@ -919,8 +940,85 @@ impl std::fmt::Debug for JitNativeRelData {
     }
 }
 
+/// Clone a `JitRelData` by directly copying its raw data buffer, tuple_set, and (optionally)
+/// JitColIndex arrays. O(n) memcpy instead of O(n log n) sort+rebuild.
+///
+/// When `copy_tuple_set` is false, the clone gets a null tuple_set (safe for `recent` buffers
+/// that are never probed for membership, or for IDB sink relations where aliasing follows).
+///
+/// # Safety
+/// `src` must be a valid, fully-initialized `JitRelData`.
+unsafe fn clone_jit_rel_data_with_indices(
+    src: &JitRelData,
+    arity: usize,
+    copy_tuple_set: bool,
+) -> Box<JitRelData> {
+    let n = src.len as usize;
+    let arity_max1 = arity.max(1);
+
+    // ── data buffer ─────────────────────────────────────────────────────────
+    let data_cap = (src.cap as usize).max(1);
+    let data_ptr = alloc_u32_zeroed(data_cap * arity_max1);
+    if n > 0 && !src.data.is_null() {
+        unsafe { ptr::copy_nonoverlapping(src.data, data_ptr, n * arity_max1) };
+    }
+
+    // ── tuple_set ────────────────────────────────────────────────────────────
+    let (ts_slots, ts_mask, ts_len, ts_slots_words) = if copy_tuple_set
+        && arity > 0
+        && !src.tuple_set.slots.is_null()
+        && src.tuple_set.mask > 0
+        && src._ts_slots_words != usize::MAX // not aliased
+    {
+        let stride = arity + 1;
+        let cap = (src.tuple_set.mask + 1) as usize;
+        let words = cap * stride;
+        let slots = alloc_u32_zeroed(words);
+        unsafe { ptr::copy_nonoverlapping(src.tuple_set.slots, slots, words) };
+        (slots, src.tuple_set.mask, src.tuple_set.len, words)
+    } else {
+        (ptr::null_mut(), 0u64, 0u64, 0usize)
+    };
+
+    // ── col_indices ──────────────────────────────────────────────────────────
+    let col_indices_ptr: *mut *mut JitColIndex = if arity > 0
+        && !src.col_indices.is_null()
+    {
+        let layout = Layout::array::<*mut JitColIndex>(arity).expect("layout overflow");
+        let raw = unsafe { alloc_zeroed(layout) } as *mut *mut JitColIndex;
+        assert!(!raw.is_null(), "allocation failed");
+        for col in 0..arity {
+            let src_idx_ptr = unsafe { *src.col_indices.add(col) };
+            if !src_idx_ptr.is_null() {
+                let src_idx = unsafe { &*src_idx_ptr };
+                // n_vals = n_tuples (one value per tuple in the vals array).
+                let cloned = src_idx.clone_from_raw(n);
+                unsafe { *raw.add(col) = Box::into_raw(cloned) };
+            }
+        }
+        raw
+    } else {
+        ptr::null_mut()
+    };
+
+    Box::new(JitRelData {
+        data: data_ptr,
+        len: src.len,
+        cap: data_cap as u64,
+        col_indices: col_indices_ptr,
+        tuple_set: JitTupleSet { slots: ts_slots, mask: ts_mask, len: ts_len },
+        arity: src.arity,
+        _pad: 0,
+        _ts_slots_words: ts_slots_words,
+    })
+}
+
 impl JitNativeRelData {
-    /// Deep-clone this `JitNativeRelData` by rebuilding each `JitRelData` from its raw data.
+    /// Deep-clone this `JitNativeRelData` by directly copying pre-built arrays.
+    ///
+    /// Uses O(n) memcpy for both data buffers, tuple_set, and JitColIndex arrays
+    /// instead of the O(n log n) sort+rebuild that `build_native_projection` would do.
+    /// This eliminates the ~10µs sort cost per `jit_hot` benchmark iteration.
     ///
     /// Used by `PackedStorage::Clone` to preserve the prebuilt native projection across
     /// clones so that the first `jit_advance_native` call in a cloned engine does not pay
@@ -929,34 +1027,21 @@ impl JitNativeRelData {
         let arity = self.total.arity as usize;
         let build_indices = !self.total.col_indices.is_null();
 
-        // Rebuild total from its raw data buffer.
-        let total_clone = {
-            let n = self.total.len as usize;
-            let words = n * arity.max(1);
-            let slice = if n == 0 || self.total.data.is_null() {
-                &[][..]
-            } else {
-                unsafe { std::slice::from_raw_parts(self.total.data, words) }
-            };
-            JitRelData::build_from_packed(slice, arity, build_indices)
-        };
+        // Clone total: copy data buffer + tuple_set + col_indices (no sort needed).
+        let total_clone = unsafe { clone_jit_rel_data_with_indices(&self.total, arity, true) };
 
-        // Rebuild recent from its raw data buffer.
-        // `recent` is only iterated, never probed as a membership set — skip tuple_set.
-        let recent_clone = {
-            let n = self.recent.len as usize;
-            let words = n * arity.max(1);
-            let slice = if n == 0 || self.recent.data.is_null() {
-                &[][..]
-            } else {
-                unsafe { std::slice::from_raw_parts(self.recent.data, words) }
-            };
-            JitRelData::build_from_packed_no_tupleset(slice, arity, build_indices)
+        // Clone recent: copy data buffer only (no tuple_set, no col_indices).
+        // `recent` is only iterated, never probed as a membership set.
+        let recent_clone = if self.recent.len > 0 {
+            unsafe { clone_jit_rel_data_with_indices(&self.recent, arity, false) }
+        } else {
+            JitRelData::build_from_packed_no_tupleset(&[], arity, false)
         };
 
         // `new` is always an empty write buffer — no data to copy.
         let new_clone = JitRelData::build_from_packed(&[], arity, false);
 
+        let _ = build_indices; // determined by col_indices presence in clone_jit_rel_data
         JitNativeRelData {
             total: total_clone,
             recent: recent_clone,
