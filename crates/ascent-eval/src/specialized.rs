@@ -661,6 +661,16 @@ impl PackedStorage {
                     self.packed_data.extend_from_slice(data);
                     self.count += new_len;
                     self.delta.extend(start_idx..start_idx + new_len);
+                    // Pre-size jit_dedup before the insert loop to avoid rehash cascades.
+                    // Without this, inserting N new tuples into a fresh table triggers
+                    // ceil(log2(N)) do_grow calls (e.g. 7 rehashes for 1140 tuples).
+                    // Each rehash allocates a new Vec + copies all existing entries.
+                    // One upfront reserve eliminates all rehashes.
+                    {
+                        let needed_cap =
+                            (((self.count) * 4 / 3) + 1).next_power_of_two().max(16) as u32;
+                        self.jit_dedup.reserve(needed_cap);
+                    }
                     for i in 0..new_len {
                         let tuple = &data[i * arity..(i + 1) * arity];
                         let hash = crate::jit_index::jit_dedup_hash(tuple);
