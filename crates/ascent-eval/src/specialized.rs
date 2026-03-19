@@ -620,7 +620,10 @@ impl PackedStorage {
             false
         };
         let had_delta = !self.delta.is_empty();
-        self.recent = std::mem::take(&mut self.delta);
+        // Swap instead of take: recycle the old recent Vec's heap allocation as the
+        // new empty delta, avoiding a malloc+free pair on every fixpoint iteration.
+        std::mem::swap(&mut self.delta, &mut self.recent);
+        self.delta.clear(); // clear the recycled buffer (former recent) for reuse
         // Skip recent_col_indices rebuild — JIT uses jit_recent_indices.
         if update_hash_indices {
             self.update_jit_indices();

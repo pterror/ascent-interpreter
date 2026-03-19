@@ -874,6 +874,30 @@ impl Engine {
 
         // Step 2: build the runtime context if not yet cached.
         if !self.stratum_stage4_cache.contains_key(&stratum_key) {
+            // Pre-size jit_indices BEFORE building the runtime so that
+            // JitLookupHandle::from_index captures the post-reserve entries_ptr.
+            // If we reserved after build, the handle would hold a dangling pointer
+            // into the freed pre-reserve allocation → SIGSEGV on first JIT probe.
+            if let Some(jit_cell) = self.jit.as_ref() {
+                let jit = jit_cell.lock().unwrap();
+                if !jit.tuple_count_hints.is_empty() {
+                    use crate::relation::Relation;
+                    for rule in rules {
+                        for head in &rule.heads {
+                            if let Some(&count_hint) =
+                                jit.tuple_count_hints.get(head.relation.as_str())
+                                && let Some(Relation::Packed(ps)) =
+                                    self.relations.get_mut(&head.relation)
+                            {
+                                for idx in &mut ps.jit_indices {
+                                    idx.reserve(count_hint as usize);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let runtime = match self.build_stratum_stage4_runtime(rules, native_fn_available) {
                 Some(r) => r,
                 None => return false,
@@ -917,6 +941,14 @@ impl Engine {
                                     // Safety: native.new is a fully initialized JitRelData
                                     // built by build_native_projection (valid buffers).
                                     unsafe { native.new.pre_size(count_hint as usize) };
+                                }
+                                // Pre-size recent indices: recent typically holds 1–2
+                                // tuples per iteration; cap=4 avoids any rehash after warmup.
+                                // Safe here (after runtime build) because recent handles are
+                                // only used in the recent loop, which runs after advance()
+                                // refreshes the handles from the current index state.
+                                for idx in &mut ps.jit_recent_indices {
+                                    idx.reserve(2);
                                 }
                             }
                         }

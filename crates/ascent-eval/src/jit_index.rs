@@ -374,6 +374,54 @@ impl JitHashIndex {
         self.entries_ptr = self.entries.as_ptr();
     }
 
+    /// Pre-allocate capacity for at least `n_tuples` entries without inserting.
+    ///
+    /// Avoids rehash cascades when the expected tuple count is known upfront.
+    /// No-op if the current capacity is already sufficient.
+    /// The capacity is rounded up to the next power of two with load factor ≤ 0.5.
+    pub fn reserve(&mut self, n_tuples: usize) {
+        if n_tuples == 0 {
+            return;
+        }
+        // Need at least 2×n_tuples slots to stay below 50% load.
+        let needed_cap = (n_tuples * 2).next_power_of_two().max(2);
+        let current_cap = (self.mask as usize) + 1;
+        if needed_cap <= current_cap {
+            return;
+        }
+        // Allocate new entries (zeroed = EMPTY_KEY / SENTINEL defaults).
+        let new_entries = vec![JitIndexEntry::default(); needed_cap + 1]; // +1 for overflow slot
+        // Re-insert existing entries into the larger table.
+        let old_cap = current_cap;
+        let old_entries = std::mem::replace(&mut self.entries, new_entries);
+        self.mask = (needed_cap - 1) as u32;
+        // Re-insert all existing keys/chains from the old table.
+        for e in old_entries.iter().take(old_cap + 1) {
+            if e.key == EMPTY_KEY && e.head == SENTINEL {
+                continue;
+            }
+            // Re-probe into new table at new slot.
+            let slot = if e.key == EMPTY_KEY {
+                needed_cap // overflow slot
+            } else {
+                let h = knuth_hash(e.key);
+                let mut s = h & (needed_cap - 1);
+                loop {
+                    if self.entries[s].key == EMPTY_KEY {
+                        break;
+                    }
+                    s = (s + 1) & (needed_cap - 1);
+                }
+                s
+            };
+            self.entries[slot] = *e;
+        }
+        self.entries_ptr = self.entries.as_ptr();
+        // Also pre-allocate values capacity (2 u32s per future tuple).
+        self.values.reserve(n_tuples * 2);
+        self.values_ptr = if self.values.is_empty() { std::ptr::null() } else { self.values.as_ptr() };
+    }
+
     /// Clear all entries for a full rebuild.
     ///
     /// Resets all slots to empty/sentinel, clears values (keeps capacity),
