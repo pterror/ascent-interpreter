@@ -660,14 +660,32 @@ impl PackedStorage {
                     let new_slice = &self.packed_data[new_start..new_end];
                     // Safety: native.total was built by build_native_projection /
                     // extend_and_rebuild_indices and is fully initialised.
+                    //
+                    // For IDB sink relations in the native advance path, skip building
+                    // tuple_set inside extend_and_rebuild_indices — we alias it to
+                    // jit_dedup data below (same format after 2026-03-19 hash unification).
+                    // jit_dedup was updated by insert_packed_raw_native_flush above,
+                    // so it already contains all tuples including the ones in new_slice.
+                    let is_sink_native = self.jit_is_sink;
                     unsafe {
                         native.total.extend_and_rebuild_indices(
                             new_slice,
                             arity,
                             build_indices,
+                            !is_sink_native, // build_tuple_set: false for sinks (alias below)
                         );
                     }
                     native.total_built_count = curr_count;
+
+                    // For sink relations, alias total.tuple_set to jit_dedup's entries.
+                    // jit_dedup and JitTupleSet now use the same hash (0x9e3779b9 init,
+                    // sentinel 0), so the native asm's probe of total.tuple_set reads
+                    // directly from the authoritative dedup table.
+                    if is_sink_native {
+                        let handle = &self.jit_dedup.handle;
+                        let mask = if handle.cap == 0 { 0 } else { (handle.cap - 1) as u64 };
+                        unsafe { native.total.alias_tuple_set(handle.entries, mask) };
+                    }
                 }
 
                 // Rebuild recent from self.recent index list.

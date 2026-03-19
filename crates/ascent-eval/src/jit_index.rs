@@ -699,22 +699,29 @@ mod tests {
 // ─── JIT-accessible dedup hash table ────────────────────────────────────────
 
 /// Sentinel value: a slot whose hash field equals `JITDEDUP_EMPTY` is vacant.
-pub const JITDEDUP_EMPTY: u32 = 0xFFFF_FFFF;
+///
+/// Value 0 matches the zero-initialized memory from `alloc_zeroed`, so new
+/// allocations are correctly pre-filled with empty markers without an explicit
+/// memset pass.  Must also match `EMPTY_TAG` in `storage.rs` so that
+/// `JitDedupTable` and `JitTupleSet` use the same probe format and can alias
+/// each other's backing storage.
+pub const JITDEDUP_EMPTY: u32 = 0;
 
 /// Compute the JIT dedup hash for a packed u32 tuple.
 ///
-/// Uses a simple multiply-accumulate to keep the JIT-side implementation to a
-/// handful of `imul_imm` + `iadd` instructions — no length prefix, no FxHasher
-/// complexity.  The output `0xFFFF_FFFF` is remapped to `0xFFFF_FFFE` so it
-/// cannot collide with the empty-slot sentinel.
+/// Uses the same multiply-accumulate as `tuple_hash` in `storage.rs` so that
+/// `JitDedupTable` entries can be aliased as a `JitTupleSet` without rehashing.
+/// The initial value `0x9e3779b9` ensures the hash of the empty tuple is
+/// non-zero; the output 0 is remapped to 1 to avoid the sentinel.
 ///
-/// **Must match the hash emitted by the JIT in `gen_emit_heads_v3`.**
+/// **Must match the hash emitted by the JIT in `gen_emit_heads_v3`
+/// (non-native path) and `emit_heads` (native path).**
 pub fn jit_dedup_hash(packed: &[u32]) -> u32 {
-    let mut h: u32 = 0;
+    let mut h: u32 = 0x9e3779b9;
     for &v in packed {
         h = h.wrapping_mul(0x9e3779b9).wrapping_add(v);
     }
-    if h == JITDEDUP_EMPTY { h = JITDEDUP_EMPTY - 1; }
+    if h == 0 { h = 1; }
     h
 }
 
@@ -727,7 +734,7 @@ pub fn jit_dedup_hash(packed: &[u32]) -> u32 {
 /// changes.
 ///
 /// Flat slot layout: each slot is `stride = arity + 1` consecutive `u32`s:
-///   `slot[0]`          = hash (`JITDEDUP_EMPTY` = vacant)
+///   `slot[0]`          = hash tag (0 = `JITDEDUP_EMPTY` = vacant)
 ///   `slot[1..stride]`  = packed tuple data (`arity` u32s)
 ///
 /// The JIT knows `stride` at compile time (it equals `head.args.len() + 1`).

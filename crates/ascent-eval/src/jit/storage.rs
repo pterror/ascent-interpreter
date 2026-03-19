@@ -483,6 +483,8 @@ pub struct JitRelData {
     // ── private fields beyond the 64-byte C region ───────────────────────
     // Total words allocated in tuple_set.slots (cap_in_slots * (arity + 1)).
     // Used by Drop to reconstruct the layout for dealloc.
+    // Sentinel value `usize::MAX` means the slots are aliased (not owned) and
+    // must NOT be freed by Drop — set by alias_tuple_set().
     _ts_slots_words: usize,
 }
 
@@ -675,9 +677,45 @@ impl JitRelData {
         }
     }
 
+    /// Point `tuple_set` at `jit_dedup`'s backing storage instead of maintaining
+    /// a separate owned copy.
+    ///
+    /// After calling this, the JIT's `total.tuple_set` probe reads directly from
+    /// the `JitDedupTable` entries.  This is valid when:
+    /// 1. `jit_dedup_hash` and `tuple_hash` produce identical values (unified
+    ///    after the 2026-03-19 hash unification: both start at `0x9e3779b9`,
+    ///    both use sentinel 0).
+    /// 2. `jit_dedup` contains every tuple that was inserted into this relation
+    ///    (guaranteed by `insert_packed_raw_native_flush` which calls
+    ///    `jit_dedup.insert` before this method is called).
+    ///
+    /// The aliased memory is NOT freed by `Drop`; the owning `JitDedupTable`
+    /// is responsible for its lifetime.
+    ///
+    /// # Safety
+    /// `entries` must point to a valid flat slot array of at least `(mask+1)*(arity+1)` u32s,
+    /// owned by a `JitDedupTable` that outlives `self`.
+    pub unsafe fn alias_tuple_set(&mut self, entries: *mut u32, mask: u64) {
+        // Free any previously owned tuple_set allocation.
+        if !self.tuple_set.slots.is_null() && self.tuple_set.mask > 0
+            && self._ts_slots_words != usize::MAX
+        {
+            unsafe { free_u32_slice(self.tuple_set.slots, self._ts_slots_words) };
+        }
+        self.tuple_set.slots = entries;
+        self.tuple_set.mask = mask;
+        self.tuple_set.len = 0; // not used during probe
+        // Sentinel: usize::MAX means the slot array is aliased (not owned).
+        self._ts_slots_words = usize::MAX;
+    }
+
     /// Appends `new_tuples` (flat row-major, stride=arity) to this relation's data buffer,
-    /// rebuilds all column indices from the extended data, and updates the `tuple_set`
-    /// to include the new tuples (required for cross-iteration JIT head dedup).
+    /// rebuilds all column indices from the extended data, and optionally updates the
+    /// `tuple_set` to include the new tuples.
+    ///
+    /// Pass `build_tuple_set = false` when the caller will alias `tuple_set` to
+    /// `jit_dedup` immediately after this call (skips the ~12µs tuple_set update
+    /// for IDB sink relations in the native advance path).
     ///
     /// # Safety
     /// `self` must be a fully initialized `JitRelData` from `build_from_packed`.
@@ -686,6 +724,7 @@ impl JitRelData {
         new_tuples: &[u32],
         arity: usize,
         build_indices: bool,
+        build_tuple_set: bool,
     ) {
         let arity_max1 = arity.max(1);
         let n_new = new_tuples.len() / arity_max1;
@@ -735,7 +774,8 @@ impl JitRelData {
         self.len = new_len as u64;
 
         // Update tuple_set: required for cross-iteration head dedup (JIT probes total.tuple_set).
-        if arity > 0 {
+        // Skipped when the caller will alias tuple_set to jit_dedup after this call.
+        if build_tuple_set && arity > 0 {
             let stride = arity + 1;
 
             // Check if existing capacity can accommodate new_len at <70% load factor.
@@ -829,10 +869,11 @@ impl Drop for JitRelData {
             self.col_indices = ptr::null_mut();
         }
 
-        // Free tuple_set slots.
-        // Use mask to compute the actual allocation size (mask is updated by
-        // jit_tuple_set_grow; _ts_slots_words is not, so mask is authoritative).
-        if !self.tuple_set.slots.is_null() && self.tuple_set.mask > 0 {
+        // Free tuple_set slots (only if owned — not an alias into jit_dedup).
+        // _ts_slots_words == usize::MAX is the sentinel meaning "aliased, do not free".
+        if !self.tuple_set.slots.is_null() && self.tuple_set.mask > 0
+            && self._ts_slots_words != usize::MAX
+        {
             let stride = arity + 1;
             let cap = (self.tuple_set.mask + 1) as usize;
             unsafe { free_u32_slice(self.tuple_set.slots, cap * stride) };

@@ -968,16 +968,16 @@ fn emit_heads(
         // If cap == 0, the dedup table is uninitialized; must insert via Rust.
         dynasm!(asm; test r10d, r10d; jz =>call_insert);
 
-        // Compute hash (same as jit_dedup_hash): h = 0; for each word: h = h*KNUTH + word
-        dynasm!(asm; xor eax, eax);
+        // Compute hash (same as jit_dedup_hash / tuple_hash): h = 0x9e3779b9; for each word: h = h*KNUTH + word
+        dynasm!(asm; mov eax, 0x9e3779b9u32 as i32);
         for col in 0..arity {
             dynasm!(asm
                 ; imul eax, eax, 0x9e3779b9u32 as i32
                 ; add eax, [rbp + head_col_slot(var_count, max_head_arity, col)]
             );
         }
-        // Remap hash 0xFFFFFFFF (-1) → 0xFFFFFFFE (avoid sentinel)
-        dynasm!(asm; cmp eax, -1i32; jne >no_remap; dec eax; no_remap:);
+        // Remap hash 0 → 1 (avoid sentinel JITDEDUP_EMPTY = 0)
+        dynasm!(asm; test eax, eax; jnz >hash_nonzero_d; mov eax, 1; hash_nonzero_d:);
 
         // probe: mask = cap - 1 (in rcx), slot = hash & mask (in rdx)
         dynasm!(asm
@@ -995,8 +995,8 @@ fn emit_heads(
             ; imul rsi, rdx, stride_d
             ; add rsi, r11              // rsi = &slot[0]
             ; mov edi, [rsi]            // edi = slot hash
-            ; cmp edi, -1i32
-            ; je =>call_insert          // empty slot → new tuple
+            ; test edi, edi
+            ; jz =>call_insert          // empty slot (JITDEDUP_EMPTY=0) → new tuple
             ; cmp edi, eax
             ; jne =>probe_nx            // hash mismatch → next slot
         );
