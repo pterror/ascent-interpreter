@@ -909,15 +909,14 @@ impl Engine {
                                 jit.tuple_count_hints.get(head.relation.as_str())
                             {
                                 ps.reserve_tuples(count_hint as usize);
-                                // Also pre-size jit_native.new so the JIT doesn't pay
-                                // jit_tuple_set_grow during the hot inner loop.
-                                // For triangle n=20: eliminates 7 tuple_set grows per iter
-                                // (cap 16→2048 for 1140 tuples) and replaces them with a
-                                // single upfront alloc+memset.
+                                // Pre-size jit_native.new to avoid grow cascades in the
+                                // hot inner loop. new starts at capacity 16; for triangle
+                                // n=20 (1140 tuples) it grows 7× without hints, replaced
+                                // here with a single upfront alloc+memset.
                                 if let Some(native) = ps.jit_native.as_mut() {
                                     // Safety: native.new is a fully initialized JitRelData
-                                    // built by build_native_projection (len=0, valid buffers).
-                                    unsafe { native.new.pre_size_new(count_hint as usize) };
+                                    // built by build_native_projection (valid buffers).
+                                    unsafe { native.new.pre_size(count_hint as usize) };
                                 }
                             }
                         }

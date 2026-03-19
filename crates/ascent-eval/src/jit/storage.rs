@@ -613,17 +613,16 @@ impl JitRelData {
         }
     }
 
-    /// Pre-size the `new` buffer (data + tuple_set) to hold at least `n_tuples` without
-    /// growing during JIT execution.  Called once per stratum run using count hints from
-    /// a prior run to eliminate `jit_tuple_set_grow` calls in the hot inner loop.
+    /// Pre-size this buffer (data + tuple_set) to hold at least `n_tuples` without growing.
     ///
-    /// For triangle n=20: 1140 new tuples/iter → 7 tuple_set grows (16→2048) per iteration
-    /// without this hint.  Pre-sizing to 2048 replaces the 7 grow-rehash events with a
-    /// single upfront alloc + memset.
+    /// Called once per stratum run using count hints from a prior run.  Applies to both
+    /// `native.new` (head buffer) and `native.total` (accumulated tuples) — both start at
+    /// capacity 16 on a fresh engine and grow 7× for triangle n=20 (1140 tuples) without hints.
+    /// Pre-sizing replaces the 7 grow-rehash cascades with a single upfront alloc + memset.
     ///
     /// # Safety
-    /// `self` must be a fully initialized `JitRelData` (len=0, built by `build_from_packed`).
-    pub unsafe fn pre_size_new(&mut self, n_tuples: usize) {
+    /// `self` must be a fully initialized `JitRelData` (built by `build_from_packed`).
+    pub unsafe fn pre_size(&mut self, n_tuples: usize) {
         if n_tuples == 0 {
             return;
         }
@@ -645,7 +644,7 @@ impl JitRelData {
                     new_cap * arity_max1 * std::mem::size_of::<u32>(),
                 ) as *mut u32
             };
-            assert!(!new_ptr.is_null(), "pre_size_new: data realloc failed");
+            assert!(!new_ptr.is_null(), "pre_size: data realloc failed");
             self.data = new_ptr;
             self.cap = new_cap as u64;
         }
