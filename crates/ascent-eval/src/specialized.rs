@@ -706,8 +706,17 @@ impl PackedStorage {
                 // may be used as an inner scan in semi-naive Variant 2+, which probes
                 // col_indices. The new empty JitRelData has col_indices built for empty data
                 // (all ranges = empty), giving correct no-match behavior.
+                //
+                // Fast path: if self.recent is already empty AND native.recent is already
+                // an empty JitRelData (len=0, col_indices correct for empty data), skip the
+                // drop+alloc cycle. EDB relations have static facts, so self.recent is empty
+                // for all fixpoint iterations after the first — saving 3 allocs + 3 frees
+                // per EDB relation per iteration in the common case.
                 let native = self.jit_native.as_mut().unwrap();
-                native.recent = JitRelData::build_from_packed_no_tupleset(&[], arity, build_indices);
+                if !self.recent.is_empty() || native.recent.len > 0 {
+                    native.recent =
+                        JitRelData::build_from_packed_no_tupleset(&[], arity, build_indices);
+                }
                 // `new` was already reset above by the swap.
             } else {
                 // IDB: extend total with only the new delta tuples; rebuild indices.
