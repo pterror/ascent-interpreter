@@ -42,6 +42,11 @@ pub struct JitCompiler {
     pub(crate) dedup_cap_hints: rustc_hash::FxHashMap<String, u32>,
     /// Peak tuple count observed per IDB head relation (relation name → count).
     pub(crate) tuple_count_hints: rustc_hash::FxHashMap<String, u32>,
+    /// Pool of reusable Stage 4 runtimes (one per stratum key, non-native path only).
+    /// Avoids the ~9 Box allocations in build_stratum_stage4_runtime on every fresh-engine
+    /// hot-bench iteration; repopulate_runtime writes new engine pointers without allocating.
+    #[cfg(feature = "specialized")]
+    pub(crate) stratum_runtime_pool: rustc_hash::FxHashMap<usize, crate::eval::StratumStage4Runtime>,
 }
 
 // Safety: JitCompiler is only accessed from one thread at a time (guarded by Mutex).
@@ -61,6 +66,8 @@ impl JitCompiler {
             var_count: 0,
             dedup_cap_hints: FxHashMap::default(),
             tuple_count_hints: FxHashMap::default(),
+            #[cfg(feature = "specialized")]
+            stratum_runtime_pool: FxHashMap::default(),
         })
     }
 
@@ -195,7 +202,9 @@ impl JitCompiler {
 
         for (i, rule) in rules.iter().enumerate() {
             if let Err(reason) = Self::packed_eligible_reason_stage4(rule) {
-                eprintln!("JIT: stratum {stratum_key} rule {i} not eligible for stage4: {reason}");
+                if std::env::var("ASCENT_DUMP_JIT").is_ok() {
+                    eprintln!("JIT: stratum {stratum_key} rule {i} not eligible for stage4: {reason}");
+                }
                 self.stratum_stage4_fn_cache.insert(stratum_key, None);
                 return None;
             }

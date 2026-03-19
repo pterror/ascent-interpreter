@@ -253,11 +253,25 @@ impl Stratification {
     }
 }
 
+/// Relation-name metadata for repopulating a pooled `StratumStage4Runtime`.
+/// Parallel arrays match indices of the corresponding pointer arrays in the runtime.
+#[cfg(all(feature = "jit", feature = "specialized"))]
+pub(crate) struct StratumStage4RefreshInfo {
+    /// Relation name for each slot in `_all_rels`.
+    all_rel_names: Box<[String]>,
+    /// Relation name for each slot in `_lookup_specs` (parallel to specs).
+    lookup_spec_rel_names: Box<[String]>,
+    /// Per-rule: name for each clause (+ negation + aggregation) rel slot.
+    clause_rel_names: Vec<Box<[String]>>,
+    /// Per-rule: name for each head rel slot.
+    head_rel_names: Vec<Box<[String]>>,
+}
+
 /// Pinned runtime data for a Stage 4 stratum function (inlined rule bodies).
 /// All raw pointers in `stage4_ctx` point into the boxes below.
 #[cfg(all(feature = "jit", feature = "specialized"))]
 #[allow(dead_code, clippy::vec_box)]
-struct StratumStage4Runtime {
+pub(crate) struct StratumStage4Runtime {
     stage4_ctx: Box<crate::jit::packed_helpers::StratumStage4Ctx>,
     _per_rule_clause_rels: Vec<Box<[*const crate::specialized::PackedStorage]>>,
     _per_rule_head_rels: Vec<Box<[*mut crate::specialized::PackedStorage]>>,
@@ -272,6 +286,9 @@ struct StratumStage4Runtime {
     _lookup_specs: Box<[crate::jit::packed_helpers::LookupSpec]>,
     /// Optional native fast-path runtime (Step 3). `None` if any relation lacks `jit_native`.
     stage4_native_runtime: Option<crate::jit::packed_helpers::StratumStage4NativeRuntime>,
+    /// Present when this runtime was built with pooling support (stage4_native_runtime is None).
+    /// Used to repopulate pointer slots for a new engine without re-allocating.
+    refresh_info: Option<StratumStage4RefreshInfo>,
 }
 
 #[cfg(all(feature = "jit", feature = "specialized"))]
@@ -872,14 +889,14 @@ impl Engine {
 
         let native_fn_available = stage4_native_fn.is_some();
 
-        // Step 2: build the runtime context if not yet cached.
+        // Step 2: build or repopulate the runtime context if not yet cached.
         if !self.stratum_stage4_cache.contains_key(&stratum_key) {
-            // Pre-size jit_indices BEFORE building the runtime so that
-            // JitLookupHandle::from_index captures the post-reserve entries_ptr.
-            // If we reserved after build, the handle would hold a dangling pointer
-            // into the freed pre-reserve allocation → SIGSEGV on first JIT probe.
-            if let Some(jit_cell) = self.jit.as_ref() {
-                let jit = jit_cell.lock().unwrap();
+            // Pre-size jit_indices BEFORE building or repopulating the runtime so that
+            // JitLookupHandle::from_index (called in both build and repopulate) captures
+            // the post-reserve entries_ptr.  If we reserved after, the handle would hold
+            // a dangling pointer into the freed pre-reserve allocation → SIGSEGV.
+            let pool_runtime = if let Some(jit_cell) = self.jit.as_ref() {
+                let mut jit = jit_cell.lock().unwrap();
                 if !jit.tuple_count_hints.is_empty() {
                     use crate::relation::Relation;
                     for rule in rules {
@@ -896,11 +913,24 @@ impl Engine {
                         }
                     }
                 }
-            }
+                // Also try the pool: if a prior engine returned its runtime, we can
+                // repopulate in-place (pointer writes only, zero allocations).
+                jit.stratum_runtime_pool.remove(&stratum_key)
+            } else {
+                None
+            };
 
-            let runtime = match self.build_stratum_stage4_runtime(rules, native_fn_available) {
-                Some(r) => r,
-                None => return false,
+            let runtime = if let Some(mut rt) = pool_runtime
+                && self.repopulate_runtime(&mut rt)
+            {
+                // Pool hit: pointer writes only, zero allocations.
+                rt
+            } else {
+                // Pool miss or non-repopulatable (native path): build fresh.
+                match self.build_stratum_stage4_runtime(rules, native_fn_available) {
+                    Some(r) => r,
+                    None => return false,
+                }
             };
             self.stratum_stage4_cache.insert(stratum_key, runtime);
         }
@@ -1052,19 +1082,24 @@ impl Engine {
         // Starting handle index for each rule (for setting lookup_handles ptr later).
         let mut rule_handle_offsets: Vec<usize> = Vec::new();
 
+        // Refresh info: relation names parallel to pointer arrays (for pool reuse).
+        let mut ri_clause_rel_names: Vec<Box<[String]>> = Vec::new();
+        let mut ri_head_rel_names: Vec<Box<[String]>> = Vec::new();
+        let mut ri_spec_rel_names: Vec<String> = Vec::new();
+
         for rule in rules {
-            // Clause rel pointers
-            let mut clause_rels: Vec<*const PackedStorage> = rule
+            // Clause rel pointers (with parallel name collection for pool refresh).
+            let (mut clause_rel_names_rule, mut clause_rels): (Vec<String>, Vec<*const PackedStorage>) = rule
                 .body
                 .iter()
                 .filter_map(|item| match item {
                     CBodyItem::Clause(c) => match self.relations.get(&c.relation)? {
-                        Relation::Packed(p) => Some(p as *const PackedStorage),
+                        Relation::Packed(p) => Some((c.relation.clone(), p as *const PackedStorage)),
                         Relation::Generic(_) => None,
                     },
                     _ => None,
                 })
-                .collect();
+                .unzip();
 
             let clause_count = rule
                 .body
@@ -1087,6 +1122,7 @@ impl Engine {
                     match self.relations.get(&a.relation) {
                         Some(Relation::Packed(p)) => {
                             clause_rels.push(p as *const PackedStorage);
+                            clause_rel_names_rule.push(a.relation.clone());
                         }
                         _ => return None,
                     }
@@ -1107,6 +1143,7 @@ impl Engine {
                     match self.relations.get(&a.relation) {
                         Some(Relation::Packed(p)) => {
                             clause_rels.push(p as *const PackedStorage);
+                            clause_rel_names_rule.push(a.relation.clone());
                         }
                         _ => return None,
                     }
@@ -1116,17 +1153,17 @@ impl Engine {
                 return None;
             }
 
-            // Head rel pointers
-            let head_rels: Vec<*mut PackedStorage> = rule
+            // Head rel pointers (with parallel name collection for pool refresh).
+            let (head_rel_names_rule, head_rels): (Vec<String>, Vec<*mut PackedStorage>) = rule
                 .heads
                 .iter()
                 .filter_map(|head| match self.relations.get(&head.relation)? {
                     Relation::Packed(p) => {
-                        Some(p as *const PackedStorage as *mut PackedStorage)
+                        Some((head.relation.clone(), p as *const PackedStorage as *mut PackedStorage))
                     }
                     Relation::Generic(_) => None,
                 })
-                .collect();
+                .unzip();
 
             if head_rels.len() != rule.heads.len() {
                 return None;
@@ -1149,7 +1186,9 @@ impl Engine {
 
             for (clause_offset, clause) in rule_clauses.iter().enumerate() {
                 let rel_ptr = clause_rels[clause_offset];
+                let rel_name = &clause_rel_names_rule[clause_offset];
                 for use_recent_flag in [0u32, 1u32] {
+                    ri_spec_rel_names.push(rel_name.clone());
                     if clause.bound_cols.is_empty() {
                         // Full-scan clause — null handle (never accessed by inline probe)
                         handles_flat.push(JitLookupHandle::null());
@@ -1179,6 +1218,9 @@ impl Engine {
                     }
                 }
             }
+
+            ri_clause_rel_names.push(clause_rel_names_rule.into_boxed_slice());
+            ri_head_rel_names.push(head_rel_names_rule.into_boxed_slice());
 
             let clause_rels_box: Box<[*const PackedStorage]> = clause_rels.into_boxed_slice();
             let head_rels_box: Box<[*mut PackedStorage]> = head_rels.into_boxed_slice();
@@ -1222,15 +1264,15 @@ impl Engine {
             ctx.lookup_handles = unsafe { handles_box.as_mut_ptr().add(offset) };
         }
 
-        // All packed rels for advance()
-        let all_rels: Vec<*mut PackedStorage> = self
+        // All packed rels for advance() (with parallel name collection for pool refresh).
+        let (ri_all_rel_names, all_rels): (Vec<String>, Vec<*mut PackedStorage>) = self
             .relations
-            .values()
-            .filter_map(|rel| match rel {
-                Relation::Packed(p) => Some(p as *const PackedStorage as *mut PackedStorage),
+            .iter()
+            .filter_map(|(name, rel)| match rel {
+                Relation::Packed(p) => Some((name.clone(), p as *const PackedStorage as *mut PackedStorage)),
                 Relation::Generic(_) => None,
             })
-            .collect();
+            .unzip();
 
         let all_rels_box: Box<[*mut PackedStorage]> = all_rels.into_boxed_slice();
         let rule_ctx_ptrs_box: Box<[*mut PackedJitContextV3]> =
@@ -1265,6 +1307,19 @@ impl Engine {
             None
         };
 
+        // Pool refresh info: only available for non-native path (native has additional
+        // raw pointers in stage4_native_runtime that would also need updating on reuse).
+        let refresh_info = if native_runtime.is_none() {
+            Some(StratumStage4RefreshInfo {
+                all_rel_names: ri_all_rel_names.into_boxed_slice(),
+                lookup_spec_rel_names: ri_spec_rel_names.into_boxed_slice(),
+                clause_rel_names: ri_clause_rel_names,
+                head_rel_names: ri_head_rel_names,
+            })
+        } else {
+            None
+        };
+
         Some(StratumStage4Runtime {
             stage4_ctx,
             _per_rule_clause_rels: per_rule_clause_rels,
@@ -1276,7 +1331,120 @@ impl Engine {
             _handles_buf: handles_box,
             _lookup_specs: specs_box,
             stage4_native_runtime: native_runtime,
+            refresh_info,
         })
+    }
+
+    /// Repopulate a pooled `StratumStage4Runtime` with new engine-specific pointers.
+    ///
+    /// Updates all raw `*const/*mut PackedStorage` and `*mut JitDedupHandle` slots in the
+    /// runtime to point to this engine's relations.  Also rebuilds `jit_indices` and
+    /// the `_handles_buf` so the first JIT body execution sees valid data.
+    ///
+    /// Returns `false` if any required relation is missing (shouldn't happen for pooled runtimes
+    /// built from the same program).
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    fn repopulate_runtime(&mut self, rt: &mut StratumStage4Runtime) -> bool {
+        use crate::jit_index::JitLookupHandle;
+        use crate::relation::Relation;
+
+        let Some(info) = rt.refresh_info.as_ref() else { return false; };
+
+        // 1. Update _all_rels
+        for (slot, name) in rt._all_rels.iter_mut().zip(info.all_rel_names.iter()) {
+            if let Some(Relation::Packed(ps)) = self.relations.get(name.as_str()) {
+                *slot = ps as *const _ as *mut _;
+            } else {
+                return false;
+            }
+        }
+        // stage4_ctx.all_rels already points into _all_rels (Box didn't move). ✓
+
+        // 2. Update _lookup_specs.rel
+        for (spec, name) in rt._lookup_specs.iter_mut().zip(info.lookup_spec_rel_names.iter()) {
+            if let Some(Relation::Packed(ps)) = self.relations.get(name.as_str()) {
+                spec.rel = ps as *const _;
+            } else {
+                return false;
+            }
+        }
+
+        // 3. Update _per_rule_clause_rels and _per_rule_head_rels and _per_rule_dedup_handles
+        for rule_i in 0..rt._per_rule_clause_rels.len() {
+            let clause_names = &info.clause_rel_names[rule_i];
+            for (slot, name) in rt._per_rule_clause_rels[rule_i].iter_mut().zip(clause_names.iter()) {
+                if let Some(Relation::Packed(ps)) = self.relations.get(name.as_str()) {
+                    *slot = ps as *const _;
+                } else {
+                    return false;
+                }
+            }
+            // ctx.rels already points into clause_rels_box (Box didn't move). ✓
+
+            let head_names = &info.head_rel_names[rule_i];
+            for (slot, name) in rt._per_rule_head_rels[rule_i].iter_mut().zip(head_names.iter()) {
+                if let Some(Relation::Packed(ps)) = self.relations.get(name.as_str()) {
+                    *slot = ps as *const _ as *mut _;
+                } else {
+                    return false;
+                }
+            }
+            // ctx.head_rels already points into head_rels_box (Box didn't move). ✓
+
+            // Rebuild dedup handles from updated head_rels.
+            for (slot, &head_ps) in rt._per_rule_dedup_handles[rule_i]
+                .iter_mut()
+                .zip(rt._per_rule_head_rels[rule_i].iter())
+            {
+                *slot = unsafe { &raw mut (*head_ps).jit_dedup.handle };
+            }
+            // ctx.head_dedup_handles already points into dedup_box (Box didn't move). ✓
+        }
+
+        // 4. Update jit_indices for clause relations (needed before rebuilding handles_buf).
+        //    If jit_indices is empty (fresh engine), pre-create with capacity reserved by the
+        //    step-2 pre-size (count_hint already applied to the JitHashIndex if it existed;
+        //    for a fresh engine the reserve was a no-op, so pre-grow here before inserting).
+        for clause_names in info.clause_rel_names.iter() {
+            for name in clause_names.iter() {
+                if let Some(Relation::Packed(ps)) = self.relations.get_mut(name.as_str()) {
+                    // Ensure jit_indices exists with pre-reserved capacity before inserting.
+                    if ps.jit_indices.is_empty() && ps.count > 0 && ps.arity > 0 {
+                        ps.jit_indices = (0..ps.arity)
+                            .map(|_| {
+                                let mut idx = crate::jit_index::JitHashIndex::empty();
+                                // Pre-reserve to avoid rehash cascade during update_jit_indices.
+                                // count+1 ensures enough capacity even before reserve hint is known.
+                                idx.reserve(ps.count + 1);
+                                idx
+                            })
+                            .collect();
+                    }
+                    ps.update_jit_indices();
+                }
+            }
+        }
+
+        // 5. Rebuild _handles_buf from new jit_indices.
+        //    Non-native path runs full-variant body BEFORE first advance_s4 call,
+        //    so stale handle entries would be dereferenced → must be refreshed here.
+        let total = rt.stage4_ctx.total_handles as usize;
+        for i in 0..total {
+            let spec = unsafe { &*rt.stage4_ctx.lookup_specs.add(i) };
+            let ps = unsafe { &*spec.rel };
+            let idx_opt = if spec.use_recent != 0 {
+                ps.jit_recent_indices.get(spec.col as usize)
+            } else {
+                ps.jit_indices.get(spec.col as usize)
+            };
+            let handle = unsafe { &mut *rt.stage4_ctx.handles_buf.add(i) };
+            *handle = match idx_opt {
+                Some(idx) => JitLookupHandle::from_index(idx),
+                None => JitLookupHandle::null(),
+            };
+        }
+
+        true
     }
 
     /// Build the native runtime context for Stage 4 stratum execution.
@@ -4056,4 +4224,22 @@ mod jit_hot_tests {
         }
     }
 
+}
+
+/// Return Stage 4 runtimes to the JIT pool when an engine is dropped.
+/// On the next hot-bench iteration, `repopulate_runtime` rewrites engine-specific pointers
+/// into the already-allocated boxes (zero allocations vs the ~9 Box allocs in a fresh build).
+#[cfg(all(feature = "jit", feature = "specialized"))]
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Some(jit_cell) = self.jit.as_ref()
+            && !self.stratum_stage4_cache.is_empty()
+            && let Ok(mut jit) = jit_cell.lock()
+        {
+            for (key, runtime) in self.stratum_stage4_cache.drain() {
+                // Keep at most one runtime per stratum in the pool.
+                jit.stratum_runtime_pool.entry(key).or_insert(runtime);
+            }
+        }
+    }
 }
