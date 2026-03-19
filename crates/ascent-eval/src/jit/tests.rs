@@ -388,8 +388,8 @@ fn test_packed_jit_arithmetic_condition() {
 
 // ─── Stratum meta-function tests ────────────────────────────────────
 
-/// These tests exercise the stratum meta-function JIT path, which compiles
-/// a whole fixpoint loop per stratum into a single Cranelift function.
+/// These tests exercise the stratum-level JIT path, which compiles
+/// a whole fixpoint loop per stratum into a single asm function.
 #[cfg(feature = "specialized")]
 #[test]
 fn test_stratum_meta_tc() {
@@ -449,9 +449,9 @@ fn test_stratum_meta_multi_rule_stratum() {
     );
 }
 
-// ─── Stage 3 direct-insert tests ────────────────────────────────────
+// ─── Stage 4 direct-insert tests ────────────────────────────────────
 
-/// These tests specifically exercise the Stage 3 (direct-insert) path and verify
+/// These tests specifically exercise the Stage 4 (direct-insert) path and verify
 /// correctness across recursive, multi-rule, and conditional scenarios.
 #[cfg(feature = "specialized")]
 #[test]
@@ -551,8 +551,8 @@ fn test_stratum_meta_single_rule_fixpoint() {
 // ─── Stage 4 inlined-body tests ─────────────────────────────────────
 
 /// These tests specifically exercise the Stage 4 (inlined rule bodies) path,
-/// which compiles all rule bodies directly into a single Cranelift function,
-/// eliminating call_indirect overhead.
+/// which compiles all rule bodies directly into a single asm function,
+/// eliminating per-rule call overhead.
 #[cfg(feature = "specialized")]
 #[test]
 fn test_stage4_transitive_closure() {

@@ -2,7 +2,7 @@
 //!
 //! Supports rules with N `CClause` body items where clause 0 is a full scan
 //! (no bound cols) and clauses 1..N-1 are index scans.  Returns `Err` for any
-//! unsupported pattern so the caller can fall back to Cranelift.
+//! unsupported pattern; the caller falls back to the interpreted path.
 //!
 //! # ABI
 //! Generated function: `unsafe extern "C" fn(*mut StratumStage4Ctx)` — System V
@@ -1333,13 +1333,12 @@ fn emit_clause_level(
         let use_recent = p.use_recent[level];
         let is_rec = p.is_rec[level];
         // Native path only supports EDB (contiguous JitColIndex) inner clauses.
-        // IDB inner clauses require full JitColIndex rebuild per iteration (O(n log n)),
-        // which is slower than the Cranelift callback path's O(1) linked-list inserts.
-        // Reject so the stratum falls back to Cranelift for these rules.
+        // IDB inner clauses require full JitColIndex rebuild per iteration (O(n log n));
+        // the non-native asm path uses O(1) linked-list inserts and handles IDB correctly.
         if p.use_jit_native && is_rec {
             return Err(format!(
                 "asm native: clause {level} is IDB \
-                 (per-iteration JitColIndex rebuild is slower than Cranelift linked-list)"
+                 (per-iteration JitColIndex rebuild would be slower than linked-list path)"
             ));
         }
         let is_contiguous = !is_rec;

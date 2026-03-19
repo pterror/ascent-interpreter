@@ -344,12 +344,12 @@ const _: () = {
 #[allow(dead_code)]
 pub type StratumMetaFn = unsafe extern "C" fn(*mut StratumMetaCtx);
 
-// ─── Stage 3: direct-insert rule variants ───────────────────────────
+// ─── Stage 4: direct-insert rule variants ───────────────────────────
 
-/// Runtime context for Stage 3 packed JIT rule variants.
+/// Runtime context for Stage 4 packed JIT rule variants.
 ///
 /// Head relations are written to directly — no results buffer needed.
-/// Bindings are held in Cranelift Variables (register-allocated), not in a heap array.
+/// Bindings are held in asm local registers / stack slots.
 ///
 /// repr(C) layout on 64-bit:
 ///   rels               (ptr)  @ offset  0
@@ -377,7 +377,7 @@ pub struct PackedJitContextV3 {
     /// Flat array of `*const JitRelData`, indexed by `clause_offset * 2 + use_recent`.
     /// Points into `jit_native.total` (use_recent=0) or `jit_native.recent` (use_recent=1)
     /// for each clause's relation.  Refreshed by `jit_stratum_advance_s4` after each advance.
-    /// Null when Stage 4 is used without the Cranelift JitRelData-direct path.
+    /// Null for non-native asm rules (no jit_native).
     pub jit_rels: *const *const storage::JitRelData,
 }
 
@@ -393,7 +393,7 @@ const _: () = {
     assert!(std::mem::offset_of!(PackedJitContextV3, jit_rels) == 40);
 };
 
-/// Context for Stage 3 stratum meta-function (direct-insert variant).
+/// Context for Stage 4 stratum function (direct-insert variant).
 ///
 /// Layout (repr C, 64-bit):
 ///   offset  0: full_fns    *const PackedJitFnV3           (8 bytes)
@@ -574,7 +574,7 @@ pub unsafe extern "C" fn packed_try_insert(
 
 /// Advance all packed relations and return 1 if any gained new tuples.
 ///
-/// Called once per semi-naive iteration in Stage 3 (no flush step needed).
+/// Called once per semi-naive iteration in Stage 4 (no flush step needed).
 ///
 /// # Safety
 /// `rels` must point to `n_rels` valid `*mut PackedStorage` pointers.
@@ -737,9 +737,8 @@ pub unsafe extern "C" fn jit_advance_native(ctx: *mut StratumStage4NativeCtx) ->
     let mut changed = false;
     for &rel_ptr in advance_slice {
         let rel = unsafe { &mut *rel_ptr };
-        // Skip JitHashIndex rebuild when safe: the asm native path reads JitColIndex directly
-        // via jit_native. When jit_used_in_cranelift_strata=false, no Cranelift stratum
-        // will probe jit_indices for this relation, so the rebuild can be elided.
+        // Skip JitHashIndex rebuild: the asm native path reads JitColIndex directly
+        // via jit_native and never consults jit_indices. Hash indices are never needed.
         if rel.advance_jit_skip_hash_indices() {
             changed = true;
         }
@@ -830,7 +829,7 @@ unsafe fn jit_stratum_advance_s4_inner(ctx: *mut StratumStage4Ctx) -> u8 {
         handle._pad = 0;
     }
     // Refresh jit_rel_ptrs — advance_jit() rebuilt jit_native; copy fresh JitRelData pointers.
-    // These are used by the Cranelift direct-load path to read count and data pointer inline.
+    // These are used by the asm backend to read count and data pointer inline.
     if !ctx.jit_rel_specs.is_null() && !ctx.jit_rel_ptrs.is_null() {
         for i in 0..ctx.total_jit_rels as usize {
             let spec = unsafe { &*ctx.jit_rel_specs.add(i) };

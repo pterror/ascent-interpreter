@@ -312,11 +312,7 @@ impl PackedStorage {
         }
     }
 
-    /// Like `build_native_projection`, but skips `JitColIndex` building.
-    ///
-    /// Used for Cranelift strata that only read `data` and `len` directly from
-    /// `JitRelData` and never probe `col_indices`.
-#[inline]
+    #[inline]
     fn value_slice(&self, idx: usize) -> &[Value] {
         &self.value_data[idx * self.arity..(idx + 1) * self.arity]
     }
@@ -631,14 +627,9 @@ impl PackedStorage {
         }
 
         // Rebuild jit_native only if it has already been initialized.
-        // jit_native is None on the Cranelift path (build_stratum_stage4_native_runtime is
-        // never called without jit-asm), so this guard prevents paying the build cost there.
-        // The asm native runtime builder explicitly initializes jit_native before first run;
-        // after that, this block keeps it fresh on every fixpoint iteration.
-        //
-        // Exception: the Cranelift direct-load path (Step 6) also initializes jit_native,
-        // but with build_indices=false (lean projection). The build_indices flag is respected
-        // below so lean projections never build JitColIndex.
+        // jit_native starts as None; the asm native runtime builder initializes it before
+        // the first run. After that, this block keeps it fresh on every fixpoint iteration.
+        // build_indices=false projections (recent buffers) never build JitColIndex.
         if rebuild_jit_native && self.jit_native.is_some() {
             use crate::jit::storage::JitRelData;
             let arity = self.arity;
@@ -716,8 +707,7 @@ impl PackedStorage {
     /// Advance for the asm native path: skips `JitHashIndex` rebuild when safe.
     ///
     /// The asm native path reads `JitColIndex` directly via `jit_native` and never
-    /// consults `jit_indices` / `jit_recent_indices`.  Cranelift was removed, so hash
-    /// indices are never needed by another stratum; always skip them.
+    /// consults `jit_indices` / `jit_recent_indices`; always skip hash index rebuilds.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) fn advance_jit_skip_hash_indices(&mut self) -> bool {
         self.advance_jit_inner(false, true)

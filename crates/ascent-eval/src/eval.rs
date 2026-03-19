@@ -767,7 +767,7 @@ impl Engine {
 
     /// Try to run the stratum via the Stage 4 compiled function (inlined rule bodies).
     ///
-    /// Returns `true` if successful, `false` to fall back to Stage 3 or interpreted.
+    /// Returns `true` if successful, `false` to fall back to interpreted.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     fn try_run_stratum_stage4(&mut self, rules: &[&CRule], scc_key: usize, _rule_indices: &[usize]) -> bool {
         if rules.is_empty() {
@@ -831,7 +831,7 @@ impl Engine {
             // The index format depends on `jit_is_edb` at build time:
             //   jit_is_edb=false → vals are tuple indices (standard mode)
             //   jit_is_edb=true  → vals are column values (EDB col-value mode)
-            // The ASM/Cranelift JIT selects the mode by `!is_rec[level]`, which must
+            // The asm JIT selects the mode by `!is_rec[level]`, which must
             // match the index format.  If the index was built before `jit_is_edb` was
             // set, the format is wrong and must be rebuilt.
             //
@@ -1216,7 +1216,7 @@ impl Engine {
             lookup_specs: specs_box.as_ptr(),
             total_handles,
             _pad3: 0,
-            // Cranelift-only fields: not used by asm backend.
+            // Unused fields (reserved for future use):
             tuple_sets_buf: std::ptr::null(),
             jit_rel_specs: std::ptr::null(),
             jit_rel_ptrs: std::ptr::null_mut(),
@@ -1296,10 +1296,9 @@ impl Engine {
                 if let Some(Relation::Packed(ps)) = self.relations.get_mut(name) {
                     if ps.jit_native.is_none() {
                         // Cold path: move delta→recent, then build the native projection.
-                        // Use advance_jit_skip_hash_indices to skip JitHashIndex rebuild:
-                        // the native path uses JitColIndex (in jit_native) and never reads
-                        // jit_indices / jit_recent_indices. Cranelift was removed, so hash
-                        // indices are never consumed anywhere. Skipping the 4×O(n log n)
+                        // Skip JitHashIndex rebuild: the native path uses JitColIndex (in
+                        // jit_native) and never reads jit_indices / jit_recent_indices.
+                        // Hash indices are never consumed anywhere. Skipping the 4×O(n log n)
                         // JitHashIndex builds saves ~20µs per stratum run for triangle n=20.
                         ps.advance_jit_skip_hash_indices();
                         ps.jit_native = Some(ps.build_native_projection());
