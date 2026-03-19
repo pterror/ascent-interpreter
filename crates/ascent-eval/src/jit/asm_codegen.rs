@@ -321,6 +321,106 @@ fn emit_store_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
 /// - slots @ 0, mask @ 8, len @ 16
 /// - stride = arity + 1 words per slot
 /// - slot[0] = hash_tag (0 = empty), slot[1..N] = tuple words
+///
+/// Scalar (non-SIMD) tuple-set probe against `JitTupleSet` (open-addressed,
+/// stride = arity+1).  Used for the non-native path and arity-3 fall-back.
+///
+/// When `native_probe` is `Some((flat_idx, tr_slot))`, loads the `JitTupleSet`
+/// from `total_rels[flat_idx].tuple_set` (offset 32).  When `None`, loads from
+/// the old `ctx->tuple_sets_buf[handle_idx]` path.
+///
+/// Caller must have already loaded `edi=arg0`, `esi=arg1` (arity≥2),
+/// `r11d=arg2` (arity=3) before calling.
+fn emit_tuple_set_probe_scalar(
+    asm: &mut Assembler,
+    clause: &CClause,
+    handle_idx: usize,
+    when_exhausted: DynamicLabel,
+    var_locs: &[VarLoc],
+    native_probe: Option<(usize, i32)>,
+) -> Result<(), String> {
+    let arity = clause.args.len();
+
+    macro_rules! load_arg {
+        ($asm:expr, $idx:expr, $tgt:ident) => {
+            match &clause.args[$idx] {
+                CClauseArg::Var(var_id) => {
+                    emit_load_var($asm, var_locs, *var_id);
+                    dynasm!($asm; mov $tgt, eax);
+                }
+                CClauseArg::Expr(CExpr::Literal(crate::value::Value::I32(n))) => {
+                    dynasm!($asm; mov $tgt, *n);
+                }
+                CClauseArg::Expr(CExpr::Literal(crate::value::Value::Bool(b))) => {
+                    let v = if *b { 1i32 } else { 0i32 };
+                    dynasm!($asm; mov $tgt, v);
+                }
+                _ => return Err(format!("emit_tuple_set_probe: unsupported arg type")),
+            }
+        };
+    }
+
+    // Load JitTupleSet pointer into rdi FIRST (uses rdi which aliases edi).
+    if let Some((flat_idx, tr_slot)) = native_probe {
+        let flat_idx_i32 = (flat_idx * 8) as i32;
+        dynasm!(asm
+            ; mov rdi, [rbp + tr_slot]
+            ; mov rdi, [rdi + flat_idx_i32]
+            ; add rdi, 32              // &JitRelData.tuple_set (offset 32)
+        );
+    } else {
+        let handle_idx_i32 = (handle_idx * 8) as i32;
+        dynasm!(asm
+            ; mov rdi, [rbp + CTX_SLOT]
+            ; mov rdi, [rdi + 56]      // tuple_sets_buf
+            ; mov rdi, [rdi + handle_idx_i32]
+        );
+    }
+
+    // r8 = slots ptr, r9 = mask
+    dynasm!(asm; mov r8, [rdi]; mov r9, [rdi + 8]);
+
+    // Load args AFTER rdi (safe: rdi no longer needed as pointer).
+    load_arg!(asm, 0, edi);
+    if arity >= 2 { load_arg!(asm, 1, esi); }
+    if arity >= 3 { load_arg!(asm, 2, r11d); }
+
+    // Compute tuple_hash
+    dynasm!(asm; mov eax, 0x9e3779b9u32 as i32);
+    dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, edi);
+    if arity >= 2 { dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, esi); }
+    if arity >= 3 { dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, r11d); }
+    let hash_ok = asm.new_dynamic_label();
+    dynasm!(asm; test eax, eax; jnz =>hash_ok; mov eax, 1; =>hash_ok);
+    dynasm!(asm; mov edx, eax); // edx = hash_tag
+    dynasm!(asm; mov r10, rax; and r10, r9); // r10 = slot
+
+    let probe_lp   = asm.new_dynamic_label();
+    let probe_next = asm.new_dynamic_label();
+    let probe_done = asm.new_dynamic_label();
+
+    dynasm!(asm; =>probe_lp);
+    match arity {
+        1 => dynasm!(asm; lea rcx, [r10 + r10]),
+        2 => dynasm!(asm; lea rcx, [r10 + r10*2]),
+        _ => dynasm!(asm; lea rcx, [r10 + r10*3]),
+    }
+    dynasm!(asm
+        ; mov eax, [r8 + rcx*4]
+        ; test eax, eax
+        ; je =>when_exhausted
+        ; cmp eax, edx
+        ; jne =>probe_next
+    );
+    dynasm!(asm; cmp [r8 + rcx*4 + 4], edi; jne =>probe_next);
+    if arity >= 2 { dynasm!(asm; cmp [r8 + rcx*4 + 8], esi;   jne =>probe_next); }
+    if arity >= 3 { dynasm!(asm; cmp [r8 + rcx*4 + 12], r11d; jne =>probe_next); }
+    dynasm!(asm; jmp =>probe_done);
+    dynasm!(asm; =>probe_next; inc r10; and r10, r9; jmp =>probe_lp);
+    dynasm!(asm; =>probe_done);
+    Ok(())
+}
+
 fn emit_tuple_set_probe(
     asm: &mut Assembler,
     clause: &CClause,
@@ -348,33 +448,6 @@ fn emit_tuple_set_probe(
         }
     }
 
-    // Load JitTupleSet pointer into rdi.
-    if let Some((flat_idx, tr_slot)) = native_probe {
-        // Native path: total_rels[flat_idx]->tuple_set (JitRelData offset 32)
-        // total_rels is pre-cached in tr_slot (avoids CTX_SLOT → [+8] chain).
-        let flat_idx_i32 = (flat_idx * 8) as i32;
-        dynasm!(asm
-            ; mov rdi, [rbp + tr_slot]         // total_rels (pre-cached)
-            ; mov rdi, [rdi + flat_idx_i32]    // *mut JitRelData
-            ; add rdi, 32                      // &JitRelData.tuple_set (offset 32)
-        );
-    } else {
-        let handle_idx_i32 = (handle_idx * 8) as i32;
-        // Old path: ctx->tuple_sets_buf[handle_idx]
-        dynasm!(asm
-            ; mov rdi, [rbp + CTX_SLOT]        // ctx
-            ; mov rdi, [rdi + 56]              // tuple_sets_buf (offset 56 in StratumStage4Ctx)
-            ; mov rdi, [rdi + handle_idx_i32]  // *const JitTupleSet for this clause
-        );
-    }
-
-    // Load JitTupleSet fields
-    // r8 = slots ptr (offset 0), r9 = mask (offset 8, u64)
-    dynasm!(asm
-        ; mov r8, [rdi]      // r8 = slots ptr
-        ; mov r9, [rdi + 8]  // r9 = mask
-    );
-
     // Load args into registers: edi=arg0, esi=arg1 (arity>=2), r11d=arg2 (arity==3).
     macro_rules! load_clause_arg {
         ($asm:expr, $idx:expr, $tgt:ident) => {
@@ -395,62 +468,147 @@ fn emit_tuple_set_probe(
         };
     }
 
-    load_clause_arg!(asm, 0, edi);
-    if arity >= 2 { load_clause_arg!(asm, 1, esi); }
-    if arity >= 3 { load_clause_arg!(asm, 2, r11d); }
+    if let Some((flat_idx, tr_slot)) = native_probe {
+        // ── SIMD Swiss-table probe (native path, arity 1–2 only) ──────────
+        //
+        // Uses JitSwissTable embedded at JitRelData offset 64:
+        //   ctrl @ 64  (*mut u8,  N+16 control bytes, 0xFF = empty)
+        //   data @ 72  (*mut u32, N * arity u32s)
+        //   mask @ 80  (u64,      N-1)
+        //
+        // Register map:
+        //   r8  = ctrl ptr
+        //   r9  = data ptr
+        //   r10 = mask (N-1)
+        //   rdx = group index (group-aligned slot, steps of 16)
+        //   xmm0 = broadcast H2 tag (16 copies of 1-byte tag)
+        //   xmm1 = current group control bytes
+        //   xmm2 = pcmpeqb result (tag matches)
+        //   xmm3 = all-ones (0xFF broadcast, for empty detection)
+        //   eax  = match bitmap (pmovmskb result)
+        //   ecx  = bit position (bsf) / slot index
+        //   edi  = arg0, esi = arg1
+        if arity > 2 {
+            // Arity 3 not supported in SIMD path; caller falls back to col-index scan.
+            return Err("emit_tuple_set_probe: arity 3 not supported in SIMD native path".into());
+        }
 
-    // Compute tuple_hash(words):
-    //   h = 0x9e3779b9; for each word w: h = h*0x9e3779b9 + w; if h==0: h=1
-    dynasm!(asm; mov eax, 0x9e3779b9u32 as i32);
-    dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, edi);
-    if arity >= 2 { dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, esi); }
-    if arity >= 3 { dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, r11d); }
+        let flat_idx_i32 = (flat_idx * 8) as i32;
+        // Load JitSwissTable fields FIRST (uses rdi, which would clobber edi=arg0).
+        dynasm!(asm
+            ; mov rdi, [rbp + tr_slot]      // total_rels (pre-cached)
+            ; mov rdi, [rdi + flat_idx_i32] // *mut JitRelData
+            ; mov r8,  [rdi + 64]           // swiss.ctrl
+            ; mov r9,  [rdi + 72]           // swiss.data
+            ; mov r10, [rdi + 80]           // swiss.mask
+        );
 
-    let hash_ok = asm.new_dynamic_label();
-    dynasm!(asm; test eax, eax; jnz =>hash_ok; mov eax, 1; =>hash_ok);
-    dynasm!(asm; mov edx, eax);  // edx = hash_tag
+        // Load args AFTER JitRelData (safe: rdi no longer needed).
+        load_clause_arg!(asm, 0, edi);
+        if arity >= 2 { load_clause_arg!(asm, 1, esi); }
 
-    // r10 = slot index = hash & mask
-    dynasm!(asm; mov r10, rax; and r10, r9);
+        // Compute 32-bit tuple_hash (same sequence as scalar probe).
+        dynasm!(asm; mov eax, 0x9e3779b9u32 as i32);
+        dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, edi);
+        if arity >= 2 { dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, esi); }
+        let hash_ok = asm.new_dynamic_label();
+        dynasm!(asm; test eax, eax; jnz =>hash_ok; mov eax, 1; =>hash_ok);
 
-    // Probe loop: stride = arity+1 words.
-    //   arity=1 → stride=2: rcx = r10*2 (lea [r10+r10])
-    //   arity=2 → stride=3: rcx = r10*3 (lea [r10+r10*2])
-    //   arity=3 → stride=4: rcx = r10*4 (lea [r10+r10*3])
-    let probe_lp   = asm.new_dynamic_label();
-    let probe_next = asm.new_dynamic_label();
-    let probe_done = asm.new_dynamic_label();
+        // H2 = top 7 bits of hash (always 0x00-0x7F, never 0xFF=empty).
+        // Broadcast H2 to all 16 bytes of xmm0 using SSE2.
+        dynasm!(asm
+            ; mov  ecx, eax
+            ; shr  ecx, 25          // ecx = H2 (7 bits)
+            ; movd xmm0, ecx
+            ; punpcklbw xmm0, xmm0  // [H2,H2, 0,0, ...]
+            ; pshuflw xmm0, xmm0, 0 // [H2,H2,H2,H2, ...]
+            ; pshufd xmm0, xmm0, 0x44 // all 16 bytes = H2
+        );
 
-    dynasm!(asm; =>probe_lp);
-    match arity {
-        1 => dynasm!(asm; lea rcx, [r10 + r10]),
-        2 => dynasm!(asm; lea rcx, [r10 + r10*2]),
-        _ => dynasm!(asm; lea rcx, [r10 + r10*3]),
+        // xmm3 = all-ones (0xFF) for empty-slot detection.
+        dynasm!(asm; pcmpeqd xmm3, xmm3);
+
+        // Group-aligned start: rdx = (hash & mask) & !15
+        dynasm!(asm
+            ; and rax, r10          // rax = H1 = hash & mask
+            ; and rax, -16          // rax = group_start (16-byte aligned)
+            ; mov rdx, rax          // rdx = current group
+        );
+
+        let probe_loop   = asm.new_dynamic_label();
+        let match_loop   = asm.new_dynamic_label();
+        let clear_retry  = asm.new_dynamic_label();
+        let probe_found  = asm.new_dynamic_label();
+
+        // probe_loop: load 16 ctrl bytes, check for H2 tag matches.
+        dynasm!(asm
+            ; =>probe_loop
+            ; movdqu xmm1, [r8 + rdx]  // 16 control bytes for this group
+            ; movdqa xmm2, xmm1
+            ; pcmpeqb xmm2, xmm0       // xmm2 = (ctrl[g..g+16] == H2)
+            ; pmovmskb eax, xmm2       // eax = 16-bit match bitmap
+            ; test eax, eax
+            ; jnz =>match_loop
+            // No tag match — check for empty slot (0xFF) in this group.
+            ; pcmpeqb xmm1, xmm3       // xmm1 = (ctrl == 0xFF)
+            ; pmovmskb eax, xmm1
+            ; test eax, eax
+            ; jnz =>when_exhausted     // empty slot found → key not present
+            // No match, no empty → advance to next group.
+            ; add rdx, 16
+            ; and rdx, r10             // rdx = (group + 16) & mask
+            ; jmp =>probe_loop
+        );
+
+        // match_loop: for each matching slot, verify full tuple.
+        dynasm!(asm; =>match_loop);
+        dynasm!(asm
+            ; bsf ecx, eax             // ecx = bit position of first match
+            ; lea rcx, [rdx + rcx]     // rcx = group + bit (unmasked slot)
+            ; and rcx, r10             // rcx = slot index
+        );
+        // Verify data[slot * arity] == args.
+        match arity {
+            1 => {
+                dynasm!(asm
+                    ; cmp [r9 + rcx*4], edi
+                    ; je =>probe_found
+                );
+            }
+            _ => { // arity == 2
+                dynasm!(asm
+                    ; cmp [r9 + rcx*8], edi
+                    ; jne =>clear_retry
+                    ; cmp [r9 + rcx*8 + 4], esi
+                    ; je =>probe_found
+                );
+            }
+        }
+
+        // clear_retry: clear the tested bit and continue with remaining matches.
+        dynasm!(asm
+            ; =>clear_retry
+            ; bsf ecx, eax             // ecx = position of the bit we just tested
+            ; btr eax, ecx             // clear that bit
+            ; test eax, eax
+            ; jnz =>match_loop         // more matches in this group
+            // No more matches in group — check for empty (xmm1 still has ctrl bytes).
+            ; pcmpeqb xmm1, xmm3       // xmm1 = (ctrl == 0xFF)
+            ; pmovmskb eax, xmm1
+            ; test eax, eax
+            ; jnz =>when_exhausted     // empty slot → key not present
+            // Advance to next group.
+            ; add rdx, 16
+            ; and rdx, r10
+            ; jmp =>probe_loop
+        );
+
+        dynasm!(asm; =>probe_found);
+        Ok(())
+    } else {
+        // Scalar probe (non-native path or arity 3).
+        emit_tuple_set_probe_scalar(asm, clause, handle_idx, when_exhausted, var_locs, None)
     }
-
-    // Check hash_tag
-    dynasm!(asm
-        ; mov eax, [r8 + rcx*4]   // hash_tag
-        ; test eax, eax
-        ; je =>when_exhausted      // empty → not found
-        ; cmp eax, edx             // hash tag matches?
-        ; jne =>probe_next
-    );
-
-    // Full tuple comparison
-    dynasm!(asm; cmp [r8 + rcx*4 + 4], edi; jne =>probe_next);
-    if arity >= 2 { dynasm!(asm; cmp [r8 + rcx*4 + 8], esi;   jne =>probe_next); }
-    if arity >= 3 { dynasm!(asm; cmp [r8 + rcx*4 + 12], r11d; jne =>probe_next); }
-
-    // Found — fall through
-    dynasm!(asm; jmp =>probe_done);
-
-    dynasm!(asm; =>probe_next);
-    dynasm!(asm; inc r10; and r10, r9; jmp =>probe_lp);
-
-    dynasm!(asm; =>probe_done);
-
-    Ok(())
 }
 
 // ─── Expression compilation ───────────────────────────────────────────────
