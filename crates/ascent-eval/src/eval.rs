@@ -1480,6 +1480,10 @@ impl Engine {
         // the upfront JIT advance would immediately rebuild it (double-build), adding ~50–100µs
         // of wasted work per engine run.
         {
+            // Clone the JIT Arc once before borrowing self.relations mutably,
+            // so cache lookups/updates don't conflict with the relation borrow.
+            let jit_arc = self.jit.as_ref().map(Arc::clone);
+
             let all_rels: Vec<String> = rules
                 .iter()
                 .flat_map(|r| {
@@ -1500,7 +1504,70 @@ impl Engine {
                         // Hash indices are never consumed anywhere. Skipping the 4×O(n log n)
                         // JitHashIndex builds saves ~20µs per stratum run for triangle n=20.
                         ps.advance_jit_skip_hash_indices();
-                        ps.jit_native = Some(ps.build_native_projection());
+
+                        // EDB total cache: for EDB non-sink relations, the sorted `total`
+                        // JitRelData (with JitColIndex) can be reused across Engine instances
+                        // when the same facts are loaded (same count + same data hash).
+                        // Saves O(n log n) sort + JitColIndex rebuild per hot-bench iteration.
+                        let native = if ps.jit_is_edb && !ps.jit_is_sink {
+                            if let Some(arc) = &jit_arc {
+                                let arity = ps.arity;
+                                let count = ps.count;
+                                let data_hash = {
+                                    use std::hash::Hasher;
+                                    let mut h = rustc_hash::FxHasher::default();
+                                    let words = &ps.packed_data[0..count * arity.max(1)];
+                                    let bytes = unsafe {
+                                        std::slice::from_raw_parts(
+                                            words.as_ptr() as *const u8,
+                                            words.len() * 4,
+                                        )
+                                    };
+                                    h.write(bytes);
+                                    h.finish()
+                                };
+                                // Try cache hit (lock, check, clone, unlock).
+                                let cached = {
+                                    let jit = arc.lock().unwrap();
+                                    jit.edb_native_total_cache.get(name).and_then(
+                                        |(cached_count, cached_hash, cached_rel)| {
+                                            if *cached_count == count && *cached_hash == data_hash {
+                                                Some(unsafe {
+                                                    crate::jit::storage::clone_jit_rel_data_with_indices(
+                                                        cached_rel, arity, true,
+                                                    )
+                                                })
+                                            } else {
+                                                None
+                                            }
+                                        },
+                                    )
+                                };
+                                if let Some(cached_total) = cached {
+                                    // Use pre-sorted total from cache — O(n) clone.
+                                    ps.build_native_projection_with_total(cached_total)
+                                } else {
+                                    // Cache miss: build normally, then populate cache.
+                                    let native = ps.build_native_projection();
+                                    {
+                                        let total_clone = unsafe {
+                                            crate::jit::storage::clone_jit_rel_data_with_indices(
+                                                &native.total, arity, true,
+                                            )
+                                        };
+                                        let mut jit = arc.lock().unwrap();
+                                        jit.edb_native_total_cache
+                                            .insert(name.clone(), (count, data_hash, total_clone));
+                                    }
+                                    native
+                                }
+                            } else {
+                                ps.build_native_projection()
+                            }
+                        } else {
+                            ps.build_native_projection()
+                        };
+                        ps.jit_native = Some(native);
                     } else if !ps.delta.is_empty() {
                         // jit_native was deep-cloned (PackedStorage::clone) and new facts were
                         // inserted into delta since the clone.  advance_jit_skip_hash_indices

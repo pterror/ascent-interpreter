@@ -47,6 +47,18 @@ pub struct JitCompiler {
     /// hot-bench iteration; repopulate_runtime writes new engine pointers without allocating.
     #[cfg(feature = "specialized")]
     pub(crate) stratum_runtime_pool: rustc_hash::FxHashMap<usize, crate::eval::StratumStage4Runtime>,
+    /// Cache of pre-sorted EDB `total` JitRelData projections across Engine instances.
+    ///
+    /// Keyed by (relation_name). Value is (tuple_count, data_hash, Box<JitRelData>) where
+    /// data_hash is a FxHasher hash of the raw packed_data buffer. On a cache hit
+    /// (count+hash match), the cached JitRelData is O(n) memcpy-cloned instead of
+    /// rebuilding via O(n log n) sort + JitColIndex construction.
+    ///
+    /// Shared across Engine instances via Arc<Mutex<JitCompiler>>, so the cache survives
+    /// Engine::new() calls in hot-bench iterations that reuse a compiled JitCompiler.
+    #[cfg(all(feature = "jit-asm", feature = "specialized"))]
+    pub(crate) edb_native_total_cache:
+        FxHashMap<String, (usize, u64, Box<storage::JitRelData>)>,
 }
 
 // Safety: JitCompiler is only accessed from one thread at a time (guarded by Mutex).
@@ -68,6 +80,8 @@ impl JitCompiler {
             tuple_count_hints: FxHashMap::default(),
             #[cfg(feature = "specialized")]
             stratum_runtime_pool: FxHashMap::default(),
+            #[cfg(all(feature = "jit-asm", feature = "specialized"))]
+            edb_native_total_cache: FxHashMap::default(),
         })
     }
 

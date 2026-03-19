@@ -315,6 +315,35 @@ impl PackedStorage {
         }
     }
 
+    /// Like `build_native_projection` but uses a pre-built (cached) `total` JitRelData
+    /// instead of re-sorting and rebuilding JitColIndex. O(n) memcpy for total vs O(n log n).
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    pub(crate) fn build_native_projection_with_total(
+        &self,
+        total: Box<crate::jit::storage::JitRelData>,
+    ) -> crate::jit::storage::JitNativeRelData {
+        use crate::jit::storage::{JitNativeRelData, JitRelData};
+        let arity = self.arity;
+        let build_indices = self.jit_is_edb && !self.jit_is_sink;
+        let recent = if self.jit_is_sink {
+            JitRelData::build_from_packed_no_tupleset(&[], arity, false)
+        } else {
+            let mut recent_buf: Vec<u32> = Vec::with_capacity(self.recent.len() * arity.max(1));
+            for &idx in &self.recent {
+                let start = idx * arity;
+                recent_buf.extend_from_slice(&self.packed_data[start..start + arity]);
+            }
+            JitRelData::build_from_packed_no_tupleset(&recent_buf, arity, false)
+        };
+        JitNativeRelData {
+            total,
+            recent,
+            new: JitRelData::build_from_packed(&[], arity, false),
+            total_built_count: self.count,
+            build_indices,
+        }
+    }
+
     #[inline]
     fn value_slice(&self, idx: usize) -> &[Value] {
         &self.value_data[idx * self.arity..(idx + 1) * self.arity]
@@ -646,6 +675,10 @@ impl PackedStorage {
                 // EDB: total never changes. Always reset recent to empty.
                 // `recent` is only iterated, never probed as a membership set —
                 // skip tuple_set to avoid O(n) hash-build cost.
+                // NOTE: recent must be rebuilt (not just len=0 in-place) because EDB recent
+                // may be used as an inner scan in semi-naive Variant 2+, which probes
+                // col_indices. The new empty JitRelData has col_indices built for empty data
+                // (all ranges = empty), giving correct no-match behavior.
                 let native = self.jit_native.as_mut().unwrap();
                 native.recent = JitRelData::build_from_packed_no_tupleset(&[], arity, build_indices);
                 // `new` was already reset above by the swap.

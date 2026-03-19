@@ -948,7 +948,7 @@ impl std::fmt::Debug for JitNativeRelData {
 ///
 /// # Safety
 /// `src` must be a valid, fully-initialized `JitRelData`.
-unsafe fn clone_jit_rel_data_with_indices(
+pub(crate) unsafe fn clone_jit_rel_data_with_indices(
     src: &JitRelData,
     arity: usize,
     copy_tuple_set: bool,
