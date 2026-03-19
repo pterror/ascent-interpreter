@@ -34,9 +34,9 @@
 //!
 //! # Register use inside loop bodies
 //! All callee-saved registers survive `call` instructions:
-//!   r12 = outer loop count  (level 0 only)
-//!   r13 = recent_ptr for outer clause  (only if use_recent0)
-//!   r14 = outer loop counter i  (level 0 only)
+//!   r12 = outer loop end_ptr (use_recent0=true) or count (use_recent0=false)
+//!   r13 = outer loop current_ptr (advances by stride; use_recent0=true only)
+//!   r14 = outer loop counter i  (use_recent0=false only; free for vars when use_recent0=true)
 //!   r15 = innermost active value-scan counter j (zero-extended u32)
 //!   rbx = innermost active data_ptr (or count in col-value mode)
 //!
@@ -88,7 +88,8 @@ fn var_slot(id: u32) -> i32 {
 /// Register encoding uses the x86-64 ModRM register numbering:
 ///   3 = rbx, 13 = r13.
 /// Only callee-saved registers that are not already claimed by loop machinery
-/// may appear here (r12/r14 are reserved; r15 is clobbered during inner probes).
+/// may appear here (r12 is always loop-machinery; r13/r14 availability depends
+/// on use_recent0; r15 is clobbered during inner probes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VarLoc {
     /// rbp-relative stack slot (existing behaviour).
@@ -103,8 +104,10 @@ enum VarLoc {
 ///   fresh_cols), in ascending ID order.  These are "outer-stable": they are
 ///   written once in the outer loop body and must survive the entire inner loop.
 ///
-/// `use_recent0`: if true, r13 is occupied by the recent_ptr for clause0 and
-///   is NOT available for variable assignment.
+/// `use_recent0`: if true, the outer loop is pointer-based (r13 = current_ptr,
+///   r12 = end_ptr) and r14 is freed for variable assignment.  r13 is NOT
+///   available (occupied by the advancing loop pointer).
+///   If false, r14 is the loop counter (not available) and r13 is free.
 ///
 /// `is_multi_clause`: if true (2+ clause rule) rbx is repurposed for the
 ///   innermost data_ptr and is NOT available for variable assignment.
@@ -122,8 +125,13 @@ fn compute_var_locs(
     // Build the list of available registers, priority-ordered.
     let mut available: Vec<u8> = Vec::new();
 
-    if !use_recent0 {
-        // r13 is free when we don't need it for the outer recent_ptr.
+    if use_recent0 {
+        // Outer loop is pointer-based: r13 = advancing current_ptr (not free),
+        // but r14 is freed (no longer used as counter).
+        available.push(14);
+    } else {
+        // r13 is free when we don't need it for the outer current_ptr.
+        // r14 is occupied as the counter for the index-based loop.
         available.push(13);
     }
     if !is_multi_clause {
@@ -274,6 +282,7 @@ fn emit_load_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
         VarLoc::Stack(slot) => dynasm!(asm; mov eax, [rbp + slot]),
         VarLoc::Reg(3)      => dynasm!(asm; mov eax, ebx),
         VarLoc::Reg(13)     => dynasm!(asm; mov eax, r13d),
+        VarLoc::Reg(14)     => dynasm!(asm; mov eax, r14d),
         VarLoc::Reg(r)      => panic!("emit_load_var: unexpected reg {r}"),
     }
 }
@@ -284,6 +293,7 @@ fn emit_load_var_ecx(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
         VarLoc::Stack(slot) => dynasm!(asm; mov ecx, [rbp + slot]),
         VarLoc::Reg(3)      => dynasm!(asm; mov ecx, ebx),
         VarLoc::Reg(13)     => dynasm!(asm; mov ecx, r13d),
+        VarLoc::Reg(14)     => dynasm!(asm; mov ecx, r14d),
         VarLoc::Reg(r)      => panic!("emit_load_var_ecx: unexpected reg {r}"),
     }
 }
@@ -294,6 +304,7 @@ fn emit_store_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
         VarLoc::Stack(slot) => dynasm!(asm; mov [rbp + slot], edx),
         VarLoc::Reg(3)      => dynasm!(asm; mov ebx, edx),
         VarLoc::Reg(13)     => dynasm!(asm; mov r13d, edx),
+        VarLoc::Reg(14)     => dynasm!(asm; mov r14d, edx),
         VarLoc::Reg(r)      => panic!("emit_store_var: unexpected reg {r}"),
     }
 }
@@ -1327,9 +1338,15 @@ fn emit_clause_level(
             // scan_rels is at offset 0 in StratumStage4NativeCtx.
             // scan_rels[flat_idx0] → *mut JitRelData  (scan version: total or recent)
             //
-            // r12 = count (JitRelData.len @ 8)
-            // r13 = data_ptr (JitRelData.data @ 0) — needed for both total and recent
-            // r14 = loop counter i
+            // use_recent=true  (pointer-based loop, r14 freed for var assignment):
+            //   r13 = current tuple_ptr (advances by stride each iteration)
+            //   r12 = end_ptr (= data + len*stride; loop terminates when r13 >= r12)
+            //   r14 = available for variable assignment
+            //
+            // use_recent=false (index-based loop, r13 freed for var assignment):
+            //   r12 = count (JitRelData.len @ 8)
+            //   r13 = available for variable assignment
+            //   r14 = loop counter i
 
             // Load scan_rel for clause 0
             dynasm!(asm
@@ -1346,36 +1363,34 @@ fn emit_clause_level(
             );
 
             if use_recent {
-                // r13 is reserved for the data ptr (excluded from variable registers when
-                // use_recent0=true by compute_var_locs).  Cache it here to avoid reloading.
-                dynasm!(asm; mov r13, [rdi]);   // JitRelData.data @ 0
+                // Pointer-based outer loop: r13 = current_ptr, r12 = end_ptr.
+                // r14 is freed — available for variable assignment in compute_var_locs.
+                dynasm!(asm; mov r13, [rdi]);               // r13 = data (start_ptr)
+                dynasm!(asm; imul r12, r12, stride);        // r12 = len * stride
+                dynasm!(asm; add r12, r13);                 // r12 = end_ptr
             } else {
-                // total scan: r13 may hold a variable, so we cannot use it for data_ptr.
-                // Cache data_ptr in a stack slot before the loop to avoid the 4-load
-                // pointer chain (ctx → scan_rels → JitRelData → data) on every iteration.
+                // Index-based outer loop: r12 = count, r14 = counter.
+                // r13 may hold a variable — cache data_ptr in a stack slot instead.
                 let dp0 = data_ptr0_slot(p.var_count, p.max_head_arity, p.max_depth);
                 dynasm!(asm
                     ; mov rax, [rdi]                    // JitRelData.data @ 0
                     ; mov [rbp + dp0], rax              // cache data_ptr
                 );
+                dynasm!(asm; xor r14d, r14d);           // i = 0
             }
-
-            dynasm!(asm; xor r14d, r14d);  // i = 0
 
             let loop_hdr = asm.new_dynamic_label();
             let outer_continue = asm.new_dynamic_label();
 
             dynasm!(asm; =>loop_hdr);
-            dynasm!(asm; cmp r14, r12; jge =>outer_exit);
 
             if use_recent {
-                // recent: tuple_ptr = r13 + i * stride (r13 = recent.data cached above)
-                dynasm!(asm
-                    ; imul rcx, r14, stride
-                    ; lea rax, [r13 + rcx]          // rax = tuple_ptr
-                );
+                // Pointer-based: compare current_ptr against end_ptr.
+                dynasm!(asm; cmp r13, r12; jge =>outer_exit);
+                dynasm!(asm; mov rax, r13);             // rax = current tuple_ptr
             } else {
-                // total: load data_ptr from stack cache (1 load vs 4-load chain)
+                // Index-based: compare counter against count.
+                dynasm!(asm; cmp r14, r12; jge =>outer_exit);
                 let dp0 = data_ptr0_slot(p.var_count, p.max_head_arity, p.max_depth);
                 dynasm!(asm
                     ; mov rax, [rbp + dp0]              // data_ptr (cached before loop)
@@ -1407,7 +1422,11 @@ fn emit_clause_level(
             }
 
             dynasm!(asm; =>outer_continue);
-            dynasm!(asm; inc r14; jmp =>loop_hdr);
+            if use_recent {
+                dynasm!(asm; add r13, stride; jmp =>loop_hdr);
+            } else {
+                dynasm!(asm; inc r14; jmp =>loop_hdr);
+            }
         } else {
         // ── Old path: use packed_count / packed_recent_ptr / packed_data_ptr callbacks ──
 
