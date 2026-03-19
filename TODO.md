@@ -538,6 +538,39 @@ ascent_macro ~196µs. All 261 tests pass. fibonacci/triangle unaffected.
 
 **EDB recent rebuild skip (2026-03-19, commit `8b2c8f5`)** — in the EDB advance path, when `self.recent.is_empty() && native.recent.len == 0`, skip the `drop+JitRelData::build_from_packed_no_tupleset` cycle. EDB relations have static facts; after iteration 1, `self.recent` is always empty, so we were paying 3 allocs + 3 frees per EDB relation per iteration for an identical result. **Result (2026-03-19): jit_hot/20 ≈ 79µs, setup ≈ 27µs → eval ≈ 52µs vs ascent_macro ≈ 40µs = ~1.3×. fibonacci/20 ≈ 13µs vs 9µs = ~1.5×. TC/50 ≈ 142µs vs 108µs = ~1.3×.** Significant improvement — the allocator overhead (8.8% of old profile) was the primary remaining bottleneck.
 
+**Analysis of remaining gap (2026-03-19):** After all bookkeeping eliminations, the ~1.3–1.5× residual gap is dominated by JIT inner-loop code quality vs LLVM, not overhead. Specific costs identified:
+
+- **`packed_try_insert` for non-native path (TC/fibonacci)** — asm already probes dedup inline; `packed_try_insert` is only called for genuinely new tuples. It redundantly re-probes (`insert_if_new`) before appending. Replacing with a `packed_insert_no_dedup` helper would save ~5–10 instructions per new tuple. TC/50: ~1225 new tuples across the full run → ~2–4µs total savings. **Below noise floor; not worth implementing.**
+
+- **`jit_dedup.insert` batch in advance (triangle native path)** — 1140 per-tuple hash+insert calls after batch flush, inserting into a pre-sized table (~2048 slots, ~55% load). ~20 cycles/insert × 1140 = ~23K cycles = ~7.5µs per benchmark run. Unavoidable with current architecture (needed for cross-iteration dedup alias). A bulk-load rebuild (knowing all tuples unique) could save the per-slot collision checks, but savings are small (~2–3 instructions per insert at low load factor).
+
+- **Scalar inner-loop column scan vs LLVM vectorized** — triangle inner loop iterates a flat u32 array (col-values in JitColIndex.vals). LLVM auto-vectorizes this with AVX2 (~8 values/iteration); our asm emits scalar. For triangle n=20, each outer iteration scans ~19 values per key → 190 outer × 19 inner = 3610 scalar comparisons. With AVX2 this is ~452 SIMD iterations. Estimated: ~3–5µs savings at n=20, larger gains at higher n. **Clear implementation path: emit `vmovdqu`/`vpcmpeqd`/`vmovmskps` for the contiguous values scan in `asm_codegen.rs`. ~150 lines.**
+
+- **Hash probe overhead (JitColIndex key lookup)** — JitColIndex uses FxHash (Knuth multiply) for key→bucket lookup. `ascent_macro` uses `std::collections::HashMap` which LLVM can inline and optimize more aggressively. At ~190 outer iterations × 1 key probe each = 190 probes total — probably only 1–2µs at most.
+
+- **`JitTupleSet` existence check (triangle level-2 clause)** — native asm probes `edge.total.tuple_set` for (a,c) using a 2-word hash + open-address probe. `ascent_macro` probes a Rust `HashSet<(u32,u32)>` that LLVM has inlined and optimized. Comparable per-probe cost, but LLVM may use SIMD for the comparison. Estimated: ~1–2µs gap at n=20.
+
+**Note on JitTupleSet for arity-2 (2026-03-19):** The asm `emit_tuple_set_probe` already supports arity 1–3 and IS used for triangle's level-2 `edge(a,c)` existence check (fully-bound clause, `fresh_cols.is_empty()`). The TODO comment "~0% change for arity-2" was about the old Cranelift `gen_tuple_set_probe_v3` which only handled arity=3; the asm version is more general. The 1.3× benchmark already reflects this O(1) probe.
+
+**Note on `packed_try_insert` elimination (2026-03-19):** Only non-native path (TC, fibonacci) calls `packed_try_insert`, and only for genuinely new tuples (asm already probes dedup inline for duplicates). Eliminating the redundant Rust re-probe would save ~5–10 cycles/new tuple. TC/50: ~1225 new tuples → ~2–4µs total savings. Below noise floor. Not worth implementing.
+
+**perf stat comparison (2026-03-20, n=20 triangle, same binary same run):**
+
+| Metric | jit_hot | ascent_macro | ratio |
+|---|---|---|---|
+| Wall time | ~117µs | ~46µs | **2.5×** |
+| Instructions/iter | 2.92M | 1.03M | **2.83×** |
+| Cycles/iter | 1.51M | 583K | **2.59×** |
+| IPC | 1.93 | 1.77 | — |
+| LLC misses/iter | 6,487 | 64 | **101×** |
+| Branch-misses/iter | 7,636 | 2,100 | 3.6× |
+
+(jit_hot: 40K iterations; ascent_macro: 111K iterations, same perf window size)
+
+The JIT executes **2.83× more instructions** and hits main memory **101× more often** per triangle solve. Despite higher IPC (1.93 vs 1.77 — the CPU is not memory-stalled, it is doing work between misses), the instruction overhead dominates the gap. This is not a bookkeeping problem. The LLC miss rate (6,487 vs 64/iter) reflects hash table probing patterns: JIT probes JitTupleSet + JitColIndex + JitDedupHandle for every inner-loop iteration, each a separate pointer-chase; ascent_macro uses a single LLVM-inlined HashMap per join.
+
+**Conclusion:** The bookkeeping overhead has been reduced to noise level. The remaining gap (2.5× wall-clock, 2.83× instructions) is structural — from the JIT generating more instructions per tuple and having worse cache locality than LLVM-compiled Rust. Closing it further requires either: (a) a smarter hash table design (fewer probes per tuple), (b) SIMD batching of the inner-loop scan (~150 lines, estimated 3–5µs at n=20), or (c) an LLVM-backed JIT. For the LSP use case (incremental eval, small deltas, n≤50), the current ratio may be acceptable.
+
 ### Relation storage optimizations
 
 - [x] **Skip JIT index building for program-wide sink relations** — `jit_is_sink` flag on `PackedStorage`; `update_jit_indices()` returns early when set. 14% improvement on triangle. See above.
