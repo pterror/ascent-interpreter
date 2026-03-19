@@ -561,10 +561,84 @@ fn bench_engine_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+/// Large-n triangle benchmarks with few samples (10) to keep runtime manageable.
+/// Only includes jit_hot, jit_setup_only, and ascent_macro — interpreter and
+/// jit_run_only would take seconds per iteration at these sizes.
+fn bench_triangle_large(c: &mut Criterion) {
+    use std::time::Duration;
+    let mut group = c.benchmark_group("triangle_large");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    for &n in &[50usize, 100, 200] {
+        // JIT hot-cache: pre-compile once, share compiled JIT across iterations.
+        #[cfg(feature = "jit")]
+        {
+            let source = triangle_source_no_facts();
+            let (program, _) = prepare_program(&source);
+            let mut warmup = Engine::new(&program);
+            warmup.enable_jit();
+            for i in 1..=n {
+                for j in (i + 1)..=n {
+                    warmup.insert("edge", vec![Value::I32(i as i32), Value::I32(j as i32)]);
+                }
+            }
+            warmup.run(&program);
+            let compiled = warmup.share_jit_compiler().unwrap();
+
+            group.bench_with_input(BenchmarkId::new("jit_hot", n), &n, |b, &n| {
+                b.iter(|| {
+                    let mut engine = Engine::new(&program);
+                    engine.with_jit_compiler(compiled.clone());
+                    for i in 1..=n {
+                        for j in (i + 1)..=n {
+                            engine.insert("edge", vec![Value::I32(i as i32), Value::I32(j as i32)]);
+                        }
+                    }
+                    engine.run(&program);
+                    engine
+                });
+            });
+
+            group.bench_with_input(BenchmarkId::new("jit_setup_only", n), &n, |b, &n| {
+                b.iter(|| {
+                    let mut engine = Engine::new(&program);
+                    engine.with_jit_compiler(compiled.clone());
+                    for i in 1..=n {
+                        for j in (i + 1)..=n {
+                            engine.insert("edge", vec![Value::I32(i as i32), Value::I32(j as i32)]);
+                        }
+                    }
+                    engine
+                });
+            });
+        }
+
+        group.bench_with_input(BenchmarkId::new("ascent_macro", n), &n, |b, &n| {
+            b.iter(|| {
+                ascent! {
+                    relation edge(i32, i32);
+                    relation triangle(i32, i32, i32);
+                    triangle(a, b, c) <-- edge(a, b), edge(b, c), edge(a, c),
+                        if a < b, if b < c;
+                }
+                let mut prog = AscentProgram::default();
+                prog.edge = (1..=n)
+                    .flat_map(|i| ((i + 1)..=n).map(move |j| (i as i32, j as i32)))
+                    .collect();
+                prog.run();
+                prog
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_transitive_closure,
     bench_triangle,
+    bench_triangle_large,
     bench_connected_components,
     bench_fibonacci,
     bench_engine_overhead
