@@ -96,29 +96,6 @@ fn next_pow2_min16(n: usize) -> usize {
     cap
 }
 
-/// Allocate `count` bytes filled with `fill` and return the raw pointer.
-fn alloc_u8_filled(count: usize, fill: u8) -> *mut u8 {
-    if count == 0 {
-        return ptr::NonNull::dangling().as_ptr();
-    }
-    let layout = Layout::array::<u8>(count).expect("layout overflow");
-    let ptr = unsafe { alloc_zeroed(layout) };
-    assert!(!ptr.is_null(), "allocation failed");
-    if fill != 0 {
-        unsafe { ptr::write_bytes(ptr, fill, count) };
-    }
-    ptr
-}
-
-/// Free a `u8` slice previously allocated with `alloc_u8_filled`.
-/// No-op for `count == 0`.
-unsafe fn free_u8_slice(ptr: *mut u8, count: usize) {
-    if count == 0 {
-        return;
-    }
-    let layout = Layout::array::<u8>(count).expect("layout overflow");
-    unsafe { dealloc(ptr, layout) };
-}
 
 // ─── JitColIndex ────────────────────────────────────────────────────────────
 
@@ -494,143 +471,11 @@ impl Drop for JitTupleSet {
     }
 }
 
-// ─── JitSwissTable ──────────────────────────────────────────────────────────
-
-/// Swiss-table existence set for O(1) SIMD-probed membership queries.
-///
-/// Control bytes (1 per slot, packed 16 per cache line) let the JIT check 16
-/// candidates with a single `pcmpeqb`/`pmovmskb` pair before touching tuple
-/// data.  Layout:
-/// - `ctrl[0..cap]`: per-slot tag byte (0xFF = empty, 0x00-0x7F = occupied H2)
-/// - `ctrl[cap..cap+16]`: mirror of ctrl[0..16] for safe SIMD overread at wrap
-/// - `data[0..cap*arity]`: packed tuple data, slot `i` at `data[i*arity]`
-///
-/// Field offsets are fixed and verified by static assertions below.
-#[repr(C)]
-pub struct JitSwissTable {
-    /// Control-byte array (cap + 16 bytes).  0xFF = empty.
-    /// offset 0
-    pub ctrl: *mut u8,
-    /// Packed tuple data (cap * arity u32 words).
-    /// offset 8
-    pub data: *mut u32,
-    /// cap - 1 where cap is a power of two ≥ 16.
-    /// offset 16
-    pub mask: u64,
-}
-
-// Safety: only accessed from the JIT-callback thread.
-unsafe impl Send for JitSwissTable {}
-unsafe impl Sync for JitSwissTable {}
-
-/// SIMD-empty sentinel for `JitSwissTable` control bytes.
-pub const SWISS_EMPTY: u8 = 0xFF;
-
-impl JitSwissTable {
-    /// Null/unbuilt sentinel.
-    pub const NULL: Self = JitSwissTable { ctrl: ptr::null_mut(), data: ptr::null_mut(), mask: 0 };
-
-    pub fn is_null(&self) -> bool { self.ctrl.is_null() }
-
-    /// Build from flat row-major packed data.  `arity` must be in 1–3.
-    ///
-    /// H2 tag = top 7 bits of 32-bit `tuple_hash`, always < 0x80.
-    /// Load factor is kept below 7/8; capacity is next power-of-two ≥ 16.
-    pub fn build(packed: &[u32], arity: usize) -> Self {
-        debug_assert!((1..=3).contains(&arity));
-        let n = packed.len() / arity;
-        let cap = next_pow2_min16((n * 8 / 7) + 1);
-        let mask = (cap - 1) as u64;
-
-        // Control bytes: cap + 16 (extra 16 = SIMD overread guard), all 0xFF.
-        let ctrl = alloc_u8_filled(cap + 16, SWISS_EMPTY);
-        // Tuple data: cap * arity u32s (zeroed for safety; only read on H2 match).
-        let data = alloc_u32_zeroed(cap * arity);
-
-        let st = JitSwissTable { ctrl, data, mask };
-
-        // Insert all tuples.
-        for i in 0..n {
-            let tuple = &packed[i * arity..(i + 1) * arity];
-            st.insert(tuple, arity, cap);
-        }
-
-        // Mirror first 16 control bytes at [cap..cap+16] for safe wrap-around reads.
-        unsafe { ptr::copy_nonoverlapping(ctrl, ctrl.add(cap), 16) };
-
-        st
-    }
-
-    /// Insert a single tuple (no dedup check — caller must ensure uniqueness).
-    fn insert(&self, tuple: &[u32], arity: usize, _cap: usize) {
-        let h = tuple_hash(tuple);
-        let h2 = (h >> 25) as u8; // top 7 bits, always 0x00-0x7F
-        let mask = self.mask as usize;
-
-        // Group-aligned probe start.
-        let mut group = (h as usize & mask) & !15;
-        loop {
-            for bit in 0..16 {
-                let slot = (group + bit) & mask;
-                let cb = unsafe { *self.ctrl.add(slot) };
-                if cb == SWISS_EMPTY {
-                    unsafe {
-                        *self.ctrl.add(slot) = h2;
-                        for (j, &word) in tuple.iter().enumerate().take(arity) {
-                            *self.data.add(slot * arity + j) = word;
-                        }
-                    }
-                    return;
-                }
-            }
-            group = (group + 16) & mask;
-            debug_assert_ne!(group, (h as usize & mask) & !15, "JitSwissTable: full table");
-        }
-    }
-
-    /// Rust-side membership check (for tests / correctness verification).
-    pub unsafe fn contains(&self, tuple: &[u32]) -> bool {
-        if self.ctrl.is_null() { return false; }
-        let arity = tuple.len();
-        let h = tuple_hash(tuple);
-        let h2 = (h >> 25) as u8;
-        let mask = self.mask as usize;
-        let cap = mask + 1;
-        let mut group = (h as usize & mask) & !15;
-        loop {
-            for bit in 0..16 {
-                let slot = (group + bit) & mask;
-                let cb = unsafe { *self.ctrl.add(slot) };
-                if cb == SWISS_EMPTY { return false; }
-                if cb == h2 {
-                    let matches = (0..arity)
-                        .all(|j| unsafe { *self.data.add(slot * arity + j) == tuple[j] });
-                    if matches { return true; }
-                }
-            }
-            group = (group + 16) & mask;
-            if group == (h as usize & mask) & !15 { return false; } // full scan
-            let _ = cap;
-        }
-    }
-
-    /// Free owned allocations.  No-op if null.
-    pub unsafe fn free(&mut self, arity: usize) {
-        if self.ctrl.is_null() { return; }
-        let cap = (self.mask + 1) as usize;
-        unsafe { free_u8_slice(self.ctrl, cap + 16) };
-        if arity > 0 {
-            unsafe { free_u32_slice(self.data, cap * arity) };
-        }
-        *self = JitSwissTable::NULL;
-    }
-}
-
 // ─── JitRelData ─────────────────────────────────────────────────────────────
 
 /// One relation version (total, delta, or new).
 ///
-/// Layout (C-visible, 88 bytes):
+/// Layout (C-visible, 64 bytes):
 /// - offset  0: `data`        (*mut u32)
 /// - offset  8: `len`         (u64)
 /// - offset 16: `cap`         (u64)
@@ -638,9 +483,8 @@ impl JitSwissTable {
 /// - offset 32: `tuple_set`   (JitTupleSet, 24 bytes)
 /// - offset 56: `arity`       (u32)
 /// - offset 60: `_pad`        (u32)
-/// - offset 64: `swiss`       (JitSwissTable, 24 bytes) — SIMD existence probe
 ///
-/// Private fields follow at offset 88 (not visible to JIT code).
+/// Private fields follow at offset 64 (not visible to JIT code).
 #[repr(C)]
 pub struct JitRelData {
     /// Packed tuples, row-major, stride = arity.
@@ -663,11 +507,7 @@ pub struct JitRelData {
     pub arity: u32,
     #[doc(hidden)]
     pub _pad: u32,
-    /// SIMD Swiss-table existence probe (for fully-bound body-clause checks on `total`).
-    /// Built for arity 1–3 when `build_tuple_set=true`; null otherwise.
-    /// offset 64  (JitSwissTable is 24 bytes → ends at 88)
-    pub swiss: JitSwissTable,
-    // ── private fields beyond the 88-byte C region ───────────────────────
+    // ── private fields beyond the 64-byte C region ───────────────────────
     // Total words allocated in tuple_set.slots (cap_in_slots * (arity + 1)).
     // Used by Drop to reconstruct the layout for dealloc.
     // Sentinel value `usize::MAX` means the slots are aliased (not owned) and
@@ -690,7 +530,6 @@ impl JitRelData {
             tuple_set: JitTupleSet::new_empty(),
             arity: arity as u32,
             _pad: 0,
-            swiss: JitSwissTable::NULL,
             _ts_slots_words: 0,
         })
     }
@@ -741,16 +580,6 @@ impl JitRelData {
             (ptr::null_mut(), 0u64, 0u64, 0usize)
         };
 
-        // ── Swiss table ───────────────────────────────────────────────────
-        // SIMD existence probe for fully-bound body clauses.  Built alongside
-        // tuple_set for arity 1–2; null for arity 0, 3+.  (SIMD probe only
-        // supports arity 1–2; building for arity 3 is pure waste.)
-        let swiss = if build_tuple_set && (1..=2).contains(&arity) {
-            JitSwissTable::build(data, arity)
-        } else {
-            JitSwissTable::NULL
-        };
-
         // ── column index pointer array ────────────────────────────────────
         // We allocate an array of `arity` raw pointers.  `*mut *mut JitColIndex`
         // has the same size as `*mut usize` on the target, so we allocate
@@ -786,7 +615,6 @@ impl JitRelData {
             },
             arity: arity as u32,
             _pad: 0,
-            swiss,
             _ts_slots_words: ts_slots_words,
         })
     }
@@ -1078,9 +906,6 @@ impl Drop for JitRelData {
             unsafe { free_u32_slice(self.tuple_set.slots, cap * stride) };
             self.tuple_set.slots = ptr::null_mut();
         }
-
-        // Free Swiss table (if not null).
-        unsafe { self.swiss.free(arity) };
     }
 }
 
@@ -1182,13 +1007,6 @@ pub(crate) unsafe fn clone_jit_rel_data_with_indices(
         ptr::null_mut()
     };
 
-    // ── Swiss table ──────────────────────────────────────────────────────────
-    // Do not rebuild in clone: for small hot tables the SIMD probe adds
-    // overhead vs scalar, and the rebuild cost (2 mallocs + N inserts) is
-    // paid every solve.  The JitTupleSet covers correctness; Swiss is an
-    // optional fast path that can be rebuilt on-demand if ever needed.
-    let swiss = JitSwissTable::NULL;
-
     Box::new(JitRelData {
         data: data_ptr,
         len: src.len,
@@ -1197,7 +1015,6 @@ pub(crate) unsafe fn clone_jit_rel_data_with_indices(
         tuple_set: JitTupleSet { slots: ts_slots, mask: ts_mask, len: ts_len },
         arity: src.arity,
         _pad: 0,
-        swiss,
         _ts_slots_words: ts_slots_words,
     })
 }
@@ -1360,20 +1177,13 @@ const _: () = {
     assert!(offset_of!(JitTupleSet, len) == 16);
     assert!(size_of::<JitTupleSet>() == 24);
 
-    // ── JitSwissTable (24 bytes) ──────────────────────────────────────────
-    assert!(offset_of!(JitSwissTable, ctrl) == 0);
-    assert!(offset_of!(JitSwissTable, data) == 8);
-    assert!(offset_of!(JitSwissTable, mask) == 16);
-    assert!(size_of::<JitSwissTable>() == 24);
-
-    // ── JitRelData C-visible region (first 88 bytes) ──────────────────────
+    // ── JitRelData C-visible region (first 64 bytes) ──────────────────────
     assert!(offset_of!(JitRelData, data) == 0);
     assert!(offset_of!(JitRelData, len) == 8);
     assert!(offset_of!(JitRelData, cap) == 16);
     assert!(offset_of!(JitRelData, col_indices) == 24);
     assert!(offset_of!(JitRelData, tuple_set) == 32);
     assert!(offset_of!(JitRelData, arity) == 56);
-    assert!(offset_of!(JitRelData, swiss) == 64);
-    // Total struct size is 88 (C region) + size_of::<usize>() (private field).
-    assert!(size_of::<JitRelData>() == 88 + size_of::<usize>());
+    // Total struct size is 64 (C region) + size_of::<usize>() (private field).
+    assert!(size_of::<JitRelData>() == 64 + size_of::<usize>());
 };
