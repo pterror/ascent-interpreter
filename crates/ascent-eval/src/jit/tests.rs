@@ -657,6 +657,42 @@ fn test_stage4_multi_rule() {
     );
 }
 
+/// Test the AVX2 SIMD filter path for an `is_col_value` scan with a `<` condition.
+///
+/// `reach(x, z) <-- edge(x, y), edge(y, z) if z < x` — after optimize_body
+/// `if z < x` is pushed to clause 1's conditions (inner col-value scan where z is fresh).
+/// detect_simd_filter should find it and emit the SIMD prefix.
+/// Correctness is verified by comparing against the interpreter.
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stage4_simd_filter_lt() {
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation reach(i32, i32);
+            reach(x, z) <-- edge(x, y), edge(y, z) if z < x;
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![Value::I32(1), Value::I32(2)],
+                vec![Value::I32(2), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(1)],
+                vec![Value::I32(2), Value::I32(1)],
+                vec![Value::I32(1), Value::I32(3)],
+                vec![Value::I32(3), Value::I32(2)],
+                // Add more to potentially exceed 8 elements in one range
+                vec![Value::I32(4), Value::I32(5)],
+                vec![Value::I32(4), Value::I32(6)],
+                vec![Value::I32(4), Value::I32(7)],
+                vec![Value::I32(4), Value::I32(8)],
+                vec![Value::I32(4), Value::I32(9)],
+            ],
+        )],
+        "reach",
+    );
+}
+
 /// Test that the JitTupleSet fast path for fully-bound arity-3 clauses works correctly.
 ///
 /// The rule `result(x) <-- triple(x, y, z), triple(y, z, x)` has:

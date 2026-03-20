@@ -29,6 +29,8 @@
 //!   [base - 4*MAX_DEPTH*8 - 16]           native_total_rels_slot   (NativeCtx.total_rels)
 //!   [base - 4*MAX_DEPTH*8 - 24]           native_head_rels_slot    (NativeCtx.head_rels)
 //!   [base - 4*MAX_DEPTH*8 - 32]           native_head_total_rels_slot (NativeCtx.head_total_rels)
+//!   [base - 4*MAX_DEPTH*8 - 36]           simd_mask_slot (4 bytes, SIMD batch element mask)
+//!   [base - 4*MAX_DEPTH*8 - 68]           simd_vals_slot (32 bytes, SIMD batch u32 values)
 //! ```
 //! where V = var_count, H = max_head_arity, MAX_DEPTH = max nesting depth.
 //!
@@ -206,7 +208,8 @@ fn frame_size(var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 
     //   24     = native ctx array-ptr cache: total_rels + head_rels + head_total_rels (3×8)
     //   8      = guard / alignment slack
     let level_bytes = max_depth * 4 * 8;
-    let raw = 8 + var_count * 4 + max_head_arity * 4 + level_bytes + 8 + 24 + 8;
+    // 36 = 4 (simd_mask_slot) + 32 (simd_vals_slot)
+    let raw = 8 + var_count * 4 + max_head_arity * 4 + level_bytes + 8 + 24 + 36 + 8;
     // Round up to next value ≡ 8 (mod 16)
     let rem = raw % 16;
     let pad = if rem <= 8 { 8 - rem } else { 24 - rem };
@@ -236,6 +239,18 @@ fn native_head_rels_slot(var_count: usize, max_head_arity: usize, max_depth: usi
 /// Precomputed once per rule variant; used by cross-iteration dedup probes in head emission.
 fn native_head_total_rels_slot(var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 {
     data_ptr0_slot(var_count, max_head_arity, max_depth) - 24
+}
+
+/// SIMD batch element mask (4 bytes): 8-bit bitmask of elements passing the vectorized filter.
+/// Used by emit_col_value_simd_prefix to iterate over passing elements in a batch.
+fn simd_mask_slot(var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 {
+    native_head_total_rels_slot(var_count, max_head_arity, max_depth) - 4
+}
+
+/// SIMD batch values (32 bytes): one batch of 8 u32 column values saved to stack.
+/// Indexed as [simd_vals_slot + i*4] where i is the element index (0–7).
+fn simd_vals_slot(var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 {
+    simd_mask_slot(var_count, max_head_arity, max_depth) - 32
 }
 
 // ─── Assembly helpers ─────────────────────────────────────────────────────
@@ -1145,6 +1160,223 @@ fn emit_not_probes(
     Ok(())
 }
 
+// ─── SIMD column filter ───────────────────────────────────────────────────
+
+/// Return the stack slot for `var_id` if it lives on the stack, or None if in a register.
+fn var_loc_stack(var_locs: &[VarLoc], var_id: u32) -> Option<i32> {
+    match var_locs.get(var_id as usize)? {
+        VarLoc::Stack(s) => Some(*s),
+        VarLoc::Reg(_) => None,
+    }
+}
+
+/// How the SIMD comparand is supplied.
+enum SimdComparand {
+    /// Stack slot of an already-bound variable (loaded with `mov r8d, [rbp + slot]`).
+    Var(i32),
+    /// Literal i32 value (loaded with `mov r8d, DWORD n`).
+    Lit(i32),
+}
+
+/// An AVX2-vectorizable `>` or `<` filter on the free column in an `is_col_value` scan.
+///
+/// The SIMD comparison is `vpcmpgtd ymm2, lhs, rhs` where:
+///   `elements_gt = true`  → `lhs = ymm0 (elements)`, `rhs = ymm1 (comparand)` → element > comparand
+///   `elements_gt = false` → `lhs = ymm1 (comparand)`, `rhs = ymm0 (elements)` → element < comparand
+struct SimdFilter {
+    comparand: SimdComparand,
+    elements_gt: bool,
+    /// Index in `clause.conditions` to skip inside the SIMD element body (already filtered).
+    skip_cond: usize,
+}
+
+/// Try to detect a SIMD-filterable `>` or `<` condition on the free column.
+///
+/// Returns `Some(SimdFilter)` when:
+///   - `clause.args[free_col]` is a fresh variable (being bound by this scan).
+///   - One of `clause.conditions` is `CCondition::If(VarBinVar(Lt|Gt, ...) | VarBinLit(...) | LitBinVar(...))`.
+///   - The comparand is a bound variable on the stack or an i32 literal.
+fn detect_simd_filter(clause: &CClause, free_col: usize, var_locs: &[VarLoc]) -> Option<SimdFilter> {
+    // Only applicable when the free column arg is a fresh variable.
+    let free_var = match &clause.args[free_col] {
+        CClauseArg::Var(vid) if clause.fresh_cols.iter().any(|&(c, _)| c == free_col) => *vid,
+        _ => return None,
+    };
+
+    for (idx, cond) in clause.conditions.iter().enumerate() {
+        let CCondition::If(expr) = cond else { continue };
+        let result = match expr {
+            // free_var < v2 → element < bound → elements_gt = false
+            CExpr::VarBinVar(CBinOp::Lt, v1, v2) if *v1 == free_var => {
+                var_loc_stack(var_locs, *v2).map(|s| (SimdComparand::Var(s), false))
+            }
+            // v1 < free_var → free_var > v1 → elements_gt = true
+            CExpr::VarBinVar(CBinOp::Lt, v1, v2) if *v2 == free_var => {
+                var_loc_stack(var_locs, *v1).map(|s| (SimdComparand::Var(s), true))
+            }
+            // free_var > v2 → elements_gt = true
+            CExpr::VarBinVar(CBinOp::Gt, v1, v2) if *v1 == free_var => {
+                var_loc_stack(var_locs, *v2).map(|s| (SimdComparand::Var(s), true))
+            }
+            // v1 > free_var → free_var < v1 → elements_gt = false
+            CExpr::VarBinVar(CBinOp::Gt, v1, v2) if *v2 == free_var => {
+                var_loc_stack(var_locs, *v1).map(|s| (SimdComparand::Var(s), false))
+            }
+            // free_var < n
+            CExpr::VarBinLit(CBinOp::Lt, v, Value::I32(n)) if *v == free_var => {
+                Some((SimdComparand::Lit(*n), false))
+            }
+            // free_var > n
+            CExpr::VarBinLit(CBinOp::Gt, v, Value::I32(n)) if *v == free_var => {
+                Some((SimdComparand::Lit(*n), true))
+            }
+            // n < free_var → free_var > n
+            CExpr::LitBinVar(CBinOp::Lt, Value::I32(n), v) if *v == free_var => {
+                Some((SimdComparand::Lit(*n), true))
+            }
+            // n > free_var → free_var < n
+            CExpr::LitBinVar(CBinOp::Gt, Value::I32(n), v) if *v == free_var => {
+                Some((SimdComparand::Lit(*n), false))
+            }
+            _ => None,
+        };
+        if let Some((comparand, elements_gt)) = result {
+            return Some(SimdFilter { comparand, elements_gt, skip_cond: idx });
+        }
+    }
+    None
+}
+
+/// Emit an AVX2 SIMD prefix loop for an `is_col_value` contiguous scan.
+///
+/// Entry state: r15 = elem_ptr (u32*), rbx = end_ptr (exclusive).
+/// Processes batches of 8 elements at a time using `vpcmpgtd` to filter.
+/// Falls through to `scalar_hdr` when fewer than 8 elements remain.
+///
+/// Element body: for each passing element, binds the free column variable and
+/// recurses into clause level+1 (or emits heads if at the last clause).
+/// Conditions in `clause.conditions[filter.skip_cond]` are skipped (already filtered).
+#[allow(clippy::too_many_arguments)]
+fn emit_col_value_simd_prefix(
+    asm: &mut Assembler,
+    p: &EmitParams<'_>,
+    level: usize,
+    outer_exit: DynamicLabel,
+    scalar_hdr: DynamicLabel,
+    filter: &SimdFilter,
+) -> Result<(), String> {
+    let clause = &p.clauses[level];
+    let free_col = 1 - clause.bound_cols[0];
+    let mask_slot = simd_mask_slot(p.var_count, p.max_head_arity, p.max_depth);
+    let vals_slot = simd_vals_slot(p.var_count, p.max_head_arity, p.max_depth);
+    let simd_hdr = asm.new_dynamic_label();
+    let simd_elem_hdr = asm.new_dynamic_label();
+    let simd_elem_continue = asm.new_dynamic_label();
+
+    // ── SIMD batch loop ───────────────────────────────────────────────────
+    // Precondition: r15 = elem_ptr, rbx = end_ptr.
+    // Jump to scalar_hdr when fewer than 8 elements remain.
+    dynasm!(asm; =>simd_hdr);
+    dynasm!(asm
+        ; lea rdx, [r15 + 32]         // rdx = r15 + 32 (one past last batch element)
+        ; cmp rdx, rbx
+        ; jg =>scalar_hdr             // fewer than 8 elements → fall to scalar tail
+        ; vmovdqu ymm0, [r15]         // ymm0 = 8 u32 column values
+    );
+    // Broadcast the comparand value into ymm1.
+    // Store comparand to simd_mask_slot temporarily (will be overwritten with the actual mask).
+    // vpbroadcastd with mem32 source avoids the vmovd r32→xmm→ymm sequence.
+    match &filter.comparand {
+        SimdComparand::Var(slot) => dynasm!(asm
+            ; mov eax, [rbp + *slot]
+            ; mov [rbp + mask_slot], eax
+        ),
+        SimdComparand::Lit(n) => dynasm!(asm
+            ; mov eax, DWORD *n
+            ; mov [rbp + mask_slot], eax
+        ),
+    }
+    dynasm!(asm
+        ; vmovdqu ymm0, [r15]                      // load 8 u32 column values
+        ; vpbroadcastd ymm1, [rbp + mask_slot]     // broadcast comparand (32-bit mem source)
+    );
+    // Signed compare: vpcmpgtd sets lane to 0xFFFFFFFF where lhs > rhs, else 0.
+    if filter.elements_gt {
+        dynasm!(asm; vpcmpgtd ymm2, ymm0, ymm1); // element > comparand
+    } else {
+        dynasm!(asm; vpcmpgtd ymm2, ymm1, ymm0); // comparand > element ⟺ element < comparand
+    }
+    // Extract the high bit of each 32-bit float lane as an 8-bit mask.
+    // vmovmskps eax, ymm2 encoded as raw bytes: VEX.256.0F 50 /r
+    //   C4 E1 7C 50 C2  →  vmovmskps eax, ymm2
+    dynasm!(asm; .bytes [0xC4u8, 0xE1, 0x7C, 0x50, 0xC2]);
+    dynasm!(asm
+        ; vmovdqu [rbp + vals_slot], ymm0  // save batch values to stack
+        ; vzeroupper                        // clear YMM upper halves before any Rust calls
+        ; mov [rbp + mask_slot], eax        // overwrite temp comparand with actual mask
+        ; add r15, 32                       // advance elem_ptr to next batch
+    );
+
+    // ── SIMD element body loop ────────────────────────────────────────────
+    // r15 = next-batch ptr (callee-saved, survives Rust calls).
+    // rbx = end_ptr (callee-saved, survives Rust calls).
+    // [rbp + mask_slot]: 8-bit mask of remaining passing elements for this batch.
+    // [rbp + vals_slot]: saved u32 values for this batch.
+    dynasm!(asm; =>simd_elem_hdr);
+    dynasm!(asm
+        ; mov eax, [rbp + mask_slot]
+        ; test eax, eax
+        ; jz =>simd_hdr               // batch exhausted → fetch next
+        ; bsf r10d, eax               // r10d = index of lowest set bit (0–7)
+        ; btr eax, r10d               // clear that bit
+        ; mov [rbp + mask_slot], eax
+        ; lea r9, [rbp + vals_slot]
+        ; mov ecx, [r9 + r10*4]       // ecx = element value at index r10
+    );
+
+    // Bind the free column variable from ecx (fresh → store; bound → compare+skip).
+    emit_bind_col_value(asm, clause, free_col, simd_elem_continue, p.var_locs)?;
+
+    // Emit conditions, skipping the one already handled by SIMD.
+    for (idx, cond) in clause.conditions.iter().enumerate() {
+        if idx == filter.skip_cond { continue; }
+        if let CCondition::If(expr) = cond {
+            emit_expr(asm, expr, p.var_locs)?;
+            dynasm!(asm; test eax, eax; jz =>simd_elem_continue);
+        }
+    }
+
+    // Emit level+1 body or (if last clause) rule conditions and heads.
+    if level + 1 == p.clauses.len() {
+        for expr in p.rule_conds {
+            emit_expr(asm, expr, p.var_locs)?;
+            dynasm!(asm; test eax, eax; jz =>simd_elem_continue);
+        }
+        emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, simd_elem_continue)?;
+        emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
+    } else {
+        let simd_sub_exhausted = asm.new_dynamic_label();
+        emit_clause_level(asm, p, level + 1, outer_exit, simd_sub_exhausted)?;
+
+        // When the level+1 body exhausts, restore r15/rbx from the slots written
+        // by level+1's entry code (lines that save r15/rbx when level >= 2).
+        // At entry to the element body: r15 = next_batch_ptr, rbx = end_ptr.
+        // Level+1 saves these and simd_sub_exhausted restores them.
+        dynasm!(asm; =>simd_sub_exhausted);
+        let node_slot = level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+        let dptr_slot = level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+        dynasm!(asm
+            ; mov r15, [rbp + node_slot]
+            ; mov rbx, [rbp + dptr_slot]
+        );
+    }
+
+    dynasm!(asm; =>simd_elem_continue);
+    dynasm!(asm; jmp =>simd_elem_hdr);
+
+    Ok(())
+}
+
 /// Emit code for clause `level` and all deeper clauses.
 ///
 /// `outer_exit`:    label to jump to when the level-0 loop is completely done.
@@ -1651,6 +1883,15 @@ fn emit_clause_level(
 
             let inner_hdr = asm.new_dynamic_label();
             let inner_continue = asm.new_dynamic_label();
+
+            // SIMD prefix: emit before scalar tail when a filterable condition exists
+            // on the free column.  Falls through to inner_hdr when <8 elements remain.
+            if is_col_value {
+                let free_col = 1 - clause.bound_cols[0];
+                if let Some(ref sf) = detect_simd_filter(clause, free_col, p.var_locs) {
+                    emit_col_value_simd_prefix(asm, p, level, outer_exit, inner_hdr, sf)?;
+                }
+            }
 
             dynasm!(asm; =>inner_hdr);
             if is_col_value {
