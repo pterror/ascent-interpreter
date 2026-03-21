@@ -512,7 +512,6 @@ fn emit_tuple_set_probe(
 //   r11  = vals ptr      (scratch)
 //   r10d = secondary key (scratch)
 //   r15, rbx = scan ptr / count (saved by level >= 2 entry; free at level 1)
-#[allow(dead_code)]
 fn emit_native_edb_full_probe(
     asm: &mut Assembler,
     p: &EmitParams<'_>,
@@ -594,11 +593,12 @@ fn emit_native_edb_full_probe(
         ; mov r11, [r8 + 16]      // vals ptr
     );
 
-    // Set up scan: r15 = &vals[start], rbx = count
-    // (r15/rbx are either unused at level 1, or saved at level >= 2 entry.)
+    // Check count is non-zero and compute hi before loading secondary key
+    // (secondary key load may clobber eax which holds count).
     dynasm!(asm
-        ; lea r15, [r11 + rsi*4]  // r15 = &vals[start]
-        ; mov rbx, rax             // rbx = count
+        ; test eax, eax
+        ; jz =>when_not_found               // count == 0: not in relation
+        ; lea edx, [rsi + rax - 1]          // edx = hi = start + count - 1
     );
 
     // Load secondary key → r10d  (emit_load_var writes eax; move to r10d)
@@ -617,26 +617,363 @@ fn emit_native_edb_full_probe(
         }
     }
 
-    // Linear scan: vals[start..start+count] for secondary key.
-    // Sequential access through a contiguous u32 array (≤200 bytes for n≤50,
-    // always L1-resident) is vastly cheaper than a random hash-table probe.
-    let scan_loop  = asm.new_dynamic_label();
-    let scan_found = asm.new_dynamic_label();
+    // Binary search: vals[lo..=hi] for secondary key (target = r10d).
+    //
+    // Registers:
+    //   esi  = lo  (start index, updated each iteration)
+    //   edx  = hi  (end index, updated each iteration)
+    //   ecx  = mid (= (lo+hi)/2 each iteration)
+    //   eax  = vals[mid]  (scratch)
+    //   r10d = target (secondary key)
+    //   r11  = vals base ptr
+    //
+    // vals is sorted ascending (JitColIndex invariant), so binary search
+    // terminates in ceil(log₂(count)) ≤ 7 iterations for count ≤ 99.
+    // The ~400-byte slice for a fixed primary key is L1-resident after the
+    // first probe, making each subsequent probe essentially free.
+    let bsearch_loop  = asm.new_dynamic_label();
+    let bsearch_right = asm.new_dynamic_label();
+    let bsearch_found = asm.new_dynamic_label();
 
     dynasm!(asm
-        ; test rbx, rbx
-        ; jz =>when_not_found        // count == 0: not in relation
-        ; =>scan_loop
-        ; mov eax, [r15]             // load current val
+        ; =>bsearch_loop
+        ; cmp esi, edx
+        ; jg =>when_not_found               // lo > hi: not found
+        ; lea ecx, [rsi + rdx]
+        ; shr ecx, 1                        // mid = (lo + hi) / 2
+        ; mov eax, [r11 + rcx*4]            // val = vals[mid]
         ; cmp eax, r10d
-        ; je =>scan_found
-        ; add r15, 4
-        ; dec rbx
-        ; jnz =>scan_loop
-        ; jmp =>when_not_found       // exhausted without finding
-        ; =>scan_found
+        ; je =>bsearch_found                // hit: fall through
+        ; jl =>bsearch_right                // val < target → search right half
+        ; lea edx, [rcx - 1]               // hi = mid - 1
+        ; jmp =>bsearch_loop
+        ; =>bsearch_right
+        ; lea esi, [rcx + 1]               // lo = mid + 1
+        ; jmp =>bsearch_loop
+        ; =>bsearch_found
     );
 
+    Ok(())
+}
+
+// ─── Merge intersection ───────────────────────────────────────────────────
+
+/// Detected pattern for a two-pointer sorted-merge intersection.
+///
+/// Fuses a col-scan level L (arity-2 EDB, one fresh col) with a fully-bound
+/// existence-check level L+1 (arity-2 EDB, no fresh cols) into a single
+/// two-pointer sorted-merge loop that eliminates the per-element hash probe.
+///
+/// Both relations must be native-path EDB (JitColIndex sorted vals arrays).
+struct MergePattern {
+    /// Flat handle index for the scan relation at level L (includes use_recent).
+    scan_flat_idx: usize,
+    /// Primary column for JitColIndex probe on the scan relation.
+    scan_primary_col: usize,
+    /// Flat handle index for the existence relation at level L+1 (always total).
+    exist_flat_idx: usize,
+    /// Primary column for JitColIndex probe on the existence relation.
+    exist_primary_col: usize,
+    /// Variable ID of the key for the existence probe (bound before level L).
+    exist_key_var: u32,
+    /// Variable ID bound as the fresh column from the scan level.
+    fresh_var: u32,
+    /// Index of level L+1 (the existence check level).
+    exist_level: usize,
+}
+
+/// Detect whether levels [level, level+1] form a merge-intersectable pattern.
+fn detect_merge_pattern(p: &EmitParams<'_>, level: usize) -> Option<MergePattern> {
+    if !p.use_jit_native {
+        return None;
+    }
+    let clause_l = &p.clauses[level];
+    if clause_l.args.len() != 2 || p.is_rec[level] {
+        return None;
+    }
+    // Scan level: exactly one fresh col (the col we iterate over).
+    if clause_l.fresh_cols.len() != 1 || clause_l.bound_cols.is_empty() {
+        return None;
+    }
+    let exist_level = level + 1;
+    if exist_level >= p.clauses.len() {
+        return None;
+    }
+    let clause_l1 = &p.clauses[exist_level];
+    if clause_l1.args.len() != 2 || p.is_rec[exist_level] {
+        return None;
+    }
+    // Existence check: fully-bound, total version.
+    if !clause_l1.fresh_cols.is_empty() || p.use_recent[exist_level] {
+        return None;
+    }
+    let (_, fresh_var_l) = clause_l.fresh_cols[0];
+    let scan_primary_col = clause_l.bound_cols[0];
+    // Classify clause_l1's args: one must be fresh_var_l (the merge key),
+    // the other must be a different Var (the key for the existence probe).
+    let (exist_primary_col, exist_key_var) = match (&clause_l1.args[0], &clause_l1.args[1]) {
+        (CClauseArg::Var(v0), CClauseArg::Var(v1)) => {
+            if *v1 == fresh_var_l && *v0 != fresh_var_l {
+                (0usize, *v0)
+            } else if *v0 == fresh_var_l && *v1 != fresh_var_l {
+                (1usize, *v1)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let scan_flat_idx =
+        p.rule_handle_base + level * 2 + if p.use_recent[level] { 1 } else { 0 };
+    let exist_flat_idx = p.rule_handle_base + exist_level * 2; // total (use_recent=false)
+    Some(MergePattern {
+        scan_flat_idx,
+        scan_primary_col,
+        exist_flat_idx,
+        exist_primary_col,
+        exist_key_var,
+        fresh_var: fresh_var_l,
+        exist_level,
+    })
+}
+
+/// Emit a two-pointer sorted-merge intersection loop.
+///
+/// Replaces the col-scan at `level` and the existence check at `level+1`.
+/// For each (key_b, key_a) pair already established, probes both JitColIndex
+/// sorted slices once and walks them with two pointers in O(|A|+|B|) steps,
+/// binding the matched value as `fresh_var` and emitting heads (or deeper levels)
+/// for each hit.
+///
+/// Register contract during the merge loop:
+///   r15 = ptr_b: advancing pointer into scan vals slice
+///   rbx = end_b: end of scan vals slice (fixed)
+///   [rbp + ptr_a_slot] = ptr_a: advancing pointer into exist vals slice
+///   [rbp + end_a_slot] = end_a: end of exist vals slice (fixed)
+#[allow(clippy::too_many_arguments)]
+fn emit_merge_scan_exist(
+    asm: &mut Assembler,
+    p: &EmitParams<'_>,
+    level: usize,
+    outer_exit: DynamicLabel,
+    when_exhausted: DynamicLabel,
+    mp: &MergePattern,
+) -> Result<(), String> {
+    // Reuse per-level stack slots for ptr_a and end_a.
+    // level_vptr_slot  → ptr_a (current position in exist vals slice)
+    // level_count_slot → end_a (fixed end of exist vals slice)
+    let ptr_a_slot = level_vptr_slot(level, p.var_count, p.max_head_arity);
+    let end_a_slot = level_count_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+    let exist_flat_idx_i32 = (mp.exist_flat_idx * 8) as i32;
+    let scan_flat_idx_i32 = (mp.scan_flat_idx * 8) as i32;
+
+    // ── Step 1: Probe existence relation for key_a → load vals_a slice ──────
+    // Load JitRelData* for existence rel → rdi
+    dynasm!(asm
+        ; mov rdi, [rbp + CTX_SLOT]
+        ; mov rdi, [rdi]                              // scan_rels ptr (NativeCtx offset 0)
+        ; mov rdi, [rdi + exist_flat_idx_i32]         // *mut JitRelData for exist rel
+    );
+    let exist_pcol_off = (mp.exist_primary_col * 8) as i32;
+    dynasm!(asm
+        ; mov r8, [rdi + 24]                          // col_indices: *mut *mut JitColIndex
+        ; mov r8, [r8 + exist_pcol_off]               // JitColIndex* for exist_primary_col
+    );
+    // Load exist key into ecx
+    emit_load_var_ecx(asm, p.var_locs, mp.exist_key_var);
+    // Hash probe JitColIndex: slot = (key * KNUTH32) & mask
+    dynasm!(asm
+        ; mov eax, ecx
+        ; imul eax, eax, 0x9e3779b9u32 as i32
+        ; mov edx, [r8 + 24]                          // JitColIndex.mask
+        ; and eax, edx                                 // slot = hash & mask
+        ; mov r9, [r8]                                 // keys ptr
+    );
+    let probe_a_lp  = asm.new_dynamic_label();
+    let probe_a_hit = asm.new_dynamic_label();
+    dynasm!(asm; =>probe_a_lp);
+    dynasm!(asm
+        ; mov esi, [r9 + rax*4]
+        ; cmp esi, -1i32
+        ; je =>when_exhausted          // key absent: no intersection possible
+        ; cmp esi, ecx
+        ; je =>probe_a_hit
+        ; inc eax
+        ; and eax, edx
+        ; jmp =>probe_a_lp
+    );
+    dynasm!(asm; =>probe_a_hit);
+    // ranges[slot] = start(lo32) | count(hi32)
+    dynasm!(asm
+        ; mov r11, [r8 + 8]            // ranges ptr
+        ; mov r11, [r11 + rax*8]       // ranges[slot]
+        ; mov esi, r11d                // start_a = lo32
+        ; shr r11, 32
+        ; mov eax, r11d                // count_a = hi32
+        ; mov r11, [r8 + 16]           // vals_a ptr
+    );
+    dynasm!(asm; test eax, eax; jz =>when_exhausted);
+    // ptr_a = vals_a + start_a*4;  end_a = ptr_a + count_a*4
+    // (rsi = start_a u32 zero-extended; rax = count_a u32 zero-extended)
+    dynasm!(asm
+        ; lea rcx, [r11 + rsi*4]       // ptr_a
+        ; mov [rbp + ptr_a_slot], rcx
+        ; lea rax, [rcx + rax*4]       // end_a = ptr_a + count_a*4
+        ; mov [rbp + end_a_slot], rax
+    );
+
+    // ── Step 2: Probe scan relation for key_b → r15=ptr_b, rbx=end_b ────────
+    dynasm!(asm
+        ; mov rdi, [rbp + CTX_SLOT]
+        ; mov rdi, [rdi]
+        ; mov rdi, [rdi + scan_flat_idx_i32]          // *mut JitRelData for scan rel
+    );
+    let scan_pcol_off = (mp.scan_primary_col * 8) as i32;
+    dynasm!(asm
+        ; mov r8, [rdi + 24]
+        ; mov r8, [r8 + scan_pcol_off]                // JitColIndex* for scan_primary_col
+    );
+    // Load scan key into ecx
+    let scan_clause = &p.clauses[level];
+    match &scan_clause.args[mp.scan_primary_col] {
+        CClauseArg::Var(var_id) => emit_load_var_ecx(asm, p.var_locs, *var_id),
+        CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+            let n = *n;
+            dynasm!(asm; mov ecx, n);
+        }
+        _ => return Err("emit_merge: unsupported scan key arg type".to_string()),
+    }
+    // Hash probe
+    dynasm!(asm
+        ; mov eax, ecx
+        ; imul eax, eax, 0x9e3779b9u32 as i32
+        ; mov edx, [r8 + 24]
+        ; and eax, edx
+        ; mov r9, [r8]
+    );
+    let probe_b_lp  = asm.new_dynamic_label();
+    let probe_b_hit = asm.new_dynamic_label();
+    dynasm!(asm; =>probe_b_lp);
+    dynasm!(asm
+        ; mov esi, [r9 + rax*4]
+        ; cmp esi, -1i32
+        ; je =>when_exhausted
+        ; cmp esi, ecx
+        ; je =>probe_b_hit
+        ; inc eax
+        ; and eax, edx
+        ; jmp =>probe_b_lp
+    );
+    dynasm!(asm; =>probe_b_hit);
+    dynasm!(asm
+        ; mov r11, [r8 + 8]
+        ; mov r11, [r11 + rax*8]
+        ; mov esi, r11d
+        ; shr r11, 32
+        ; mov eax, r11d
+        ; mov r11, [r8 + 16]
+    );
+    dynasm!(asm; test eax, eax; jz =>when_exhausted);
+    // r15 = ptr_b = vals_b + start_b*4;  rbx = end_b = ptr_b + count_b*4
+    dynasm!(asm
+        ; lea r15, [r11 + rsi*4]
+        ; lea rbx, [r15 + rax*4]
+    );
+
+    // ── Step 3: Two-pointer sorted merge loop ────────────────────────────────
+    // Each iteration: compare *ptr_b vs *ptr_a
+    //   equal   → match: bind fresh_var, emit body, advance both
+    //   b < a   → advance ptr_b (scan pointer)
+    //   b > a   → advance ptr_a (exist pointer, in [rbp + ptr_a_slot])
+    let merge_loop  = asm.new_dynamic_label();
+    let merge_adv_b = asm.new_dynamic_label();
+    let merge_match = asm.new_dynamic_label();
+    let merge_cont  = asm.new_dynamic_label();
+
+    dynasm!(asm; =>merge_loop);
+    // Bounds checks
+    dynasm!(asm; cmp r15, rbx; jge =>when_exhausted);        // ptr_b >= end_b
+    dynasm!(asm
+        ; mov rax, [rbp + ptr_a_slot]
+        ; cmp rax, [rbp + end_a_slot]
+        ; jge =>when_exhausted                                // ptr_a >= end_a
+    );
+    // Compare elements (rax still = ptr_a)
+    dynasm!(asm
+        ; mov ecx, [r15]               // b_val = *ptr_b
+        ; mov r10d, [rax]              // a_val = *ptr_a
+        ; cmp ecx, r10d
+        ; je =>merge_match
+        ; jl =>merge_adv_b
+        // b_val > a_val: advance ptr_a
+        ; add rax, 4
+        ; mov [rbp + ptr_a_slot], rax
+        ; jmp =>merge_loop
+    );
+    dynasm!(asm; =>merge_adv_b);
+    dynasm!(asm; add r15, 4; jmp =>merge_loop);
+
+    dynasm!(asm; =>merge_match);
+    // Bind fresh_var = ecx (the matched value)
+    dynasm!(asm; mov edx, ecx);
+    emit_store_var(asm, p.var_locs, mp.fresh_var);
+
+    // Clause L conditions
+    for cond in &scan_clause.conditions {
+        if let CCondition::If(expr) = cond {
+            emit_expr(asm, expr, p.var_locs)?;
+            dynasm!(asm; test eax, eax; jz =>merge_cont);
+        }
+    }
+    // Clause L+1 conditions (existence check may carry additional filters)
+    let exist_clause = &p.clauses[mp.exist_level];
+    for cond in &exist_clause.conditions {
+        if let CCondition::If(expr) = cond {
+            emit_expr(asm, expr, p.var_locs)?;
+            dynasm!(asm; test eax, eax; jz =>merge_cont);
+        }
+    }
+
+    if mp.exist_level + 1 == p.clauses.len() {
+        // Terminal: emit rule-level conditions, anti-joins, and heads.
+        for expr in p.rule_conds {
+            emit_expr(asm, expr, p.var_locs)?;
+            dynasm!(asm; test eax, eax; jz =>merge_cont);
+        }
+        emit_not_probes(
+            asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, merge_cont,
+        )?;
+        emit_heads(
+            asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth,
+            p.pti, p.var_locs, p.use_jit_native, p.rule_head_base,
+            p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr,
+        )?;
+    } else {
+        // Non-terminal: recurse into deeper level (exist_level+1).
+        // emit_clause_level(exist_level+1) will save r15/rbx at its top
+        // (since exist_level+1 >= 2 when level >= 1) and sub_exhausted restores them.
+        let sub_exhausted = asm.new_dynamic_label();
+        emit_clause_level(asm, p, mp.exist_level + 1, outer_exit, sub_exhausted)?;
+        dynasm!(asm; =>sub_exhausted);
+        let node_slot =
+            level_node_save_slot(mp.exist_level, p.var_count, p.max_head_arity, p.max_depth);
+        let dptr_slot =
+            level_dptr_save_slot(mp.exist_level, p.var_count, p.max_head_arity, p.max_depth);
+        dynasm!(asm
+            ; mov r15, [rbp + node_slot]
+            ; mov rbx, [rbp + dptr_slot]
+        );
+    }
+
+    // merge_cont: advance both pointers, then loop.
+    dynasm!(asm; =>merge_cont);
+    dynasm!(asm; add r15, 4);                    // advance ptr_b
+    dynasm!(asm
+        ; mov rax, [rbp + ptr_a_slot]
+        ; add rax, 4
+        ; mov [rbp + ptr_a_slot], rax            // advance ptr_a
+        ; jmp =>merge_loop
+    );
     Ok(())
 }
 
@@ -1785,14 +2122,29 @@ fn emit_clause_level(
 
         // Fast path for fully-bound existence checks.
         if clause.fresh_cols.is_empty() {
-            // Note: JitColIndex linear scan (`emit_native_edb_full_probe`) was evaluated
-            // as an alternative existence-check for EDB arity-2 relations but measured
-            // slower than JitTupleSet in practice: the scan depth is O(n) (≈99 iterations
-            // at n=100) yielding ~310 instructions vs JitTupleSet's ~43.  Even with the
-            // sorted-vals L1-residency advantage, the instruction overhead dominates
-            // for the hot benchmark (where JitTupleSet is L2-resident, not L3).
-            // Kept as `emit_native_edb_full_probe` for potential future binary-search
-            // variant.  See TODO.md § "JitColIndex binary-search existence check".
+            // Native EDB path (arity 2): use JitColIndex binary search instead of
+            // JitTupleSet.  Binary search on the sorted vals slice has O(log n) ≈ 7
+            // iterations vs O(1) for JitTupleSet, but the ~400-byte slice for a fixed
+            // primary key is L1-resident across all inner iterations.  JitTupleSet at
+            // large n (96KB for n=100) spills to L2 (~10 cycles/miss), making the
+            // binary search faster despite more instructions.
+            let use_col_scan = p.use_jit_native && !is_rec && arity == 2
+                && !clause.bound_cols.is_empty();
+            if use_col_scan {
+                emit_native_edb_full_probe(asm, p, level, clause, when_exhausted)?;
+                if level + 1 == p.clauses.len() {
+                    for expr in p.rule_conds {
+                        emit_expr(asm, expr, p.var_locs)?;
+                        dynasm!(asm; test eax, eax; jz =>when_exhausted);
+                    }
+                    emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, when_exhausted)?;
+                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
+                    dynasm!(asm; jmp =>when_exhausted);
+                } else {
+                    emit_clause_level(asm, p, level + 1, outer_exit, when_exhausted)?;
+                }
+                return Ok(());
+            }
             // Non-native or IDB or arity != 2: fall back to JitTupleSet hash probe.
             let handle_idx_in_buf = flat_idx;
             let native_total_for_probe = if p.use_jit_native {
@@ -1815,6 +2167,15 @@ fn emit_clause_level(
             }
             // If emit_tuple_set_probe returned Err (e.g. unsupported arity), fall through
             // to the existing col-index + scan path.
+        }
+
+        // ── Merge intersection fast path ─────────────────────────────────────
+        // When level L is a col-scan and level L+1 is a fully-bound existence
+        // check, fuse them into a two-pointer sorted merge (O(|A|+|B|) per outer
+        // pair instead of O(|B|×hash_probe)).
+        if let Some(mp) = detect_merge_pattern(p, level) {
+            emit_merge_scan_exist(asm, p, level, outer_exit, when_exhausted, &mp)?;
+            return Ok(());
         }
 
         // Compute probe key into ecx (supports Var, Literal, or arbitrary expression).
