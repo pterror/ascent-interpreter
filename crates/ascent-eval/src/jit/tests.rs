@@ -623,6 +623,27 @@ fn test_stage4_triangle() {
     );
 }
 
+/// Test triangle detection with enough edges to trigger the adaptive col-scan path
+/// (JitRelData.len > 2048 triggers JitColIndex scan instead of JitTupleSet probe).
+#[cfg(feature = "specialized")]
+#[test]
+fn test_stage4_triangle_large() {
+    // n=65 gives 65*64/2 = 2080 edges, exceeding the 2048 threshold.
+    let n = 65i32;
+    let edges: Vec<Vec<Value>> = (0..n)
+        .flat_map(|i| ((i + 1)..n).map(move |j| vec![Value::I32(i), Value::I32(j)]))
+        .collect();
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(i32, i32);
+            relation tri(i32, i32, i32);
+            tri(a, b, c) <-- edge(a, b), edge(b, c), edge(a, c);
+        "#,
+        &[("edge", edges)],
+        "tri",
+    );
+}
+
 #[cfg(feature = "specialized")]
 #[test]
 fn test_stage4_multi_rule() {

@@ -481,6 +481,165 @@ fn emit_tuple_set_probe(
     emit_tuple_set_probe_scalar(asm, clause, handle_idx, when_exhausted, var_locs, native_probe)
 }
 
+// ─── EDB full-probe via JitColIndex scan ───────────────────────────────────
+//
+// For an arity-2 clause where ALL args are bound (existence check), the
+// JitTupleSet hash table is a poor fit at large n: the table is 12 bytes/slot
+// and grows to ~96 KB for 5000 tuples, causing L2/L3 cache misses on every
+// random probe.
+//
+// Instead: look up the bound primary-column value in the JitColIndex (which
+// holds a compact hash of ~99 unique keys, ~1 KB, always in L1), get the
+// start/count of the corresponding sorted col-1 values, then scan linearly
+// through that contiguous range (≤50 u32s = ≤200 bytes, fits in L1).
+//
+// Preconditions:
+//   - p.use_jit_native && !is_rec (EDB relation, native path)
+//   - clause.fresh_cols.is_empty() (all args already bound)
+//   - clause.args.len() == 2
+//   - level >= 1
+//
+// On miss: jumps to when_not_found.
+// On hit:  falls through (caller emits conditions/heads).
+//
+// Registers used (caller-saved or saved by level entry code):
+//   rdi  = JitRelData*   (scratch)
+//   r8   = JitColIndex*  (scratch)
+//   r9   = keys ptr      (scratch)
+//   eax, edx = hash slot / count (scratch)
+//   ecx  = primary key   (scratch)
+//   esi  = start         (scratch)
+//   r11  = vals ptr      (scratch)
+//   r10d = secondary key (scratch)
+//   r15, rbx = scan ptr / count (saved by level >= 2 entry; free at level 1)
+#[allow(dead_code)]
+fn emit_native_edb_full_probe(
+    asm: &mut Assembler,
+    p: &EmitParams<'_>,
+    level: usize,
+    clause: &CClause,
+    when_not_found: DynamicLabel,
+) -> Result<(), String> {
+    let arity = clause.args.len();
+    debug_assert_eq!(arity, 2);
+
+    // flat handle index for total (non-recent) version of this clause's relation
+    let total_flat_idx = p.rule_handle_base + level * 2;
+    let total_flat_idx_i32 = (total_flat_idx * 8) as i32;
+
+    // Load JitRelData* for this clause → rdi
+    dynasm!(asm
+        ; mov rdi, [rbp + CTX_SLOT]
+        ; mov rdi, [rdi]                       // scan_rels ptr
+        ; mov rdi, [rdi + total_flat_idx_i32]  // *mut JitRelData
+    );
+
+    // Use bound_cols[0] as the primary lookup column.
+    let primary_col = clause.bound_cols[0];
+    let secondary_col = 1 - primary_col;
+    let primary_col_i32 = (primary_col * 8) as i32;
+
+    // Load JitColIndex* for primary_col → r8
+    dynasm!(asm
+        ; mov r8, [rdi + 24]              // col_indices: *mut *mut JitColIndex
+        ; mov r8, [r8 + primary_col_i32]  // JitColIndex* for primary_col
+    );
+
+    // Load primary key → ecx
+    match &clause.args[primary_col] {
+        CClauseArg::Var(var_id) => emit_load_var_ecx(asm, p.var_locs, *var_id),
+        CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+            dynasm!(asm; mov ecx, *n);
+        }
+        _ => {
+            return Err(
+                "emit_native_edb_full_probe: unsupported primary arg type".to_string(),
+            )
+        }
+    }
+
+    // Hash-probe JitColIndex for primary key → start (esi), count (eax), vals (r11)
+    // Knuth multiplicative hash: slot = (key * 0x9e3779b9) & mask
+    dynasm!(asm
+        ; mov eax, ecx
+        ; imul eax, eax, 0x9e3779b9u32 as i32
+        ; mov edx, [r8 + 24]   // JitColIndex.mask
+        ; and eax, edx          // slot
+        ; mov r9, [r8]          // keys ptr
+    );
+
+    let probe_lp  = asm.new_dynamic_label();
+    let probe_hit = asm.new_dynamic_label();
+
+    dynasm!(asm; =>probe_lp);
+    dynasm!(asm
+        ; mov esi, [r9 + rax*4]
+        ; cmp esi, -1i32           // EMPTY_KEY → key absent
+        ; je =>when_not_found
+        ; cmp esi, ecx
+        ; je =>probe_hit
+        ; inc eax
+        ; and eax, edx
+        ; jmp =>probe_lp
+    );
+
+    dynasm!(asm; =>probe_hit);
+    // ranges[slot] = start(lo32) | count(hi32)
+    dynasm!(asm
+        ; mov r11, [r8 + 8]       // ranges ptr
+        ; mov r11, [r11 + rax*8]  // ranges[slot]
+        ; mov esi, r11d            // start = lo32
+        ; shr r11, 32
+        ; mov eax, r11d            // count = hi32
+        ; mov r11, [r8 + 16]      // vals ptr
+    );
+
+    // Set up scan: r15 = &vals[start], rbx = count
+    // (r15/rbx are either unused at level 1, or saved at level >= 2 entry.)
+    dynasm!(asm
+        ; lea r15, [r11 + rsi*4]  // r15 = &vals[start]
+        ; mov rbx, rax             // rbx = count
+    );
+
+    // Load secondary key → r10d  (emit_load_var writes eax; move to r10d)
+    match &clause.args[secondary_col] {
+        CClauseArg::Var(var_id) => {
+            emit_load_var(asm, p.var_locs, *var_id);
+            dynasm!(asm; mov r10d, eax);
+        }
+        CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+            dynasm!(asm; mov r10d, *n);
+        }
+        _ => {
+            return Err(
+                "emit_native_edb_full_probe: unsupported secondary arg type".to_string(),
+            )
+        }
+    }
+
+    // Linear scan: vals[start..start+count] for secondary key.
+    // Sequential access through a contiguous u32 array (≤200 bytes for n≤50,
+    // always L1-resident) is vastly cheaper than a random hash-table probe.
+    let scan_loop  = asm.new_dynamic_label();
+    let scan_found = asm.new_dynamic_label();
+
+    dynasm!(asm
+        ; test rbx, rbx
+        ; jz =>when_not_found        // count == 0: not in relation
+        ; =>scan_loop
+        ; mov eax, [r15]             // load current val
+        ; cmp eax, r10d
+        ; je =>scan_found
+        ; add r15, 4
+        ; dec rbx
+        ; jnz =>scan_loop
+        ; jmp =>when_not_found       // exhausted without finding
+        ; =>scan_found
+    );
+
+    Ok(())
+}
+
 // ─── Expression compilation ───────────────────────────────────────────────
 
 fn check_expr(expr: &CExpr) -> Result<(), String> {
@@ -1624,8 +1783,17 @@ fn emit_clause_level(
         let total_flat_idx_i32 = (total_flat_idx * 8) as i32;
         let _ = total_flat_idx_i32; // suppress unused warning in old path
 
-        // Fast path for fully-bound existence checks: inline JitTupleSet probe.
+        // Fast path for fully-bound existence checks.
         if clause.fresh_cols.is_empty() {
+            // Note: JitColIndex linear scan (`emit_native_edb_full_probe`) was evaluated
+            // as an alternative existence-check for EDB arity-2 relations but measured
+            // slower than JitTupleSet in practice: the scan depth is O(n) (≈99 iterations
+            // at n=100) yielding ~310 instructions vs JitTupleSet's ~43.  Even with the
+            // sorted-vals L1-residency advantage, the instruction overhead dominates
+            // for the hot benchmark (where JitTupleSet is L2-resident, not L3).
+            // Kept as `emit_native_edb_full_probe` for potential future binary-search
+            // variant.  See TODO.md § "JitColIndex binary-search existence check".
+            // Non-native or IDB or arity != 2: fall back to JitTupleSet hash probe.
             let handle_idx_in_buf = flat_idx;
             let native_total_for_probe = if p.use_jit_native {
                 Some((total_flat_idx, native_total_rels_slot(p.var_count, p.max_head_arity, p.max_depth)))
