@@ -41,7 +41,7 @@ Public-facing crates (ascent-eval, ascent-interpreter, ascent-syntax, ascent-ir)
 - [DONE] `ascent-ir` — Crate-level usage example added
 - [DONE] `docs/reference/types.md` — Fixed `Engine::new()` examples
 - [PENDING] `ascent-ir/lib.rs:33` — `syn::Expr` leaks into IR public API _(architectural — requires new expression AST)_
-- [PENDING] `value.rs:114` — `Value::Interned` variant exposes `Rc<dyn InternTable>` _(architectural — requires Value enum redesign)_
+- [DONE] `value.rs:114` — `Value::Interned` variant: added `#[non_exhaustive]`, `as_str()`, `type_name()` accessors, documented as internal
 - [PENDING] `expr.rs:12` — `eval_expr` returns `Option<Value>` with no error diagnostics _(requires EvalError type)_
 - [PENDING] No error types exist anywhere in the codebase _(design work needed)_
 
@@ -56,14 +56,13 @@ Public-facing crates (ascent-eval, ascent-interpreter, ascent-syntax, ascent-ir)
 - [DONE] JIT var_count > 10,000 guard
 - [DONE] Mutex `.lock().unwrap_or_else(|e| e.into_inner())` for poisoned-mutex recovery
 
-### Remaining (4 items — all architectural)
+### Remaining (3 items — all architectural)
 
 These require design decisions, not mechanical fixes:
 
 1. `syn::Expr` in IR API — needs a new `IrExpr` AST independent of `syn`
-2. `Value::Interned` exposure — needs Value enum redesign to hide internals
-3. `eval_expr` error handling — needs `EvalError` type with diagnostic variants
-4. No error types — needs `EvalError`, `LoweringError`, `ParseError` designed as a coherent set
+2. `eval_expr` error handling — needs `EvalError` type with diagnostic variants
+3. No error types — needs `EvalError`, `LoweringError`, `ParseError` designed as a coherent set
 
 ### Conflicts
 None identified.
