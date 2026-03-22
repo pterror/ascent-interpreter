@@ -2790,6 +2790,9 @@ fn codegen_stratum_asm_inner(
     jit_tuple_set_grow_addr: usize,
 ) -> Result<AsmStratum, String> {
     // ── Eligibility ──────────────────────────────────────────────────────────
+    if var_count > 10_000 {
+        return Err(format!("asm: var_count {var_count} exceeds limit of 10000; stack frame would be too large"));
+    }
     for (ri, (clauses, heads, conds, nots, aggs)) in rules.iter().enumerate() {
         // Native path does not support negation or aggregation.
         if use_jit_native && (!nots.is_empty() || !aggs.is_empty()) {

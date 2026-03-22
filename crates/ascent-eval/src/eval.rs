@@ -945,7 +945,7 @@ impl Engine {
             let Some(jit_cell) = self.jit.as_ref() else {
                 return false;
             };
-            let mut jit = jit_cell.lock().unwrap();
+            let mut jit = jit_cell.lock().unwrap_or_else(|e| e.into_inner());
             jit.var_count = self.var_count;
             match jit.compile_stratum_stage4(stratum_key, rules) {
                 Some(f) => f,
@@ -957,7 +957,7 @@ impl Engine {
         // This is compiled speculatively; it will only be used if stage4_native_runtime is Some.
         let stage4_native_fn: Option<crate::jit::packed_helpers::StratumStage4Fn> =
             self.jit.as_ref().and_then(|jit_cell| {
-                let mut jit = jit_cell.lock().unwrap();
+                let mut jit = jit_cell.lock().unwrap_or_else(|e| e.into_inner());
                 jit.var_count = self.var_count;
                 jit.compile_stratum_stage4_native(stratum_key, rules)
             });
@@ -971,7 +971,7 @@ impl Engine {
             // the post-reserve entries_ptr.  If we reserved after, the handle would hold
             // a dangling pointer into the freed pre-reserve allocation → SIGSEGV.
             let pool_runtime = if let Some(jit_cell) = self.jit.as_ref() {
-                let mut jit = jit_cell.lock().unwrap();
+                let mut jit = jit_cell.lock().unwrap_or_else(|e| e.into_inner());
                 if !jit.tuple_count_hints.is_empty() {
                     use crate::relation::Relation;
                     for rule in rules {
@@ -1020,7 +1020,7 @@ impl Engine {
         // Avoids 6–8 dedup reallocs and ~13 packed_data/delta reallocs on each
         // fresh-engine iteration, eliminating malloc/memmove overhead.
         if let Some(jit_cell) = self.jit.as_ref() {
-            let jit = jit_cell.lock().unwrap();
+            let jit = jit_cell.lock().unwrap_or_else(|e| e.into_inner());
             let has_hints = !jit.dedup_cap_hints.is_empty() || !jit.tuple_count_hints.is_empty();
             if has_hints {
                 use crate::relation::Relation;
@@ -1107,7 +1107,7 @@ impl Engine {
         if hints.is_empty() {
             return;
         }
-        let mut jit = jit_cell.lock().unwrap();
+        let mut jit = jit_cell.lock().unwrap_or_else(|e| e.into_inner());
         for (name, cap, count) in hints {
             if cap > 0 {
                 let entry = jit.dedup_cap_hints.entry(name.clone()).or_insert(0);
@@ -1603,7 +1603,7 @@ impl Engine {
                                 };
                                 // Try cache hit (lock, check, clone, unlock).
                                 let cached = {
-                                    let jit = arc.lock().unwrap();
+                                    let jit = arc.lock().unwrap_or_else(|e| e.into_inner());
                                     jit.edb_native_total_cache.get(name).and_then(
                                         |(cached_count, cached_hash, cached_rel)| {
                                             if *cached_count == count && *cached_hash == data_hash {
@@ -1630,7 +1630,7 @@ impl Engine {
                                                 &native.total, arity, true,
                                             )
                                         };
-                                        let mut jit = arc.lock().unwrap();
+                                        let mut jit = arc.lock().unwrap_or_else(|e| e.into_inner());
                                         jit.edb_native_total_cache
                                             .insert(name.clone(), (count, data_hash, total_clone));
                                     }

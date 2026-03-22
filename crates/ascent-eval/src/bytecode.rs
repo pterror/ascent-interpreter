@@ -63,6 +63,9 @@ impl BytecodeProgram {
             }
         }
         let idx = self.constants.len();
+        if idx > u16::MAX as usize {
+            panic!("bytecode constant pool overflow: more than {} constants", u16::MAX);
+        }
         self.constants.push(val);
         idx as u16
     }
@@ -230,12 +233,12 @@ pub(crate) fn eval_bytecode(program: &BytecodeProgram, bindings: &Bindings) -> O
                 stack.push(bindings.get(var_id)?.clone());
             }
             Op::Binary(op) => {
-                let right = stack.pop().unwrap();
-                let left = stack.pop().unwrap();
+                let right = stack.pop().expect("bytecode stack underflow");
+                let left = stack.pop().expect("bytecode stack underflow");
                 stack.push(eval_binary_op(*op, &left, &right)?);
             }
             Op::Unary(op) => {
-                let val = stack.pop().unwrap();
+                let val = stack.pop().expect("bytecode stack underflow");
                 let result = match op {
                     CUnOp::Neg => val.neg()?,
                     CUnOp::Not => val.not()?,
@@ -244,14 +247,14 @@ pub(crate) fn eval_bytecode(program: &BytecodeProgram, bindings: &Bindings) -> O
                 stack.push(result);
             }
             Op::JumpIfFalse(target) => {
-                let val = stack.pop().unwrap();
+                let val = stack.pop().expect("bytecode stack underflow");
                 if !val.as_bool()? {
                     ip = *target as usize;
                     continue;
                 }
             }
             Op::JumpIfTrue(target) => {
-                let val = stack.pop().unwrap();
+                let val = stack.pop().expect("bytecode stack underflow");
                 if val.as_bool()? {
                     ip = *target as usize;
                     continue;
