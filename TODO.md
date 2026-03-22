@@ -661,10 +661,11 @@ No JitColIndex sort. No PackedStorage rebuild cycle. Just pointer swaps + RelInd
   in `extend_and_rebuild_indices`. **Result: TC jit_hot/50 at parity with ascent_macro** (~139µs
   vs ~140µs, previously 1.49×).
 
-- [ ] **Phase 2 — inline insert in JIT**: extend `emit_tuple_set_probe` / head-emission asm to
-  write directly into the output `JitTupleSet` and `data` buffer inline. Rust callback only for
-  table growth (amortized). Eliminates `JitDedupTable`, batch flush, `advance_jit_inner` loop.
-  ~200 lines in `asm_codegen.rs`.
+- [x] **Phase 2 — inline dedup insert for sink heads** (commit `5ceee4d`): for sink relations
+  (head-only, never in body), JIT inserts directly into `total.tuple_set` (aliased to `jit_dedup`)
+  during step 2a probe. Skips `new.tuple_set` probe entirely. Batch flush skips per-tuple
+  `jit_dedup.insert()` loop. Added `jit_dedup_grow_relink` callback for load-factor management.
+  **Result: triangle jit_hot/20 from 2.1× → 1.48×** (~49µs vs ~33µs macro).
 
 - [ ] **Phase 3 — interpreter uses same layout**: replace `PackedStorage`'s interpreter-path
   indices (`indices`, `value_data`, `recent_col_indices`) with `RelIndex`. Interpreter inner loop
