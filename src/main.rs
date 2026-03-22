@@ -39,7 +39,7 @@ fn run_file(path: &str) {
     };
 
     match eval_source(&source) {
-        Ok((engine, program)) => dump_all(&engine, &program),
+        Ok((mut engine, program)) => dump_all(&mut engine, &program),
         Err(e) => {
             eprintln!("parse error: {e}");
             std::process::exit(1);
@@ -120,7 +120,7 @@ fn repl() {
                     }
                 }
                 ":dump" | ":d" => {
-                    if let (Some(eng), Some(prog)) = (&engine, &current_program) {
+                    if let (Some(eng), Some(prog)) = (&mut engine, &current_program) {
                         dump_all(eng, prog);
                     } else {
                         eprintln!("(no program)");
@@ -129,7 +129,7 @@ fn repl() {
                 ":query" | ":q" => {
                     if arg.is_empty() {
                         eprintln!("usage: :query <relation> or :query rel(pattern, ...)");
-                    } else if let Some(eng) = &engine {
+                    } else if let Some(eng) = &mut engine {
                         query_relation(eng, arg);
                     } else {
                         eprintln!("(no program)");
@@ -138,7 +138,7 @@ fn repl() {
                 ":count" => {
                     if arg.is_empty() {
                         eprintln!("usage: :count <relation>");
-                    } else if let Some(eng) = &engine {
+                    } else if let Some(eng) = &mut engine {
                         match eng.relation(arg) {
                             Some(rel) => eprintln!("  {arg}: {}", rel.len()),
                             None => eprintln!("  unknown relation: {arg}"),
@@ -228,7 +228,7 @@ fn repl() {
                     }
                 }
                 ":relations" | ":rels" => {
-                    if let (Some(eng), Some(prog)) = (&engine, &current_program) {
+                    if let (Some(eng), Some(prog)) = (&mut engine, &current_program) {
                         list_relations(eng, prog);
                     } else {
                         eprintln!("(no relations)");
@@ -271,7 +271,7 @@ fn repl() {
                 source = candidate;
                 current_program = Some(program);
                 show_changes(
-                    engine.as_ref().unwrap(),
+                    engine.as_mut().unwrap(),
                     current_program.as_ref().unwrap(),
                     &mut prev_counts,
                 );
@@ -299,7 +299,7 @@ fn print_help() {
     eprintln!("Multi-line input continues until ';'. Empty line cancels.");
 }
 
-fn show_changes(engine: &Engine, program: &Program, prev_counts: &mut HashMap<String, usize>) {
+fn show_changes(engine: &mut Engine, program: &Program, prev_counts: &mut HashMap<String, usize>) {
     let mut any_change = false;
     let mut names: Vec<&str> = program.relations.keys().map(String::as_str).collect();
     names.sort();
@@ -325,7 +325,7 @@ fn show_changes(engine: &Engine, program: &Program, prev_counts: &mut HashMap<St
     }
 }
 
-fn list_relations(engine: &Engine, program: &Program) {
+fn list_relations(engine: &mut Engine, program: &Program) {
     let mut names: Vec<&str> = program.relations.keys().map(String::as_str).collect();
     names.sort();
 
@@ -338,7 +338,7 @@ fn list_relations(engine: &Engine, program: &Program) {
     }
 }
 
-fn query_relation(engine: &Engine, input: &str) {
+fn query_relation(engine: &mut Engine, input: &str) {
     let (name, pattern) = parse_query(input);
 
     match engine.relation(name) {
@@ -439,7 +439,7 @@ fn print_filtered(name: &str, rel: &Relation, pats: &[QueryPat]) {
     }
 }
 
-fn dump_all(engine: &Engine, program: &Program) {
+fn dump_all(engine: &mut Engine, program: &Program) {
     let mut names: Vec<&str> = program.relations.keys().map(String::as_str).collect();
     names.sort();
 

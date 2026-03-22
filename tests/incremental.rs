@@ -10,7 +10,7 @@ fn parse(input: &str) -> Program {
     Program::from_ast(ast)
 }
 
-fn collect_rel(engine: &Engine, name: &str) -> Vec<Vec<Value>> {
+fn collect_rel(engine: &mut Engine, name: &str) -> Vec<Vec<Value>> {
     let rel = engine.relation(name).expect("relation not found");
     let mut tuples: Vec<Vec<Value>> = rel.iter().map(|t| t.to_vec()).collect();
     tuples.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
@@ -30,11 +30,11 @@ fn rerun_idempotent() {
     let program = parse(src);
     let mut engine = Engine::new(&program);
     engine.run(&program);
-    let first = collect_rel(&engine, "path");
+    let first = collect_rel(&mut engine, "path");
 
     // Run again on same engine — should produce identical results.
     engine.run(&program);
-    let second = collect_rel(&engine, "path");
+    let second = collect_rel(&mut engine, "path");
     assert_eq!(first, second);
 }
 
@@ -50,12 +50,12 @@ fn additive_facts() {
     let mut engine = Engine::new(&program);
     engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
     engine.run(&program);
-    assert_eq!(collect_rel(&engine, "path").len(), 1); // (1,2)
+    assert_eq!(collect_rel(&mut engine, "path").len(), 1); // (1,2)
 
     // Add a new fact and re-run.
     engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
     engine.run(&program);
-    assert_eq!(collect_rel(&engine, "path").len(), 3); // (1,2), (2,3), (1,3)
+    assert_eq!(collect_rel(&mut engine, "path").len(), 3); // (1,2), (2,3), (1,3)
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn additive_rules() {
     let prog1 = parse(src1);
     let mut engine = Engine::new(&prog1);
     engine.run(&prog1);
-    assert_eq!(collect_rel(&engine, "path").len(), 2); // (1,2), (2,3)
+    assert_eq!(collect_rel(&mut engine, "path").len(), 2); // (1,2), (2,3)
 
     // Add transitive rule.
     let src2 = r#"
@@ -85,7 +85,7 @@ fn additive_rules() {
     let prog2 = parse(src2);
     engine.update_program(&prog2);
     engine.run(&prog2);
-    assert_eq!(collect_rel(&engine, "path").len(), 3); // (1,2), (2,3), (1,3)
+    assert_eq!(collect_rel(&mut engine, "path").len(), 3); // (1,2), (2,3), (1,3)
 }
 
 #[test]
@@ -129,8 +129,8 @@ fn update_program_adds_new_relation() {
     engine.update_program(&prog2);
     engine.run(&prog2);
 
-    assert_eq!(collect_rel(&engine, "a"), vec![vec![Value::I32(1)]]);
-    assert_eq!(collect_rel(&engine, "b"), vec![vec![Value::I32(2)]]);
+    assert_eq!(collect_rel(&mut engine, "a"), vec![vec![Value::I32(1)]]);
+    assert_eq!(collect_rel(&mut engine, "b"), vec![vec![Value::I32(2)]]);
 }
 
 // --- Source-tagged fact tests ---
@@ -157,7 +157,7 @@ fn source_insert_and_retract() {
     assert_eq!(engine.relation("edge").unwrap().len(), 1);
 
     // The surviving tuple is from s2
-    let tuples = collect_rel(&engine, "edge");
+    let tuples = collect_rel(&mut engine, "edge");
     assert_eq!(tuples, vec![vec![Value::I32(3), Value::I32(4)]]);
 }
 
@@ -180,7 +180,7 @@ fn source_retract_and_rederive() {
     engine.insert_with_source("edge", vec![Value::I32(2), Value::I32(3)], s2);
     engine.run(&program);
 
-    assert_eq!(collect_rel(&engine, "path").len(), 3); // (1,2), (2,3), (1,3)
+    assert_eq!(collect_rel(&mut engine, "path").len(), 3); // (1,2), (2,3), (1,3)
 
     // Retract file_a's facts
     engine.retract_source(s1);
@@ -195,7 +195,7 @@ fn source_retract_and_rederive() {
         .unwrap()
         .retract_source(SourceId::ANONYMOUS);
     engine.run(&program);
-    assert_eq!(collect_rel(&engine, "path").len(), 1); // only (2,3)
+    assert_eq!(collect_rel(&mut engine, "path").len(), 1); // only (2,3)
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn source_multiple_sources_independent() {
     engine.retract_source(a);
     assert_eq!(engine.relation("fact").unwrap().len(), 1);
 
-    let tuples = collect_rel(&engine, "fact");
+    let tuples = collect_rel(&mut engine, "fact");
     assert_eq!(tuples, vec![vec![Value::I32(3)]]);
 }
 
@@ -334,7 +334,7 @@ fn source_untagged_facts_survive_retraction() {
     engine.retract_source(s);
     assert_eq!(engine.relation("node").unwrap().len(), 2);
 
-    let tuples = collect_rel(&engine, "node");
+    let tuples = collect_rel(&mut engine, "node");
     assert_eq!(tuples, vec![vec![Value::I32(1)], vec![Value::I32(3)]]);
 }
 
@@ -362,6 +362,6 @@ fn source_batch_retract() {
     assert_eq!(removed, 4);
     assert_eq!(engine.relation("fact").unwrap().len(), 1);
 
-    let tuples = collect_rel(&engine, "fact");
+    let tuples = collect_rel(&mut engine, "fact");
     assert_eq!(tuples, vec![vec![Value::I32(3)]]);
 }
