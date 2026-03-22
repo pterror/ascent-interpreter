@@ -348,6 +348,9 @@ fn eval_block_stmts(
     None
 }
 
+/// Maximum number of elements allowed when materializing a range.
+const MAX_RANGE_SIZE: i64 = 1_000_000;
+
 /// Expand a range Value into individual values.
 pub fn expand_range(range: &Value) -> Option<Vec<Value>> {
     match range {
@@ -358,6 +361,14 @@ pub fn expand_range(range: &Value) -> Option<Vec<Value>> {
         } => {
             let s = start.as_i64()?;
             let e = end.as_i64()?;
+            let size = if *inclusive { e - s + 1 } else { e - s };
+            if size > MAX_RANGE_SIZE {
+                eprintln!(
+                    "Warning: range {s}..{e} has {size} elements (limit {MAX_RANGE_SIZE}). \
+                     Skipping expansion to prevent OOM."
+                );
+                return Some(Vec::new());
+            }
             let values: Vec<Value> = if *inclusive {
                 (s..=e).map(|v| coerce_i64(v, start)).collect()
             } else {

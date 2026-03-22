@@ -326,6 +326,8 @@ pub struct Engine {
     /// Cache of Stage 4 stratum runtime contexts (inlined rule bodies).
     #[cfg(all(feature = "jit", feature = "specialized"))]
     stratum_stage4_cache: FxHashMap<usize, StratumStage4Runtime>,
+    /// Maximum number of fixpoint iterations before stopping evaluation.
+    max_iterations: usize,
 }
 
 /// An opaque, shareable handle to a pre-compiled JIT compiler.
@@ -376,6 +378,7 @@ impl Engine {
             jit: None,
             #[cfg(all(feature = "jit", feature = "specialized"))]
             stratum_stage4_cache: FxHashMap::default(),
+            max_iterations: 10_000,
         }
     }
 
@@ -402,6 +405,14 @@ impl Engine {
     #[cfg(feature = "jit")]
     pub fn with_jit_compiler(&mut self, jit: SharedJitCompiler) {
         self.jit = Some(jit.0);
+    }
+
+    /// Set the maximum number of fixpoint iterations before evaluation stops.
+    ///
+    /// Default is 10,000. Programs that exceed this limit will print a warning
+    /// to stderr and return partial results.
+    pub fn set_max_iterations(&mut self, limit: usize) {
+        self.max_iterations = limit;
     }
 
     /// Register a custom type with constructor and destructor.
@@ -767,7 +778,17 @@ impl Engine {
         }
 
         // Semi-naive loop
+        let mut iterations = 0usize;
         while changed {
+            iterations += 1;
+            if iterations > self.max_iterations {
+                eprintln!(
+                    "Warning: fixpoint iteration limit reached ({} iterations). \
+                     Stopping evaluation — results may be incomplete.",
+                    self.max_iterations
+                );
+                break;
+            }
             changed = false;
 
             for rule in rules {
