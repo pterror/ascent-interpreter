@@ -291,7 +291,7 @@ let jit_handle = engine1.share_jit_compiler().unwrap();
 
 // Inject into a second engine — no recompilation needed
 let mut engine2 = Engine::new(&program);
-engine2.with_jit_compiler(jit_handle);
+engine2.set_jit_compiler(jit_handle);
 engine2.insert("edge", vec![Value::I32(10), Value::I32(20)]);
 engine2.run(&program);
 ```

@@ -935,10 +935,10 @@ pub(crate) fn eval_binary_op(op: CBinOp, left: &Value, right: &Value) -> Option<
         CBinOp::Shr => left.shr(right),
         CBinOp::Eq => Some(Value::Bool(left == right)),
         CBinOp::Ne => Some(Value::Bool(left != right)),
-        CBinOp::Lt => left.partial_cmp_val(right).map(|o| Value::Bool(o.is_lt())),
-        CBinOp::Le => left.partial_cmp_val(right).map(|o| Value::Bool(o.is_le())),
-        CBinOp::Gt => left.partial_cmp_val(right).map(|o| Value::Bool(o.is_gt())),
-        CBinOp::Ge => left.partial_cmp_val(right).map(|o| Value::Bool(o.is_ge())),
+        CBinOp::Lt => left.try_cmp(right).map(|o| Value::Bool(o.is_lt())),
+        CBinOp::Le => left.try_cmp(right).map(|o| Value::Bool(o.is_le())),
+        CBinOp::Gt => left.try_cmp(right).map(|o| Value::Bool(o.is_gt())),
+        CBinOp::Ge => left.try_cmp(right).map(|o| Value::Bool(o.is_ge())),
         CBinOp::And | CBinOp::Or => unreachable!("handled by short-circuit path"),
     }
 }

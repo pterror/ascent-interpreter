@@ -8,7 +8,7 @@ use ascent_syntax::AscentProgram;
 /// Run a program with JIT and without, assert same results.
 fn assert_jit_equivalence(input: &str, facts: &[(&str, Vec<Vec<Value>>)], query_rel: &str) {
     let ast: AscentProgram = syn::parse_str(input).expect("parse");
-    let program = Program::from_ast(ast);
+    let program = Program::from_ast(ast).expect("lowering should succeed");
 
     // Run without JIT
     let mut engine_interp = Engine::new(&program);
@@ -28,7 +28,7 @@ fn assert_jit_equivalence(input: &str, facts: &[(&str, Vec<Vec<Value>>)], query_
 
     // Run with JIT
     let mut engine_jit = Engine::new(&program);
-    engine_jit.enable_jit();
+    engine_jit.enable_jit().expect("JIT init should succeed");
     for (rel, tuples) in facts {
         for tuple in tuples {
             engine_jit.insert(rel, tuple.clone());

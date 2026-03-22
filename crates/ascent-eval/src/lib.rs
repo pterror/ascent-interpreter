@@ -18,7 +18,7 @@
 //! "#;
 //!
 //! let ast: AscentProgram = syn::parse_str(input).unwrap();
-//! let program = Program::from_ast(ast);
+//! let program = Program::from_ast(ast).unwrap();
 //! let mut engine = Engine::new(&program);
 //!
 //! // Insert initial facts

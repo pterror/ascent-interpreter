@@ -13,7 +13,7 @@ use ascent_syntax::AscentProgram as AscentAst;
 
 fn run(input: &str) -> Engine {
     let ast: AscentAst = syn::parse_str(input).unwrap();
-    let program = Program::from_ast(ast);
+    let program = Program::from_ast(ast).expect("lowering should succeed");
     let mut engine = Engine::new(&program);
     engine.run(&program);
     engine
@@ -734,9 +734,9 @@ fn compare_lattice_shortest_path() {
 #[cfg(feature = "jit")]
 fn run_jit(input: &str) -> Engine {
     let ast: AscentAst = syn::parse_str(input).unwrap();
-    let program = Program::from_ast(ast);
+    let program = Program::from_ast(ast).expect("lowering should succeed");
     let mut engine = Engine::new(&program);
-    engine.enable_jit();
+    engine.enable_jit().expect("JIT init should succeed");
     engine.run(&program);
     engine.materialize();
     engine

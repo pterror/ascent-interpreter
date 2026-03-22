@@ -39,7 +39,7 @@ pub fn pat_to_ident(pat: &Pat) -> Option<Ident> {
 }
 
 /// Check if expression is a wildcard (`_`).
-pub fn is_wild_card(expr: &Expr) -> bool {
+pub fn is_wildcard(expr: &Expr) -> bool {
     match expr {
         Expr::Infer(_) => true,
         Expr::Verbatim(ts) => ts.to_string() == "_",

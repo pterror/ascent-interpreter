@@ -301,10 +301,12 @@ impl std::fmt::Debug for StratumStage4Runtime {
 /// The evaluation engine state.
 #[derive(Debug)]
 pub struct Engine {
+    /// The program being evaluated.
+    program: Program,
     /// Storage for each relation.
     relations: FxHashMap<String, Relation>,
     /// Declared column types per relation (primitive type name, or None for complex types).
-    col_types: FxHashMap<String, Vec<Option<String>>>,
+    column_types: FxHashMap<String, Vec<Option<String>>>,
     /// Registry of custom type constructors.
     pub(crate) type_registry: TypeRegistry,
     /// Intern table for variable names.
@@ -335,7 +337,7 @@ pub struct Engine {
 /// An opaque, shareable handle to a pre-compiled JIT compiler.
 ///
 /// Obtained from [`Engine::share_jit_compiler`] and passed to
-/// [`Engine::with_jit_compiler`] to avoid recompilation across engine instances.
+/// [`Engine::set_jit_compiler`] to avoid recompilation across engine instances.
 #[cfg(feature = "jit")]
 #[derive(Clone)]
 pub struct SharedJitCompiler(Arc<Mutex<crate::jit::JitCompiler>>);
@@ -344,7 +346,7 @@ impl Engine {
     /// Create a new engine from a program.
     pub fn new(program: &Program) -> Self {
         let mut relations = FxHashMap::default();
-        let mut col_types = FxHashMap::default();
+        let mut column_types = FxHashMap::default();
 
         for (name, rel) in &program.relations {
             let arity = rel.column_types.len();
@@ -363,12 +365,12 @@ impl Engine {
                 name.clone(),
                 Relation::new_auto(arity, rel.is_lattice, &types),
             );
-            col_types.insert(name.clone(), types);
+            column_types.insert(name.clone(), types);
         }
 
         Engine {
             relations,
-            col_types,
+            column_types,
             type_registry: TypeRegistry::new(),
             var_interner: VarInterner::default(),
             var_count: 0,
@@ -407,7 +409,7 @@ impl Engine {
     /// Inject a pre-compiled JIT compiler from another engine.
     /// The injected compiler is shared; compilation results are visible to all sharers.
     #[cfg(feature = "jit")]
-    pub fn with_jit_compiler(&mut self, jit: SharedJitCompiler) {
+    pub fn set_jit_compiler(&mut self, jit: SharedJitCompiler) {
         self.jit = Some(jit.0);
     }
 
@@ -513,7 +515,7 @@ impl Engine {
     /// Insert a tuple into a relation (untagged / [`SourceId::ANONYMOUS`]).
     pub fn insert(&mut self, relation: &str, tuple: Tuple) -> bool {
         if let Some(rel) = self.relations.get_mut(relation) {
-            if let Some(col) = self.col_types.get(relation)
+            if let Some(col) = self.column_types.get(relation)
                 && col.len() != tuple.len()
             {
                 eprintln!(
@@ -773,7 +775,7 @@ impl Engine {
             self.relations
                 .entry(name.clone())
                 .or_insert_with(|| Relation::new_auto(arity, rel.is_lattice, &types));
-            self.col_types.entry(name.clone()).or_insert_with(|| types);
+            self.column_types.entry(name.clone()).or_insert_with(|| types);
         }
     }
 
@@ -2766,7 +2768,7 @@ impl Engine {
     /// in relations declared with other integer types (e.g. u32).
     fn eval_head_tuple(&self, head: &CHeadClause, bindings: &Bindings) -> Option<Tuple> {
         let mut tuple = Vec::with_capacity(head.args.len());
-        let declared = self.col_types.get(head.relation.as_str());
+        let declared = self.column_types.get(head.relation.as_str());
 
         for (col_idx, arg) in head.args.iter().enumerate() {
             let value = eval_cexpr(arg, bindings, Some(&self.type_registry), &self.var_interner)?;
@@ -4308,7 +4310,7 @@ mod jit_hot_tests {
         let jit = warmup.share_jit_compiler().unwrap();
         // hot run
         let mut engine = Engine::new(&program);
-        engine.with_jit_compiler(jit);
+        engine.set_jit_compiler(jit);
         engine.run(&program);
     }
 
@@ -4339,7 +4341,7 @@ mod jit_hot_tests {
         // hot runs: verify correctness across several iterations
         for _ in 0..10 {
             let mut engine = Engine::new(&program);
-            engine.with_jit_compiler(jit.clone());
+            engine.set_jit_compiler(jit.clone());
             for i in 1..n {
                 engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
             }

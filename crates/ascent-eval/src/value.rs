@@ -588,7 +588,7 @@ impl Value {
         }
     }
 
-    pub fn partial_cmp_val(&self, other: &Value) -> Option<std::cmp::Ordering> {
+    pub fn try_cmp(&self, other: &Value) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Value::I8(a), Value::I8(b)) => Some(a.cmp(b)),
             (Value::I16(a), Value::I16(b)) => Some(a.cmp(b)),
@@ -617,7 +617,7 @@ impl Value {
             }
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
             // Dual reverses the ordering
-            (Value::Dual(a), Value::Dual(b)) => b.partial_cmp_val(a),
+            (Value::Dual(a), Value::Dual(b)) => b.try_cmp(a),
             (Value::Custom(a), Value::Custom(b)) => a.cmp_box(b.as_ref()),
             _ => None,
         }
@@ -632,7 +632,7 @@ impl Value {
         match (self, other) {
             (Value::Dual(a), Value::Dual(b)) => {
                 // Dual join = Dual(meet of inner) = Dual(min)
-                a.partial_cmp_val(b).map(|ord| {
+                a.try_cmp(b).map(|ord| {
                     Value::Dual(Box::new(if ord.is_le() {
                         (**a).clone()
                     } else {
@@ -642,7 +642,7 @@ impl Value {
             }
             _ => {
                 // Regular join = max
-                self.partial_cmp_val(other).map(|ord| {
+                self.try_cmp(other).map(|ord| {
                     if ord.is_ge() {
                         self.clone()
                     } else {
@@ -813,7 +813,7 @@ mod tests {
     fn test_custom_cmp() {
         let a = Value::custom(Point { x: 1, y: 2 });
         let b = Value::custom(Point { x: 3, y: 4 });
-        assert_eq!(a.partial_cmp_val(&b), Some(Ordering::Less));
+        assert_eq!(a.try_cmp(&b), Some(Ordering::Less));
     }
 
     #[test]
@@ -842,7 +842,7 @@ mod tests {
     fn test_custom_lattice_join() {
         let a = Value::custom(Point { x: 1, y: 2 });
         let b = Value::custom(Point { x: 3, y: 4 });
-        // lattice_join uses partial_cmp_val → max
+        // lattice_join uses try_cmp → max
         let joined = a.lattice_join(&b).unwrap();
         assert_eq!(joined, Value::custom(Point { x: 3, y: 4 }));
     }

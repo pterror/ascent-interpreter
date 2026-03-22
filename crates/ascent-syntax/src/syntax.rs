@@ -113,7 +113,7 @@ pub struct ImplSignature {
 pub struct RelationNode {
     pub attrs: Vec<Attribute>,
     pub name: Ident,
-    pub field_types: Punctuated<Type, Token![,]>,
+    pub column_types: Punctuated<Type, Token![,]>,
     pub initialization: Option<Expr>,
     pub is_lattice: bool,
 }
@@ -129,7 +129,7 @@ impl Parse for RelationNode {
         let name: Ident = input.parse()?;
         let content;
         parenthesized!(content in input);
-        let field_types = content.parse_terminated(Type::parse, Token![,])?;
+        let column_types = content.parse_terminated(Type::parse, Token![,])?;
         let initialization = if input.peek(Token![=]) {
             input.parse::<Token![=]>()?;
             Some(input.parse::<Expr>()?)
@@ -138,13 +138,13 @@ impl Parse for RelationNode {
         };
 
         input.parse::<Token![;]>()?;
-        if is_lattice && field_types.empty_or_trailing() {
+        if is_lattice && column_types.empty_or_trailing() {
             return Err(input.error("empty lattice is not allowed"));
         }
         Ok(RelationNode {
             attrs: vec![],
             name,
-            field_types,
+            column_types,
             is_lattice,
             initialization,
         })
@@ -156,7 +156,7 @@ impl std::fmt::Debug for RelationNode {
         f.debug_struct("RelationNode")
             .field("name", &self.name.to_string())
             .field("is_lattice", &self.is_lattice)
-            .field("field_types", &self.field_types.len())
+            .field("column_types", &self.column_types.len())
             .finish()
     }
 }
@@ -681,7 +681,7 @@ impl Parse for AscentProgram {
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct RelationIdentity {
     pub name: Ident,
-    pub field_types: Vec<Type>,
+    pub column_types: Vec<Type>,
     pub is_lattice: bool,
 }
 
@@ -689,7 +689,7 @@ impl From<&RelationNode> for RelationIdentity {
     fn from(relation_node: &RelationNode) -> Self {
         RelationIdentity {
             name: relation_node.name.clone(),
-            field_types: relation_node.field_types.iter().cloned().collect(),
+            column_types: relation_node.column_types.iter().cloned().collect(),
             is_lattice: relation_node.is_lattice,
         }
     }

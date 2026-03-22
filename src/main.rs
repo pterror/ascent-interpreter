@@ -495,7 +495,7 @@ fn print_tuples(name: &str, rel: &Relation) {
 
 fn cmp_tuples(a: &[Value], b: &[Value]) -> Ordering {
     for (va, vb) in a.iter().zip(b.iter()) {
-        if let Some(ord) = va.partial_cmp_val(vb)
+        if let Some(ord) = va.try_cmp(vb)
             && ord != Ordering::Equal
         {
             return ord;

@@ -28,4 +28,4 @@ mod utils;
 
 pub use syn_utils::*;
 pub use syntax::*;
-pub use utils::{expr_to_ident, is_wild_card, pat_to_ident};
+pub use utils::{expr_to_ident, is_wildcard, pat_to_ident};

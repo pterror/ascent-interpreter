@@ -208,7 +208,7 @@ fn arb_wildcard_program() -> impl Strategy<Value = (String, usize)> {
 
 fn parse_and_lower(input: &str) -> Program {
     let ast: AscentProgram = syn::parse_str(input).expect("program should parse");
-    Program::from_ast(ast)
+    Program::from_ast(ast).expect("lowering should succeed")
 }
 
 // --- Property tests ---

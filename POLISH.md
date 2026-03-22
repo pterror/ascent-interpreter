@@ -30,7 +30,7 @@ Public-facing crates (ascent-eval, ascent-interpreter, ascent-syntax, ascent-ir)
 - [DONE] `README.md` — Rewritten with installation, usage, examples, features _(severity: high)_
 - [DONE] `docs/` — Embedding guide added at `docs/guide/embedding.md` _(severity: high)_
 
-### MEDIUM — 7 resolved, 10 remaining
+### MEDIUM — 8 resolved, 9 remaining
 
 - [DONE] `eval.rs:770` — Fixpoint iteration limit (10,000 default) _(severity: medium)_
 - [DONE] `expr.rs:352` — Range expansion limit (1M) _(severity: medium)_
@@ -46,14 +46,14 @@ Public-facing crates (ascent-eval, ascent-interpreter, ascent-syntax, ascent-ir)
 - [PENDING] `eval.rs:588` — `run_incremental` leaks `FxHashSet` in public API _(severity: medium)_
 - [PENDING] `ascent-ir/lib.rs:33` — `syn::Expr` leaks into IR public API _(severity: medium)_
 - [PENDING] `value.rs:114` — `Value::Interned` variant exposes `Rc<dyn InternTable>` _(severity: medium)_
-- [PENDING] `eval.rs/syntax.rs/ir` — `field_types` vs `column_types` vs `col_types` inconsistency _(severity: medium)_
+- [DONE] `eval.rs/syntax.rs/ir` — `field_types` vs `column_types` vs `col_types` inconsistency _(severity: medium)_
 - [PENDING] `ascent-ir/lib.rs` — No crate-level usage example _(severity: medium)_
 - [PENDING] `value.rs` — No module-level usage examples _(severity: medium)_
 - [PENDING] `expr.rs:12` — `eval_expr` returns `Option<Value>` with no error diagnostics _(severity: medium)_
 - [PENDING] No error types exist anywhere in the codebase _(severity: medium)_
 - [PENDING] `syntax.rs` — Inconsistent `Node` suffix on AST types _(severity: medium)_
 
-### LOW — 8 resolved, 7 remaining
+### LOW — 10 resolved, 5 remaining
 
 - [DONE] `jit/asm_codegen.rs:75` — Safety comments on `unsafe impl Send/Sync` _(severity: low)_
 - [DONE] `jit_index.rs:85,494,750,777` — Safety comments on `unsafe impl Send/Sync` _(severity: low)_
@@ -62,10 +62,10 @@ Public-facing crates (ascent-eval, ascent-interpreter, ascent-syntax, ascent-ir)
 - [DONE] `main.rs:83` — REPL `read_line` error handling improved _(severity: low)_
 - [DONE] `main.rs:217` — `:retract` now prints parse errors _(severity: low)_
 - [DONE] `desugar.rs` — `unwrap()` → `expect("internal: generated syntax must parse")` _(severity: low)_
-- [DONE] `eval.rs:403` — `with_jit_compiler` naming (deferred — low impact) _(severity: low)_
+- [DONE] `eval.rs:403` — `with_jit_compiler` → `set_jit_compiler` _(severity: low)_
 - [PENDING] `value.rs:368` — `Tuple` is a type alias, not a newtype _(severity: low)_
-- [PENDING] `value.rs:537` — `partial_cmp_val` naming _(severity: low)_
-- [PENDING] `syntax.rs:20` — `is_wild_card` spelling _(severity: low)_
+- [DONE] `value.rs:537` — `partial_cmp_val` → `try_cmp` _(severity: low)_
+- [DONE] `syntax.rs:20` — `is_wild_card` → `is_wildcard` _(severity: low)_
 - [PENDING] `bytecode.rs:58` — Constant pool index truncated to u16 _(severity: low)_
 - [PENDING] `bytecode.rs:233` — Stack underflow panics via `unwrap()` _(severity: low)_
 - [PENDING] `jit/asm_codegen.rs:82` — Stack frame overflow with many variables _(severity: low)_

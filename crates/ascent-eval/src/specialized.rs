@@ -69,7 +69,7 @@ impl InternTable for HashInternTable {
     fn cmp_ids(&self, a: u32, b: u32) -> Ordering {
         let vals = self.to_val.borrow();
         vals[a as usize]
-            .partial_cmp_val(&vals[b as usize])
+            .try_cmp(&vals[b as usize])
             .unwrap_or(Ordering::Equal)
     }
 }

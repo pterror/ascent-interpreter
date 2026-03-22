@@ -12,7 +12,7 @@ use ascent_syntax::{
 use syn::{Expr, Type};
 
 /// A complete Ascent program in IR form.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Program {
     /// All relations in the program.
     pub relations: HashMap<String, Relation>,
@@ -36,7 +36,7 @@ pub struct Relation {
 }
 
 /// A rule: head <- body.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Rule {
     /// Head clauses (what to insert).
     pub heads: Vec<HeadClause>,
@@ -54,7 +54,7 @@ pub struct HeadClause {
 }
 
 /// A body item in a rule.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BodyItem {
     /// Match against a relation: `rel(x, y)`
     Clause(Clause),
@@ -125,7 +125,7 @@ pub struct Aggregation {
 
 impl Program {
     /// Lower an AST program to IR.
-    pub fn from_ast(ast: AscentProgram) -> Self {
+    pub fn from_ast(ast: AscentProgram) -> Result<Self, String> {
         // First desugar
         let ast = desugar_program(ast);
 
@@ -136,7 +136,7 @@ impl Program {
                 rel.name.to_string(),
                 Relation {
                     name: rel.name.to_string(),
-                    column_types: rel.field_types.into_iter().collect(),
+                    column_types: rel.column_types.into_iter().collect(),
                     is_lattice: rel.is_lattice,
                     initialization: rel.initialization,
                     attrs: rel.attrs,
@@ -145,14 +145,18 @@ impl Program {
         }
 
         // Lower rules
-        let rules = ast.rules.into_iter().map(Rule::from_ast).collect();
+        let rules = ast
+            .rules
+            .into_iter()
+            .map(Rule::from_ast)
+            .collect::<Result<Vec<_>, _>>()?;
 
-        Program { relations, rules }
+        Ok(Program { relations, rules })
     }
 }
 
 impl Rule {
-    fn from_ast(rule: RuleNode) -> Self {
+    fn from_ast(rule: RuleNode) -> Result<Self, String> {
         let heads = rule
             .head_clauses
             .into_iter()
@@ -166,9 +170,9 @@ impl Rule {
             .body_items
             .into_iter()
             .map(BodyItem::from_ast)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
-        Rule { heads, body }
+        Ok(Rule { heads, body })
     }
 }
 
@@ -182,36 +186,36 @@ impl HeadClause {
 }
 
 impl BodyItem {
-    fn from_ast(bi: BodyItemNode) -> Self {
+    fn from_ast(bi: BodyItemNode) -> Result<Self, String> {
         match bi {
-            BodyItemNode::Clause(cl) => BodyItem::Clause(Clause::from_ast(cl)),
+            BodyItemNode::Clause(cl) => Ok(BodyItem::Clause(Clause::from_ast(cl)?)),
             BodyItemNode::Generator(generator) => {
-                BodyItem::Generator(Generator::from_ast(generator))
+                Ok(BodyItem::Generator(Generator::from_ast(generator)))
             }
-            BodyItemNode::Cond(cond) => BodyItem::Condition(Condition::from_ast(cond)),
-            BodyItemNode::Agg(agg) => BodyItem::Aggregation(Aggregation::from_ast(agg)),
+            BodyItemNode::Cond(cond) => Ok(BodyItem::Condition(Condition::from_ast(cond))),
+            BodyItemNode::Agg(agg) => Ok(BodyItem::Aggregation(Aggregation::from_ast(agg))),
             BodyItemNode::Negation(neg) => {
                 // Lower negation directly to aggregation with "not"
-                BodyItem::Aggregation(Aggregation {
+                Ok(BodyItem::Aggregation(Aggregation {
                     result_vars: vec![],
                     aggregator: syn::parse_str("not").unwrap(),
                     bound_vars: vec![],
                     relation: neg.rel.to_string(),
                     args: neg.args.into_iter().collect(),
-                })
+                }))
             }
             BodyItemNode::Disjunction(_) => {
-                panic!("disjunction should be desugared to multiple rules")
+                Err("disjunction should be desugared to multiple rules".to_string())
             }
             BodyItemNode::MacroInvocation(_) => {
-                panic!("macro invocations should be expanded")
+                Err("macro invocations should be expanded".to_string())
             }
         }
     }
 }
 
 impl Clause {
-    fn from_ast(cl: ascent_syntax::BodyClauseNode) -> Self {
+    fn from_ast(cl: ascent_syntax::BodyClauseNode) -> Result<Self, String> {
         let args = cl
             .args
             .into_iter()
@@ -221,15 +225,13 @@ impl Clause {
                     if let syn::Expr::Path(p) = &e
                         && let Some(ident) = p.path.get_ident()
                     {
-                        return ClauseArg::Var(ident.to_string());
+                        return Ok(ClauseArg::Var(ident.to_string()));
                     }
-                    ClauseArg::Expr(e)
+                    Ok(ClauseArg::Expr(e))
                 }
-                BodyClauseArg::Pat(_) => {
-                    panic!("pattern args should be desugared")
-                }
+                BodyClauseArg::Pat(_) => Err("pattern args should be desugared".to_string()),
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         let conditions = cl
             .cond_clauses
@@ -237,11 +239,11 @@ impl Clause {
             .map(Condition::from_ast)
             .collect();
 
-        Clause {
+        Ok(Clause {
             relation: cl.rel.to_string(),
             args,
             conditions,
-        }
+        })
     }
 }
 
@@ -306,7 +308,7 @@ mod tests {
 
     fn parse_and_lower(input: &str) -> Program {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        Program::from_ast(ast)
+        Program::from_ast(ast).expect("lowering should succeed")
     }
 
     #[test]

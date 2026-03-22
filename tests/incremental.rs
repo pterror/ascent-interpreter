@@ -7,7 +7,7 @@ use ascent_syntax::AscentProgram;
 
 fn parse(input: &str) -> Program {
     let ast: AscentProgram = syn::parse_str(input).unwrap();
-    Program::from_ast(ast)
+    Program::from_ast(ast).expect("lowering should succeed")
 }
 
 fn collect_rel(engine: &mut Engine, name: &str) -> Vec<Vec<Value>> {

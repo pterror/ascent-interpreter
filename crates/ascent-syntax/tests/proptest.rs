@@ -255,7 +255,7 @@ proptest! {
         let prog = parse_program(&program_text);
         for (rel, expected_arity) in prog.relations.iter().zip(expected_arities.iter()) {
             prop_assert_eq!(
-                rel.field_types.len(),
+                rel.column_types.len(),
                 *expected_arity,
                 "relation {} has wrong arity",
                 rel.name
@@ -282,7 +282,7 @@ proptest! {
         let prog: AscentProgram = syn::parse_str(&decl_text).unwrap();
         prop_assert_eq!(prog.relations.len(), 1);
         prop_assert!(prog.relations[0].is_lattice);
-        prop_assert_eq!(prog.relations[0].field_types.len(), arity);
+        prop_assert_eq!(prog.relations[0].column_types.len(), arity);
     }
 
     // == Category 2: Fact properties ==
@@ -424,7 +424,7 @@ proptest! {
             for arg in cl.args.iter() {
                 if let BodyClauseArg::Expr(expr) = arg {
                     prop_assert!(
-                        !ascent_syntax::is_wild_card(expr),
+                        !ascent_syntax::is_wildcard(expr),
                         "no wildcards should remain after desugaring"
                     );
                 }
@@ -473,7 +473,7 @@ proptest! {
         let program_text = format!("relation alpha({});", ty);
         let prog: AscentProgram = syn::parse_str(&program_text).unwrap();
         prop_assert_eq!(prog.relations.len(), 1);
-        prop_assert_eq!(prog.relations[0].field_types.len(), 1);
+        prop_assert_eq!(prog.relations[0].column_types.len(), 1);
     }
 
     #[test]

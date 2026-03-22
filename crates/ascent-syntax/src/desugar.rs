@@ -19,7 +19,7 @@ use crate::syn_utils::{expr_get_vars, pattern_get_vars};
 use crate::syntax::{
     AggClauseNode, AscentProgram, BodyClauseArg, BodyClauseNode, BodyItemNode, CondClause, RuleNode,
 };
-use crate::utils::{expr_to_ident, is_wild_card};
+use crate::utils::{expr_to_ident, is_wildcard};
 
 /// Generator for unique identifiers.
 #[derive(Clone)]
@@ -192,7 +192,7 @@ pub fn desugar_wildcards(mut rule: RuleNode) -> RuleNode {
         if let BodyItemNode::Clause(bcl) = bi {
             for arg in bcl.args.iter_mut() {
                 if let BodyClauseArg::Expr(expr) = arg
-                    && is_wild_card(expr)
+                    && is_wildcard(expr)
                 {
                     let new_ident = gensym.next_ident("_", expr.span());
                     *expr = parse2(quote! { #new_ident })
@@ -370,7 +370,7 @@ mod tests {
             assert_eq!(cl.args.len(), 2);
             // Second arg should not be a wildcard anymore
             if let BodyClauseArg::Expr(e) = &cl.args[1] {
-                assert!(!is_wild_card(e));
+                assert!(!is_wildcard(e));
             }
         }
     }

@@ -30,7 +30,7 @@ fn agg_min<'a>(values: impl Iterator<Item = &'a [Value]>) -> AggResult {
     for tuple in values {
         if let Some(val) = tuple.first() {
             if let Some(current_min) = min_val {
-                if val.partial_cmp_val(current_min).is_some_and(|o| o.is_lt()) {
+                if val.try_cmp(current_min).is_some_and(|o| o.is_lt()) {
                     min_val = Some(val);
                 }
             } else {
@@ -48,7 +48,7 @@ fn agg_max<'a>(values: impl Iterator<Item = &'a [Value]>) -> AggResult {
     for tuple in values {
         if let Some(val) = tuple.first() {
             if let Some(current_max) = max_val {
-                if val.partial_cmp_val(current_max).is_some_and(|o| o.is_gt()) {
+                if val.try_cmp(current_max).is_some_and(|o| o.is_gt()) {
                     max_val = Some(val);
                 }
             } else {
