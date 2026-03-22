@@ -35,7 +35,7 @@ Public-facing crates (ascent-eval, ascent-interpreter, ascent-syntax, ascent-ir)
 - [DONE] `eval.rs:770` — No fixpoint iteration limit — added `max_iterations` default 10,000 (commit `6ac3f60`) _(severity: medium)_
 - [DONE] `expr.rs:352` — Unbounded range expansion — added MAX_RANGE_SIZE=1M limit (commit `6ac3f60`) _(severity: medium)_
 - [PENDING] `eval.rs:309` — `type_registry` pub field should be private _(severity: medium)_
-- [PENDING] `eval.rs:159` — `TypeRegistry::get` should be `constructor` (matches `destructor`) _(severity: medium)_
+- [DONE] `eval.rs:159` — `TypeRegistry::get` renamed to `constructor` (matches `destructor`) (commit `3aa15b2`) _(severity: medium)_
 - [PENDING] `eval.rs:554` — `Engine::run` takes redundant `&Program` param _(severity: medium)_
 - [PENDING] `eval.rs:588` — `run_incremental` leaks `FxHashSet` in public API _(severity: medium)_
 - [PENDING] `eval.rs:482` — `Engine::insert` accepts wrong-arity tuples silently _(severity: medium)_
