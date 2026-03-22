@@ -52,6 +52,11 @@ pub trait InternTable {
     fn fmt_debug(&self, id: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result;
     /// Compare two values by their ids (within the same table).
     fn cmp_ids(&self, a: u32, b: u32) -> Ordering;
+    /// Resolve an id to its string representation, if this table stores strings.
+    /// Returns `None` for non-string intern tables (e.g. `HashInternTable`).
+    fn resolve_str(&self, _id: u32) -> Option<&str> {
+        None
+    }
 }
 
 /// Object-safe trait for user-defined value types (custom types registered via `Engine::register_type`).
@@ -120,6 +125,11 @@ impl Hasher for HasherWrapper<'_> {
 }
 
 /// A runtime value in the interpreter.
+///
+/// Use accessor methods ([`Value::as_i32`], [`Value::as_bool`], [`Value::as_str`],
+/// [`Value::type_name`]) rather than matching on variants directly — some variants
+/// like [`Value::Interned`] are internal implementation details.
+#[non_exhaustive]
 pub enum Value {
     /// Unit value.
     Unit,
@@ -144,9 +154,14 @@ pub enum Value {
     F64(OrderedFloat<f64>),
     /// Character.
     Char(char),
-    /// An interned value: the intern table owns the backing storage and
-    /// provides display, debug, comparison, and pack/unpack.  Strings,
-    /// and any other `Hash + Eq` type that opts in, are represented here.
+    /// An interned value — an internal representation for efficient storage.
+    ///
+    /// The intern table owns the backing storage and provides display, debug,
+    /// comparison, and pack/unpack. Strings, and any other `Hash + Eq` type
+    /// that opts in, are represented here.
+    ///
+    /// **Users should not match on this variant directly.** Use accessor
+    /// methods like [`Value::as_str`] or [`Value::type_name`] instead.
     Interned(Rc<dyn InternTable>, u32),
     /// Tuple of values.
     Tuple(Rc<Vec<Value>>),
@@ -453,6 +468,43 @@ impl Value {
         match self {
             Value::Bool(v) => Some(*v),
             _ => None,
+        }
+    }
+
+    /// Try to get as a string slice, resolving interned strings transparently.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Interned(table, id) => table.resolve_str(*id),
+            _ => None,
+        }
+    }
+
+    /// Get a display-friendly type name for this value.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Unit => "()",
+            Value::Bool(_) => "bool",
+            Value::I8(_) => "i8",
+            Value::I16(_) => "i16",
+            Value::I32(_) => "i32",
+            Value::I64(_) => "i64",
+            Value::I128(_) => "i128",
+            Value::Isize(_) => "isize",
+            Value::U8(_) => "u8",
+            Value::U16(_) => "u16",
+            Value::U32(_) => "u32",
+            Value::U64(_) => "u64",
+            Value::U128(_) => "u128",
+            Value::Usize(_) => "usize",
+            Value::F32(_) => "f32",
+            Value::F64(_) => "f64",
+            Value::Char(_) => "char",
+            Value::Interned(_, _) => "interned",
+            Value::Tuple(_) => "tuple",
+            Value::Option(_) => "Option",
+            Value::Dual(_) => "Dual",
+            Value::Range { .. } => "Range",
+            Value::Custom(v) => v.type_name(),
         }
     }
 

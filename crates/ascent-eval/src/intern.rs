@@ -73,6 +73,10 @@ impl InternTable for StringTable {
     fn cmp_ids(&self, a: u32, b: u32) -> Ordering {
         self.resolve(a).cmp(self.resolve(b))
     }
+
+    fn resolve_str(&self, id: u32) -> Option<&str> {
+        Some(self.resolve(id))
+    }
 }
 
 thread_local! {
