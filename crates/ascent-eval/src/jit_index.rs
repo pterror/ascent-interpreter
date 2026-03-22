@@ -914,8 +914,24 @@ impl JitDedupTable {
         }
     }
 
+    /// Number of occupied slots.
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Set the occupied-slot count.
+    ///
+    /// # Safety (logical)
+    /// The caller must ensure `c` matches the actual number of non-empty slots
+    /// in the backing store. Used to sync after inline JIT inserts.
+    #[inline]
+    pub fn set_count(&mut self, c: usize) {
+        self.count = c;
+    }
+
     #[cold]
-    fn do_grow(&mut self, cur_cap: usize) {
+    pub(crate) fn do_grow(&mut self, cur_cap: usize) {
         let new_cap = if cur_cap == 0 { 16 } else { cur_cap * 2 };
         let stride = self.stride;
         let mut new_entries = vec![JITDEDUP_EMPTY; new_cap * stride];

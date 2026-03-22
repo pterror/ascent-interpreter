@@ -880,11 +880,20 @@ impl Engine {
 
         // Step 1b: also compile the native function (reads scan data directly from JitRelData).
         // This is compiled speculatively; it will only be used if stage4_native_runtime is Some.
+        // Build flat head_is_sink array: for each rule, for each head, whether the head
+        // relation is a sink (jit_is_sink). Used by the native asm codegen to emit inline
+        // dedup insertion into the aliased total.tuple_set (backed by jit_dedup).
+        let head_is_sink: Vec<bool> = rules.iter().flat_map(|rule| {
+            rule.heads.iter().map(|head| {
+                matches!(self.relations.get(&head.relation),
+                    Some(Relation::Packed(ps)) if ps.jit_is_sink)
+            })
+        }).collect();
         let stage4_native_fn: Option<crate::jit::packed_helpers::StratumStage4Fn> =
             self.jit.as_ref().and_then(|jit_cell| {
                 let mut jit = jit_cell.lock().unwrap();
                 jit.var_count = self.var_count;
-                jit.compile_stratum_stage4_native(stratum_key, rules)
+                jit.compile_stratum_stage4_native(stratum_key, rules, &head_is_sink)
             });
 
         let native_fn_available = stage4_native_fn.is_some();
@@ -1583,6 +1592,7 @@ impl Engine {
         let mut total_rels_vec:       Vec<*mut JitRelData>   = Vec::new();
         let mut head_rels_vec:        Vec<*mut JitRelData>   = Vec::new();
         let mut head_total_rels_vec:  Vec<*mut JitRelData>   = Vec::new();
+        let mut head_packed_rels_vec: Vec<*mut PackedStorage> = Vec::new();
         let mut scan_specs_vec:       Vec<NativeScanSpec>    = Vec::new();
         let mut head_specs_vec:       Vec<NativeHeadSpec>    = Vec::new();
 
@@ -1630,6 +1640,7 @@ impl Engine {
                 let total_ptr = native.total.as_ref() as *const JitRelData as *mut JitRelData;
                 head_rels_vec.push(new_ptr);
                 head_total_rels_vec.push(total_ptr);
+                head_packed_rels_vec.push(ps_ptr);
                 head_specs_vec.push(NativeHeadSpec { rel: ps_ptr });
             }
         }
@@ -1655,6 +1666,7 @@ impl Engine {
         let mut total_rels_buf:        Box<[*mut JitRelData]>    = total_rels_vec.into_boxed_slice();
         let mut head_rels_buf:         Box<[*mut JitRelData]>    = head_rels_vec.into_boxed_slice();
         let mut head_total_rels_buf:   Box<[*mut JitRelData]>    = head_total_rels_vec.into_boxed_slice();
+        let mut head_packed_rels_buf:  Box<[*mut PackedStorage]> = head_packed_rels_vec.into_boxed_slice();
         let     advance_rels_buf:      Box<[*mut PackedStorage]> = advance_rels_vec.into_boxed_slice();
         let     scan_specs_buf:        Box<[NativeScanSpec]>     = scan_specs_vec.into_boxed_slice();
         let     head_specs_buf:        Box<[NativeHeadSpec]>     = head_specs_vec.into_boxed_slice();
@@ -1671,6 +1683,7 @@ impl Engine {
             n_advance_rels,
             _pad2: 0,
             head_total_rels:  head_total_rels_buf.as_mut_ptr(),
+            head_packed_rels: head_packed_rels_buf.as_mut_ptr(),
             scan_specs:       scan_specs_buf.as_ptr(),
             head_specs:       head_specs_buf.as_ptr(),
         });
@@ -1681,6 +1694,7 @@ impl Engine {
             _total_rels_buf:      total_rels_buf,
             _head_rels_buf:       head_rels_buf,
             _head_total_rels_buf: head_total_rels_buf,
+            _head_packed_rels_buf: head_packed_rels_buf,
             _advance_rels_buf:    advance_rels_buf,
             _scan_specs_buf:      scan_specs_buf,
             _head_specs_buf:      head_specs_buf,

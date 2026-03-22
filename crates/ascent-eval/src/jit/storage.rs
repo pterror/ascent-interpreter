@@ -765,7 +765,10 @@ impl JitRelData {
     /// # Safety
     /// `entries` must point to a valid flat slot array of at least `(mask+1)*(arity+1)` u32s,
     /// owned by a `JitDedupTable` that outlives `self`.
-    pub unsafe fn alias_tuple_set(&mut self, entries: *mut u32, mask: u64) {
+    ///
+    /// `count` is the number of occupied slots — stored as `tuple_set.len` so the JIT's
+    /// inline load-factor check works correctly when inserting into the aliased table.
+    pub unsafe fn alias_tuple_set(&mut self, entries: *mut u32, mask: u64, count: u64) {
         // Free any previously owned tuple_set allocation.
         if !self.tuple_set.slots.is_null() && self.tuple_set.mask > 0
             && self._ts_slots_words != usize::MAX
@@ -774,7 +777,7 @@ impl JitRelData {
         }
         self.tuple_set.slots = entries;
         self.tuple_set.mask = mask;
-        self.tuple_set.len = 0; // not used during probe
+        self.tuple_set.len = count;
         // Sentinel: usize::MAX means the slot array is aliased (not owned).
         self._ts_slots_words = usize::MAX;
     }
@@ -1265,6 +1268,40 @@ pub unsafe extern "C" fn jit_tuple_set_grow(ts: *mut JitTupleSet, arity: u32) {
     // Update the JitTupleSet in place (len is unchanged).
     ts.slots = new_ptr;
     ts.mask = new_mask;
+}
+
+/// Called from JIT when an aliased `total.tuple_set` (backed by `JitDedupTable`)
+/// exceeds the load factor threshold.
+///
+/// Grows the `JitDedupTable` via its `Vec`-based allocator (not `free_u32_slice`),
+/// then updates the aliased `JitRelData.tuple_set` to point to the new entries.
+///
+/// # Safety
+/// - `ps` must be a valid `*mut PackedStorage` whose `jit_dedup` is the backing store.
+/// - `total_rel` must be a valid `*mut JitRelData` whose `tuple_set` is aliased to
+///   `ps.jit_dedup.handle.entries`.
+/// - `count` is the current number of occupied slots (JIT-maintained `tuple_set.len`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_dedup_grow_relink(
+    ps: *mut crate::specialized::PackedStorage,
+    total_rel: *mut JitRelData,
+    count: u64,
+) {
+    let ps = unsafe { &mut *ps };
+    let total_rel = unsafe { &mut *total_rel };
+
+    // Sync count from the JIT-maintained tuple_set.len before growing.
+    ps.jit_dedup.set_count(count as usize);
+
+    let cur_cap = ps.jit_dedup.handle.cap as usize;
+    ps.jit_dedup.do_grow(cur_cap);
+
+    // Re-alias: update the JitRelData's tuple_set to point to the grown table.
+    let handle = &ps.jit_dedup.handle;
+    let mask = if handle.cap == 0 { 0 } else { (handle.cap - 1) as u64 };
+    total_rel.tuple_set.slots = handle.entries;
+    total_rel.tuple_set.mask = mask;
+    // len stays the same (JIT will continue incrementing it).
 }
 
 // ─── Static offset assertions ────────────────────────────────────────────────
