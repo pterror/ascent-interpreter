@@ -1146,3 +1146,8 @@ fn test_inline_dedup_multi_head_stratum() {
     let bwd_count = assert_jit_equivalence(program, facts, "backward");
     assert_eq!(bwd_count, 3, "backward should have 3 tuples");
 }
+
+// ─── ascent_macro ground-truth parity tests ─────────────────────────────
+
+// ascent_macro parity tests live in the root crate (tests/macro_parity.rs)
+// because `ascent` is only a dev-dependency of the workspace root.
