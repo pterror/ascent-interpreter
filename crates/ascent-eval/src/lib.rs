@@ -50,8 +50,8 @@ pub mod serde_bridge;
 mod specialized;
 pub mod value;
 
-pub use eval::{Bindings, Engine, TypeRegistry, ValueDestructor, VarId, VarInterner};
+pub use eval::{Engine, TypeRegistry, ValueDestructor};
 #[cfg(feature = "jit")]
 pub use eval::SharedJitCompiler;
-pub use relation::{Relation, RelationStorage, SourceId};
+pub use relation::{Relation, SourceId};
 pub use value::{DynValue, Tuple, Value};

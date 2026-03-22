@@ -457,6 +457,11 @@ impl Engine {
             .insert(name, Box::new(destructor));
     }
 
+    /// Returns a reference to the type registry.
+    pub fn type_registry(&self) -> &TypeRegistry {
+        &self.type_registry
+    }
+
     /// Downcast a custom value to a concrete type.
     pub fn downcast_custom<T: DynValue + 'static>(value: &Value) -> Option<&T> {
         if let Value::Custom(v) = value {

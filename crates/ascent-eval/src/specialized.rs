@@ -1098,7 +1098,7 @@ impl PackedStorage {
     ///
     /// Called when a packed relation receives a value that can't be packed
     /// (type mismatch), requiring fallback to generic storage.
-    pub fn into_generic(self) -> super::RelationStorage {
+    pub fn into_generic(self) -> crate::relation::RelationStorage {
         use std::hash::{Hash, Hasher};
 
         let arity = self.arity;
@@ -1141,7 +1141,7 @@ impl PackedStorage {
         // Build recent_set from recent for generic storage (PackedStorage no longer tracks it).
         let recent_set: FxHashSet<usize> = self.recent.iter().copied().collect();
 
-        super::RelationStorage {
+        crate::relation::RelationStorage {
             data: self.value_data,
             count: self.count,
             dedup,
