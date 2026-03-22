@@ -590,6 +590,90 @@ The JIT executes **2.83× more instructions** and hits main memory **101× more 
 
 - [x] **JitColIndex binary-search existence check / merge intersection (2026-03-21):** Implemented as a full two-pointer sorted-merge intersection (`detect_merge_pattern` + `emit_merge_scan_exist`). Instead of binary-searching per inner element, fuses the arity-2 EDB col-scan (level L) and the fully-bound arity-2 EDB existence check (level L+1) into a single O(|A|+|B|) merge loop. Both JitColIndex sorted slices (~|A| and ~|B| entries) are L1-resident. Results (same-machine, separate runs): n=50: neutral (JitTupleSet 49KB still L2-resident, merge branch mispredictions offset ~50% instruction savings); n=100: ~2% improvement (noise); n=200: eval-only 333ms → 270ms = **1.23×** speedup (JitTupleSet 393KB spills to L3, merge slices stay in L1). The sorted merge is neutral-or-better for all n and closes the large-n gap progressively.
 
+### Data-structure parity with ascent_macro (next major initiative)
+
+**Diagnosis (2026-03-22):** The instruction gap at n=50 is 3.5× (8.43M vs 2.43M per iter). Disassembly
+of the macro's triangle run function reveals the reference implementation:
+
+- **Index**: `FxHashMap<i32, Vec<i32>>` — one FxHash probe to get a bucket, then sequential scan of a flat Vec
+- **Dedup**: single `FxHashSet<(i32,i32,i32)>` — one FxHash insert, deduplication is natural
+- **Hot inner loop**: `imul rcx, 0xf1357aea2e62a9c5` (FxHash), then hashbrown Swiss table probe (`pcmpeqb`/`pmovmskb`)
+
+The JIT uses THREE separate hash structures where the macro uses ONE:
+1. `JitColIndex` (sorted arrays, bulk-rebuilt each iteration) — replaces `FxHashMap<u32, Vec<u32>>`
+2. `JitTupleSet` (separate full-tuple hash set for existence checks)
+3. `JitDedupTable` (another separate hash set just for output dedup) + batch flush to PackedStorage
+
+The batch flush alone (writing 19,600 triangles at n=50 through three separate paths into PackedStorage,
+then rebuilding JitColIndex sorted arrays) accounts for ~4–6M extra instructions per iteration. The
+reference code has none of this — tuples go directly into the output HashSet.
+
+**Root cause:** PackedStorage requires bulk index rebuilds; this forced the batch-flush architecture,
+which required the separate JitDedupTable, which is the primary overhead. The fix is to make the JIT
+write directly into live data structures that support incremental insert.
+
+**Goal:** make both the JIT and the interpreter fallback use the same data layout as the macro —
+`FxHash` key→`Vec<u32>` for column indices, a single hash set for output dedup — so the JIT can
+emit exactly the asm the macro emits, and the interpreter fallback gets the same data structures
+optimized by LLVM.
+
+**Why this is achievable:** We have the reference machine code. It is `imul` + hashbrown probe.
+The JIT already emits inline hash probes (JitTupleSet). Matching the macro requires only:
+1. Same data layout (FxHash key→Vec instead of sorted-array JitColIndex)
+2. Same output path (direct insert into the output relation, not a separate dedup table + flush)
+
+No JIT code quality problem. No LLVM magic. Just wrong data structures.
+
+**New architecture:**
+
+```
+RelIndex (#[repr(C)]):          — replaces JitColIndex
+  buckets: *mut u32  @ 0        — FxHash open-addressed keys (u32::MAX = empty)
+  offsets: *mut u32  @ 8        — offsets[i] = start in vals; offsets[i+1] = end
+  vals:    *mut u32  @ 16       — flat value array (sequential scan, no sort needed)
+  mask:    u32       @ 24       — cap-1 (power-of-2)
+  len:     u32       @ 28       — occupied bucket count
+
+  insert(key, val): FxHash(key) & mask → probe buckets[] → append val to vals[],
+                    update offsets[]. JIT inlines this. Rust callback only for resize.
+  probe(key) → (ptr, len): FxHash(key) & mask → probe buckets[] → return
+                    (vals + offsets[slot], offsets[slot+1] - offsets[slot]).
+```
+
+Output relation: use `JitTupleSet` (already exists) directly as the output dedup + storage.
+No separate `JitDedupTable`. No batch flush. JIT emits:
+1. Probe output `JitTupleSet` (already inlined) — skip if duplicate
+2. Insert into output `JitTupleSet` (extend existing inline insert logic)
+3. Append to output `data` flat buffer (already inlined for JitRelData)
+
+`advance()` at end of fixpoint iteration: swap `new` → `recent` → merged into `total`.
+No JitColIndex sort. No PackedStorage rebuild cycle. Just pointer swaps + RelIndex incremental inserts.
+
+**Implementation plan:**
+
+- [ ] **Phase 1 — `RelIndex` struct**: new `#[repr(C)]` index replacing `JitColIndex`. FxHash
+  key→(offset, len) in a single flat allocation. Supports inline probe AND incremental insert
+  (vs JitColIndex's sort-on-rebuild). Rust API for interpreter path; JIT inlines fast path.
+  ~150 lines in `jit_index.rs`.
+
+- [ ] **Phase 2 — inline insert in JIT**: extend `emit_tuple_set_probe` / head-emission asm to
+  write directly into the output `JitTupleSet` and `data` buffer inline. Rust callback only for
+  table growth (amortized). Eliminates `JitDedupTable`, batch flush, `advance_jit_inner` loop.
+  ~200 lines in `asm_codegen.rs`.
+
+- [ ] **Phase 3 — interpreter uses same layout**: replace `PackedStorage`'s interpreter-path
+  indices (`indices`, `value_data`, `recent_col_indices`) with `RelIndex`. Interpreter inner loop
+  iterates `vals` slice directly — tight sequential scan, LLVM optimizes. Eliminates the dual
+  storage format (interpreter-path + JIT-path) that currently requires `ensure_interp_synced()`.
+
+- [ ] **Phase 4 — delete dead infrastructure**: remove `JitColIndex` (sorted, bulk-rebuilt),
+  `JitDedupTable`, `advance_jit_inner` batch flush loop, `ensure_interp_synced`, dual-buffer
+  bookkeeping in `PackedStorage`. Net: large reduction in code and allocations.
+
+**Expected outcome:** JIT hot path matches the macro's instruction pattern (FxHash probe + sequential
+Vec scan + single HashSet insert). Interpreter fallback uses the same structures with LLVM optimization.
+Both paths share one data layout — no conversion overhead, no sync needed.
+
 ### Not planned
 
 - ~Parallel SCC evaluation~ — strata are sequential by definition; intra-stratum parallelism is a research problem
