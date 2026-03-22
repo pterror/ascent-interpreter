@@ -21,7 +21,321 @@ use ascent_syntax::{
     AggClauseNode, AscentProgram, BodyClauseArg, BodyItemNode, CondClause, GeneratorNode,
     HeadClauseNode, HeadItemNode, RuleNode, desugar::desugar_program,
 };
-use syn::{Expr, Type};
+use quote::ToTokens;
+
+// ─── IR-native types ────────────────────────────────────────────────
+
+/// IR-native expression, replacing `syn::Expr` in public type signatures.
+#[derive(Debug, Clone)]
+pub enum IrExpr {
+    Lit(IrLit),
+    Var(String),
+    Binary(IrBinOp, Box<IrExpr>, Box<IrExpr>),
+    Unary(IrUnOp, Box<IrExpr>),
+    Range {
+        start: Box<IrExpr>,
+        end: Box<IrExpr>,
+        inclusive: bool,
+    },
+    Tuple(Vec<IrExpr>),
+    Call(String, Vec<IrExpr>),
+    MethodCall(Box<IrExpr>, String, Vec<IrExpr>),
+    Cast(Box<IrExpr>, String),
+    Array(Vec<IrExpr>),
+    /// Opaque expression serialized as tokens. Re-parsed at eval time.
+    Raw(String),
+}
+
+/// IR-native literal value.
+#[derive(Debug, Clone)]
+pub enum IrLit {
+    Int(i128),
+    Float(f64),
+    Bool(bool),
+    Char(char),
+    String(String),
+}
+
+/// IR-native binary operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+}
+
+/// IR-native unary operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrUnOp {
+    Neg,
+    Not,
+    Deref,
+}
+
+/// IR-native type representation, replacing `syn::Type` in public type signatures.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IrType {
+    /// A simple named type (e.g., `i32`, `String`).
+    Named(String),
+    /// A complex type serialized as a string (e.g., `Vec<i32>`).
+    Complex(String),
+}
+
+/// IR-native pattern, replacing `syn::Pat` in public type signatures.
+#[derive(Debug, Clone)]
+pub enum IrPattern {
+    Wild,
+    Var(String, Option<Box<IrPattern>>),
+    Lit(IrLit),
+    Tuple(Vec<IrPattern>),
+    TupleStruct(String, Vec<IrPattern>),
+    Path(String),
+    Or(Vec<IrPattern>),
+    Ref(Box<IrPattern>),
+}
+
+/// IR-native attribute, replacing `syn::Attribute` in public type signatures.
+#[derive(Debug, Clone)]
+pub struct IrAttribute {
+    pub name: String,
+    pub args: Option<String>,
+}
+
+// ─── Conversion functions ───────────────────────────────────────────
+
+/// Lower a `syn::Expr` to `IrExpr`.
+pub fn lower_expr(expr: syn::Expr) -> IrExpr {
+    match expr {
+        syn::Expr::Lit(ref lit) => match lower_syn_lit(&lit.lit) {
+            Some(ir_lit) => IrExpr::Lit(ir_lit),
+            None => IrExpr::Raw(expr.to_token_stream().to_string()),
+        },
+        syn::Expr::Path(ref p) => {
+            if let Some(ident) = p.path.get_ident() {
+                let name = ident.to_string();
+                match name.as_str() {
+                    "true" => IrExpr::Lit(IrLit::Bool(true)),
+                    "false" => IrExpr::Lit(IrLit::Bool(false)),
+                    _ => IrExpr::Var(name),
+                }
+            } else {
+                IrExpr::Raw(expr.to_token_stream().to_string())
+            }
+        }
+        syn::Expr::Binary(bin) => match lower_binop(&bin.op) {
+            Some(op) => {
+                let left = lower_expr(*bin.left);
+                let right = lower_expr(*bin.right);
+                IrExpr::Binary(op, Box::new(left), Box::new(right))
+            }
+            None => IrExpr::Raw(syn::Expr::Binary(bin).to_token_stream().to_string()),
+        },
+        syn::Expr::Unary(u) => match lower_unop(&u.op) {
+            Some(op) => IrExpr::Unary(op, Box::new(lower_expr(*u.expr))),
+            None => IrExpr::Raw(syn::Expr::Unary(u).to_token_stream().to_string()),
+        },
+        syn::Expr::Paren(p) => lower_expr(*p.expr),
+        syn::Expr::Reference(r) => lower_expr(*r.expr),
+        syn::Expr::Range(r) => {
+            let start = r.start.map(|e| Box::new(lower_expr(*e)));
+            let end = r.end.map(|e| Box::new(lower_expr(*e)));
+            match (start, end) {
+                (Some(s), Some(e)) => IrExpr::Range {
+                    start: s,
+                    end: e,
+                    inclusive: matches!(r.limits, syn::RangeLimits::Closed(_)),
+                },
+                _ => IrExpr::Raw(
+                    syn::Expr::Range(syn::ExprRange {
+                        attrs: r.attrs,
+                        start: None,
+                        limits: r.limits,
+                        end: None,
+                    })
+                    .to_token_stream()
+                    .to_string(),
+                ),
+            }
+        }
+        syn::Expr::Tuple(t) => IrExpr::Tuple(t.elems.into_iter().map(lower_expr).collect()),
+        syn::Expr::Call(call) => {
+            if let syn::Expr::Path(p) = &*call.func {
+                let name = p
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let args: Vec<IrExpr> = call.args.into_iter().map(lower_expr).collect();
+                IrExpr::Call(name, args)
+            } else {
+                IrExpr::Raw(syn::Expr::Call(call).to_token_stream().to_string())
+            }
+        }
+        syn::Expr::MethodCall(mc) => {
+            let receiver = lower_expr(*mc.receiver);
+            let method = mc.method.to_string();
+            let args: Vec<IrExpr> = mc.args.into_iter().map(lower_expr).collect();
+            IrExpr::MethodCall(Box::new(receiver), method, args)
+        }
+        syn::Expr::Cast(cast) => {
+            if let syn::Type::Path(tp) = &*cast.ty {
+                let target = tp
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                IrExpr::Cast(Box::new(lower_expr(*cast.expr)), target)
+            } else {
+                IrExpr::Raw(syn::Expr::Cast(cast).to_token_stream().to_string())
+            }
+        }
+        syn::Expr::Array(arr) => IrExpr::Array(arr.elems.into_iter().map(lower_expr).collect()),
+        other => IrExpr::Raw(other.to_token_stream().to_string()),
+    }
+}
+
+fn lower_syn_lit(lit: &syn::Lit) -> Option<IrLit> {
+    match lit {
+        syn::Lit::Int(i) => i.base10_parse::<i128>().ok().map(IrLit::Int),
+        syn::Lit::Float(f) => f.base10_parse::<f64>().ok().map(IrLit::Float),
+        syn::Lit::Bool(b) => Some(IrLit::Bool(b.value)),
+        syn::Lit::Str(s) => Some(IrLit::String(s.value())),
+        syn::Lit::Char(c) => Some(IrLit::Char(c.value())),
+        _ => None,
+    }
+}
+
+fn lower_binop(op: &syn::BinOp) -> Option<IrBinOp> {
+    Some(match op {
+        syn::BinOp::Add(_) => IrBinOp::Add,
+        syn::BinOp::Sub(_) => IrBinOp::Sub,
+        syn::BinOp::Mul(_) => IrBinOp::Mul,
+        syn::BinOp::Div(_) => IrBinOp::Div,
+        syn::BinOp::Rem(_) => IrBinOp::Rem,
+        syn::BinOp::BitAnd(_) => IrBinOp::BitAnd,
+        syn::BinOp::BitOr(_) => IrBinOp::BitOr,
+        syn::BinOp::BitXor(_) => IrBinOp::BitXor,
+        syn::BinOp::Shl(_) => IrBinOp::Shl,
+        syn::BinOp::Shr(_) => IrBinOp::Shr,
+        syn::BinOp::Eq(_) => IrBinOp::Eq,
+        syn::BinOp::Ne(_) => IrBinOp::Ne,
+        syn::BinOp::Lt(_) => IrBinOp::Lt,
+        syn::BinOp::Le(_) => IrBinOp::Le,
+        syn::BinOp::Gt(_) => IrBinOp::Gt,
+        syn::BinOp::Ge(_) => IrBinOp::Ge,
+        syn::BinOp::And(_) => IrBinOp::And,
+        syn::BinOp::Or(_) => IrBinOp::Or,
+        _ => return None,
+    })
+}
+
+fn lower_unop(op: &syn::UnOp) -> Option<IrUnOp> {
+    Some(match op {
+        syn::UnOp::Neg(_) => IrUnOp::Neg,
+        syn::UnOp::Not(_) => IrUnOp::Not,
+        syn::UnOp::Deref(_) => IrUnOp::Deref,
+        _ => return None,
+    })
+}
+
+/// Lower a `syn::Type` to `IrType`.
+pub fn lower_type(ty: syn::Type) -> IrType {
+    if let syn::Type::Path(tp) = &ty
+        && let Some(ident) = tp.path.get_ident()
+    {
+        return IrType::Named(ident.to_string());
+    }
+    IrType::Complex(ty.to_token_stream().to_string())
+}
+
+/// Lower a `syn::Pat` to `IrPattern`.
+pub fn lower_pattern(pat: syn::Pat) -> IrPattern {
+    match pat {
+        syn::Pat::Wild(_) => IrPattern::Wild,
+        syn::Pat::Ident(ident) => {
+            let name = ident.ident.to_string();
+            if name == "_" {
+                return IrPattern::Wild;
+            }
+            let sub = ident
+                .subpat
+                .map(|(_, sub)| Box::new(lower_pattern(*sub)));
+            IrPattern::Var(name, sub)
+        }
+        syn::Pat::Lit(lit) => {
+            // PatLit is an alias for ExprLit in syn 2.0 — fields are `attrs` and `lit`
+            if let Some(ir_lit) = lower_syn_lit(&lit.lit) {
+                IrPattern::Lit(ir_lit)
+            } else {
+                IrPattern::Lit(IrLit::String(lit.lit.to_token_stream().to_string()))
+            }
+        }
+        syn::Pat::Tuple(tuple) => {
+            IrPattern::Tuple(tuple.elems.into_iter().map(lower_pattern).collect())
+        }
+        syn::Pat::TupleStruct(ts) => {
+            let path_str = ts
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            let fields: Vec<IrPattern> = ts.elems.into_iter().map(lower_pattern).collect();
+            IrPattern::TupleStruct(path_str, fields)
+        }
+        syn::Pat::Path(p) => {
+            let path_str = p
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            IrPattern::Path(path_str)
+        }
+        syn::Pat::Or(or_pat) => {
+            IrPattern::Or(or_pat.cases.into_iter().map(lower_pattern).collect())
+        }
+        syn::Pat::Reference(r) => IrPattern::Ref(Box::new(lower_pattern(*r.pat))),
+        syn::Pat::Paren(p) => lower_pattern(*p.pat),
+        // Unknown patterns — encode as a Path with the token string
+        other => IrPattern::Path(other.to_token_stream().to_string()),
+    }
+}
+
+/// Lower a `syn::Attribute` to `IrAttribute`.
+pub fn lower_attribute(attr: syn::Attribute) -> IrAttribute {
+    let name = attr
+        .path()
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let args = match &attr.meta {
+        syn::Meta::Path(_) => None,
+        syn::Meta::List(list) => Some(list.tokens.to_string()),
+        syn::Meta::NameValue(nv) => Some(nv.value.to_token_stream().to_string()),
+    };
+    IrAttribute { name, args }
+}
+
+// ─── Public IR types ────────────────────────────────────────────────
 
 /// A complete Ascent program in IR form.
 #[derive(Debug, Clone)]
@@ -37,14 +351,14 @@ pub struct Program {
 pub struct Relation {
     /// Relation name.
     pub name: String,
-    /// Column types (as syn::Type for display).
-    pub column_types: Vec<Type>,
+    /// Column types.
+    pub column_types: Vec<IrType>,
     /// Whether this is a lattice.
     pub is_lattice: bool,
     /// Initial values (if any).
-    pub initialization: Option<Expr>,
+    pub initialization: Option<IrExpr>,
     /// Attributes on the relation declaration (e.g., `#[ds(btree)]`).
-    pub attrs: Vec<syn::Attribute>,
+    pub attrs: Vec<IrAttribute>,
 }
 
 /// A rule: head <- body.
@@ -62,7 +376,7 @@ pub struct HeadClause {
     /// Relation to insert into.
     pub relation: String,
     /// Expressions for each column.
-    pub args: Vec<Expr>,
+    pub args: Vec<IrExpr>,
 }
 
 /// A body item in a rule.
@@ -95,7 +409,7 @@ pub enum ClauseArg {
     /// A variable to bind.
     Var(String),
     /// An expression to match.
-    Expr(Expr),
+    Expr(IrExpr),
 }
 
 /// A generator: `for pattern in expr`.
@@ -104,20 +418,20 @@ pub struct Generator {
     /// Variables to bind.
     pub vars: Vec<String>,
     /// Expression to iterate.
-    pub expr: Expr,
+    pub expr: IrExpr,
     /// The full pattern (for complex patterns).
-    pub pattern: syn::Pat,
+    pub pattern: IrPattern,
 }
 
 /// A filter condition.
 #[derive(Debug, Clone)]
 pub enum Condition {
     /// `if expr`
-    If(Expr),
+    If(IrExpr),
     /// `if let pattern = expr`
-    IfLet { pattern: syn::Pat, expr: Expr },
+    IfLet { pattern: IrPattern, expr: IrExpr },
     /// `let pattern = expr`
-    Let { pattern: syn::Pat, expr: Expr },
+    Let { pattern: IrPattern, expr: IrExpr },
 }
 
 /// An aggregation clause.
@@ -126,14 +440,16 @@ pub struct Aggregation {
     /// Variables to bind from the aggregation result.
     pub result_vars: Vec<String>,
     /// The aggregator expression/path.
-    pub aggregator: Expr,
+    pub aggregator: IrExpr,
     /// Variables to aggregate over.
     pub bound_vars: Vec<String>,
     /// Relation to aggregate from.
     pub relation: String,
     /// Arguments to the relation.
-    pub args: Vec<Expr>,
+    pub args: Vec<IrExpr>,
 }
+
+// ─── from_ast implementations ───────────────────────────────────────
 
 impl Program {
     /// Lower an AST program to IR.
@@ -148,10 +464,10 @@ impl Program {
                 rel.name.to_string(),
                 Relation {
                     name: rel.name.to_string(),
-                    column_types: rel.column_types.into_iter().collect(),
+                    column_types: rel.column_types.into_iter().map(lower_type).collect(),
                     is_lattice: rel.is_lattice,
-                    initialization: rel.initialization,
-                    attrs: rel.attrs,
+                    initialization: rel.initialization.map(lower_expr),
+                    attrs: rel.attrs.into_iter().map(lower_attribute).collect(),
                 },
             );
         }
@@ -192,7 +508,7 @@ impl HeadClause {
     fn from_ast(hc: HeadClauseNode) -> Self {
         HeadClause {
             relation: hc.rel.to_string(),
-            args: hc.args.into_iter().collect(),
+            args: hc.args.into_iter().map(lower_expr).collect(),
         }
     }
 }
@@ -210,10 +526,10 @@ impl BodyItem {
                 // Lower negation directly to aggregation with "not"
                 Ok(BodyItem::Aggregation(Aggregation {
                     result_vars: vec![],
-                    aggregator: syn::parse_str("not").unwrap(),
+                    aggregator: IrExpr::Var("not".to_string()),
                     bound_vars: vec![],
                     relation: neg.rel.to_string(),
-                    args: neg.args.into_iter().collect(),
+                    args: neg.args.into_iter().map(lower_expr).collect(),
                 }))
             }
             BodyItemNode::Disjunction(_) => {
@@ -239,7 +555,7 @@ impl Clause {
                     {
                         return Ok(ClauseArg::Var(ident.to_string()));
                     }
-                    Ok(ClauseArg::Expr(e))
+                    Ok(ClauseArg::Expr(lower_expr(e)))
                 }
                 BodyClauseArg::Pat(_) => Err("pattern args should be desugared".to_string()),
             })
@@ -268,8 +584,8 @@ impl Generator {
 
         Generator {
             vars,
-            expr: generator.expr,
-            pattern: generator.pattern,
+            expr: lower_expr(generator.expr),
+            pattern: lower_pattern(generator.pattern),
         }
     }
 }
@@ -277,14 +593,14 @@ impl Generator {
 impl Condition {
     fn from_ast(cond: CondClause) -> Self {
         match cond {
-            CondClause::If(c) => Condition::If(c.cond),
+            CondClause::If(c) => Condition::If(lower_expr(c.cond)),
             CondClause::IfLet(c) => Condition::IfLet {
-                pattern: c.pattern,
-                expr: c.expr,
+                pattern: lower_pattern(c.pattern),
+                expr: lower_expr(c.expr),
             },
             CondClause::Let(c) => Condition::Let {
-                pattern: c.pattern,
-                expr: c.expr,
+                pattern: lower_pattern(c.pattern),
+                expr: lower_expr(c.expr),
             },
         }
     }
@@ -300,8 +616,11 @@ impl Aggregation {
         let bound_vars = agg.bound_args.into_iter().map(|i| i.to_string()).collect();
 
         let aggregator = match agg.aggregator {
-            ascent_syntax::AggregatorNode::Path(p) => syn::parse2(quote::quote! { #p }).unwrap(),
-            ascent_syntax::AggregatorNode::Expr(e) => e,
+            ascent_syntax::AggregatorNode::Path(p) => {
+                let expr: syn::Expr = syn::parse2(quote::quote! { #p }).unwrap();
+                lower_expr(expr)
+            }
+            ascent_syntax::AggregatorNode::Expr(e) => lower_expr(e),
         };
 
         Aggregation {
@@ -309,7 +628,7 @@ impl Aggregation {
             aggregator,
             bound_vars,
             relation: agg.rel.to_string(),
-            args: agg.rel_args.into_iter().collect(),
+            args: agg.rel_args.into_iter().map(lower_expr).collect(),
         }
     }
 }

@@ -16,7 +16,7 @@ use crate::compiled::{
     CAggArg, CAggregation, CBodyItem, CClause, CClauseArg, CCondition, CHeadClause, CRule,
     compile_rule, eval_cexpr,
 };
-use crate::expr::{eval_expr, expand_range};
+use crate::expr::expand_range;
 use crate::relation::{Relation, SourceId};
 use crate::value::{DynValue, Tuple, Value};
 
@@ -353,12 +353,9 @@ impl Engine {
             let types: Vec<Option<String>> = rel
                 .column_types
                 .iter()
-                .map(|ty| {
-                    if let syn::Type::Path(tp) = ty {
-                        tp.path.get_ident().map(|id| id.to_string())
-                    } else {
-                        None
-                    }
+                .map(|ty| match ty {
+                    ascent_ir::IrType::Named(name) => Some(name.clone()),
+                    ascent_ir::IrType::Complex(_) => None,
                 })
                 .collect();
             relations.insert(
@@ -782,12 +779,9 @@ impl Engine {
             let types: Vec<Option<String>> = rel
                 .column_types
                 .iter()
-                .map(|ty| {
-                    if let syn::Type::Path(tp) = ty {
-                        tp.path.get_ident().map(|id| id.to_string())
-                    } else {
-                        None
-                    }
+                .map(|ty| match ty {
+                    ascent_ir::IrType::Named(name) => Some(name.clone()),
+                    ascent_ir::IrType::Complex(_) => None,
                 })
                 .collect();
             self.relations
@@ -2870,7 +2864,7 @@ fn compute_rule_sccs(program: &Program) -> Vec<Vec<usize>> {
 ///
 /// Uses the undo log to track insertions for rollback on partial match failure.
 fn match_pattern(
-    pat: &syn::Pat,
+    pat: &ascent_ir::IrPattern,
     value: &Value,
     bindings: &mut Bindings,
     registry: Option<&TypeRegistry>,
@@ -2879,48 +2873,40 @@ fn match_pattern(
 ) -> bool {
     match pat {
         // Wildcard: always matches, binds nothing
-        syn::Pat::Wild(_) => true,
+        ascent_ir::IrPattern::Wild => true,
 
-        // Variable binding: `x` or `mut x`
-        syn::Pat::Ident(ident) => {
-            let name = ident.ident.to_string();
+        // Variable binding: `x` or `x @ subpat`
+        ascent_ir::IrPattern::Var(name, sub_pat) => {
             // Handle `_` identifiers as wildcards
             if name == "_" {
                 return true;
             }
             // If there's a subpattern (`name @ pattern`), match it too
-            if let Some((_, sub_pat)) = &ident.subpat
-                && !match_pattern(sub_pat, value, bindings, registry, interner, undo)
+            if let Some(sub) = sub_pat
+                && !match_pattern(sub, value, bindings, registry, interner, undo)
             {
                 return false;
             }
-            let var_id = interner.intern(&name);
+            let var_id = interner.intern(name);
             let old = bindings.insert(var_id, value.clone());
             undo.push((var_id, old));
             true
         }
 
         // Literal pattern: `42`, `true`, `'a'`
-        syn::Pat::Lit(expr_lit) => {
-            let expr = syn::Expr::Lit(expr_lit.clone());
-            if let Some(lit_val) = eval_expr(&expr, bindings, interner) {
-                lit_val == *value
-            } else {
-                false
-            }
+        ascent_ir::IrPattern::Lit(ir_lit) => {
+            let lit_val = crate::compiled::ir_lit_to_value(ir_lit);
+            lit_val == *value
         }
 
-        // Reference pattern: `&x` — in Datalog context, match the inner pattern
-        syn::Pat::Reference(r) => match_pattern(&r.pat, value, bindings, registry, interner, undo),
-
         // Tuple pattern: `(a, b, c)`
-        syn::Pat::Tuple(tuple) => {
+        ascent_ir::IrPattern::Tuple(pats) => {
             if let Value::Tuple(vals) = value {
-                if vals.len() != tuple.elems.len() {
+                if vals.len() != pats.len() {
                     return false;
                 }
                 let cp = undo.len();
-                for (pat_elem, val) in tuple.elems.iter().zip(vals.iter()) {
+                for (pat_elem, val) in pats.iter().zip(vals.iter()) {
                     if !match_pattern(pat_elem, val, bindings, registry, interner, undo) {
                         rollback(bindings, undo, cp);
                         return false;
@@ -2933,64 +2919,58 @@ fn match_pattern(
         }
 
         // Tuple struct pattern: `Some(x)`, `Dual(x)`, or custom types
-        syn::Pat::TupleStruct(ts) => {
-            let path_str = path_to_string(&ts.path);
-            match path_str.as_str() {
-                "Some" => {
-                    if let Value::Option(Some(inner)) = value
-                        && ts.elems.len() == 1
-                    {
-                        match_pattern(&ts.elems[0], inner, bindings, registry, interner, undo)
-                    } else {
-                        false
-                    }
-                }
-                "Dual" => {
-                    if let Value::Dual(inner) = value
-                        && ts.elems.len() == 1
-                    {
-                        match_pattern(&ts.elems[0], inner, bindings, registry, interner, undo)
-                    } else {
-                        false
-                    }
-                }
-                "None" => matches!(value, Value::Option(None)),
-                _ => {
-                    if let Some(reg) = registry
-                        && let Some(destructor) = reg.destructor(&path_str)
-                        && let Some(fields) = destructor(value)
-                        && fields.len() == ts.elems.len()
-                    {
-                        let cp = undo.len();
-                        for (pat_elem, val) in ts.elems.iter().zip(fields.iter()) {
-                            if !match_pattern(pat_elem, val, bindings, registry, interner, undo) {
-                                rollback(bindings, undo, cp);
-                                return false;
-                            }
-                        }
-                        true
-                    } else {
-                        false
-                    }
+        ascent_ir::IrPattern::TupleStruct(path_str, fields) => match path_str.as_str() {
+            "Some" => {
+                if let Value::Option(Some(inner)) = value
+                    && fields.len() == 1
+                {
+                    match_pattern(&fields[0], inner, bindings, registry, interner, undo)
+                } else {
+                    false
                 }
             }
-        }
+            "Dual" => {
+                if let Value::Dual(inner) = value
+                    && fields.len() == 1
+                {
+                    match_pattern(&fields[0], inner, bindings, registry, interner, undo)
+                } else {
+                    false
+                }
+            }
+            "None" => matches!(value, Value::Option(None)),
+            _ => {
+                if let Some(reg) = registry
+                    && let Some(destructor) = reg.destructor(path_str)
+                    && let Some(field_vals) = destructor(value)
+                    && field_vals.len() == fields.len()
+                {
+                    let cp = undo.len();
+                    for (pat_elem, val) in fields.iter().zip(field_vals.iter()) {
+                        if !match_pattern(pat_elem, val, bindings, registry, interner, undo) {
+                            rollback(bindings, undo, cp);
+                            return false;
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        },
 
         // Path pattern: `None`, `true`, `false`
-        syn::Pat::Path(p) => {
-            let path_str = path_to_string(&p.path);
-            match path_str.as_str() {
-                "None" => matches!(value, Value::Option(None)),
-                "true" => matches!(value, Value::Bool(true)),
-                "false" => matches!(value, Value::Bool(false)),
-                _ => false,
-            }
-        }
+        ascent_ir::IrPattern::Path(path_str) => match path_str.as_str() {
+            "None" => matches!(value, Value::Option(None)),
+            "true" => matches!(value, Value::Bool(true)),
+            "false" => matches!(value, Value::Bool(false)),
+            _ => false,
+        },
 
         // Or pattern: `A | B`
-        syn::Pat::Or(or_pat) => {
+        ascent_ir::IrPattern::Or(cases) => {
             let cp = undo.len();
-            for case in &or_pat.cases {
+            for case in cases {
                 if match_pattern(case, value, bindings, registry, interner, undo) {
                     return true;
                 }
@@ -2999,19 +2979,11 @@ fn match_pattern(
             false
         }
 
-        // Parenthesized: `(pattern)`
-        syn::Pat::Paren(p) => match_pattern(&p.pat, value, bindings, registry, interner, undo),
-
-        _ => false,
+        // Reference pattern: `&x` — in Datalog context, match the inner pattern
+        ascent_ir::IrPattern::Ref(inner) => {
+            match_pattern(inner, value, bindings, registry, interner, undo)
+        }
     }
-}
-
-/// Convert a syn::Path to a simple string (last segment).
-fn path_to_string(path: &syn::Path) -> String {
-    path.segments
-        .last()
-        .map(|s| s.ident.to_string())
-        .unwrap_or_default()
 }
 
 #[cfg(feature = "serde")]
