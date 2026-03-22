@@ -3,6 +3,7 @@
 //! Cranelift has been removed. Stage 4 (asm backend) is the sole JIT execution path.
 
 pub(crate) mod layout;
+pub mod rel_index;
 pub mod storage;
 #[cfg(feature = "specialized")]
 pub(crate) mod packed_helpers;
