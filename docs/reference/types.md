@@ -69,6 +69,8 @@ Register a type with explicit constructor and destructor:
 ```rust
 use ascent_eval::Engine;
 use ascent_eval::value::Value;
+use ascent_ir::Program;
+use ascent_syntax::AscentProgram;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Point { x: i32, y: i32 }
@@ -79,7 +81,10 @@ impl std::fmt::Display for Point {
     }
 }
 
-let mut engine = Engine::new();
+let src = "relation points(Point);";
+let ast = syn::parse_str::<AscentProgram>(src).unwrap();
+let program = Program::from_ast(ast);
+let mut engine = Engine::new(&program);
 engine.register_type(
     "Point",
     |args| {
@@ -104,6 +109,8 @@ With the `serde` feature, types implementing `Serialize + Deserialize` can be re
 
 ```rust
 use ascent_eval::Engine;
+use ascent_ir::Program;
+use ascent_syntax::AscentProgram;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord,
          serde::Serialize, serde::Deserialize)]
@@ -115,7 +122,10 @@ impl std::fmt::Display for Point {
     }
 }
 
-let mut engine = Engine::new();
+let src = "relation points(Point);";
+let ast = syn::parse_str::<AscentProgram>(src).unwrap();
+let program = Program::from_ast(ast);
+let mut engine = Engine::new(&program);
 engine.register_serde_type::<Point>("Point");
 ```
 
