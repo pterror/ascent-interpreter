@@ -947,28 +947,16 @@ pub(crate) fn eval_binary_op(op: CBinOp, left: &Value, right: &Value) -> Option<
 #[inline]
 fn eval_i32_binary_op(op: CBinOp, l: i32, r: i32) -> Option<Value> {
     Some(match op {
-        CBinOp::Add => Value::I32(l + r),
-        CBinOp::Sub => Value::I32(l - r),
-        CBinOp::Mul => Value::I32(l * r),
-        CBinOp::Div => {
-            if r != 0 {
-                Value::I32(l / r)
-            } else {
-                return None;
-            }
-        }
-        CBinOp::Rem => {
-            if r != 0 {
-                Value::I32(l % r)
-            } else {
-                return None;
-            }
-        }
+        CBinOp::Add => Value::I32(l.wrapping_add(r)),
+        CBinOp::Sub => Value::I32(l.wrapping_sub(r)),
+        CBinOp::Mul => Value::I32(l.wrapping_mul(r)),
+        CBinOp::Div => return l.checked_div(r).map(Value::I32),
+        CBinOp::Rem => return l.checked_rem(r).map(Value::I32),
         CBinOp::BitAnd => Value::I32(l & r),
         CBinOp::BitOr => Value::I32(l | r),
         CBinOp::BitXor => Value::I32(l ^ r),
-        CBinOp::Shl => Value::I32(l << (r as u32)),
-        CBinOp::Shr => Value::I32(l >> (r as u32)),
+        CBinOp::Shl => return l.checked_shl(r as u32).map(Value::I32),
+        CBinOp::Shr => return l.checked_shr(r as u32).map(Value::I32),
         CBinOp::Eq => Value::Bool(l == r),
         CBinOp::Ne => Value::Bool(l != r),
         CBinOp::Lt => Value::Bool(l < r),

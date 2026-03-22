@@ -427,23 +427,49 @@ impl Value {
     }
 }
 
-// Arithmetic operations
-macro_rules! impl_numeric_binop {
-    ($method:ident, $op:tt) => {
+// Arithmetic operations — wrapping for integer add/sub/mul (matches release-mode semantics),
+// raw operator for floats (no overflow concern).
+macro_rules! impl_numeric_wrapping_binop {
+    ($method:ident, $wrapping_method:ident, $op:tt) => {
         pub fn $method(&self, other: &Value) -> Option<Value> {
             match (self, other) {
-                (Value::I8(a), Value::I8(b)) => Some(Value::I8(a $op b)),
-                (Value::I16(a), Value::I16(b)) => Some(Value::I16(a $op b)),
-                (Value::I32(a), Value::I32(b)) => Some(Value::I32(a $op b)),
-                (Value::I64(a), Value::I64(b)) => Some(Value::I64(a $op b)),
-                (Value::I128(a), Value::I128(b)) => Some(Value::I128(a $op b)),
-                (Value::Isize(a), Value::Isize(b)) => Some(Value::Isize(a $op b)),
-                (Value::U8(a), Value::U8(b)) => Some(Value::U8(a $op b)),
-                (Value::U16(a), Value::U16(b)) => Some(Value::U16(a $op b)),
-                (Value::U32(a), Value::U32(b)) => Some(Value::U32(a $op b)),
-                (Value::U64(a), Value::U64(b)) => Some(Value::U64(a $op b)),
-                (Value::U128(a), Value::U128(b)) => Some(Value::U128(a $op b)),
-                (Value::Usize(a), Value::Usize(b)) => Some(Value::Usize(a $op b)),
+                (Value::I8(a), Value::I8(b)) => Some(Value::I8(a.$wrapping_method(*b))),
+                (Value::I16(a), Value::I16(b)) => Some(Value::I16(a.$wrapping_method(*b))),
+                (Value::I32(a), Value::I32(b)) => Some(Value::I32(a.$wrapping_method(*b))),
+                (Value::I64(a), Value::I64(b)) => Some(Value::I64(a.$wrapping_method(*b))),
+                (Value::I128(a), Value::I128(b)) => Some(Value::I128(a.$wrapping_method(*b))),
+                (Value::Isize(a), Value::Isize(b)) => Some(Value::Isize(a.$wrapping_method(*b))),
+                (Value::U8(a), Value::U8(b)) => Some(Value::U8(a.$wrapping_method(*b))),
+                (Value::U16(a), Value::U16(b)) => Some(Value::U16(a.$wrapping_method(*b))),
+                (Value::U32(a), Value::U32(b)) => Some(Value::U32(a.$wrapping_method(*b))),
+                (Value::U64(a), Value::U64(b)) => Some(Value::U64(a.$wrapping_method(*b))),
+                (Value::U128(a), Value::U128(b)) => Some(Value::U128(a.$wrapping_method(*b))),
+                (Value::Usize(a), Value::Usize(b)) => Some(Value::Usize(a.$wrapping_method(*b))),
+                (Value::F32(OrderedFloat(a)), Value::F32(OrderedFloat(b))) => Some(Value::F32(OrderedFloat(a $op b))),
+                (Value::F64(OrderedFloat(a)), Value::F64(OrderedFloat(b))) => Some(Value::F64(OrderedFloat(a $op b))),
+                _ => None,
+            }
+        }
+    };
+}
+
+// Checked div/rem for integer types (returns None on zero divisor); floats use raw operator
+macro_rules! impl_checked_binop {
+    ($method:ident, $checked_method:ident, $op:tt) => {
+        pub fn $method(&self, other: &Value) -> Option<Value> {
+            match (self, other) {
+                (Value::I8(a), Value::I8(b)) => a.$checked_method(*b).map(Value::I8),
+                (Value::I16(a), Value::I16(b)) => a.$checked_method(*b).map(Value::I16),
+                (Value::I32(a), Value::I32(b)) => a.$checked_method(*b).map(Value::I32),
+                (Value::I64(a), Value::I64(b)) => a.$checked_method(*b).map(Value::I64),
+                (Value::I128(a), Value::I128(b)) => a.$checked_method(*b).map(Value::I128),
+                (Value::Isize(a), Value::Isize(b)) => a.$checked_method(*b).map(Value::Isize),
+                (Value::U8(a), Value::U8(b)) => a.$checked_method(*b).map(Value::U8),
+                (Value::U16(a), Value::U16(b)) => a.$checked_method(*b).map(Value::U16),
+                (Value::U32(a), Value::U32(b)) => a.$checked_method(*b).map(Value::U32),
+                (Value::U64(a), Value::U64(b)) => a.$checked_method(*b).map(Value::U64),
+                (Value::U128(a), Value::U128(b)) => a.$checked_method(*b).map(Value::U128),
+                (Value::Usize(a), Value::Usize(b)) => a.$checked_method(*b).map(Value::Usize),
                 (Value::F32(OrderedFloat(a)), Value::F32(OrderedFloat(b))) => Some(Value::F32(OrderedFloat(a $op b))),
                 (Value::F64(OrderedFloat(a)), Value::F64(OrderedFloat(b))) => Some(Value::F64(OrderedFloat(a $op b))),
                 _ => None,
@@ -474,18 +500,41 @@ macro_rules! impl_integer_binop {
     };
 }
 
+// Checked shift: returns None when shift amount >= type width
+macro_rules! impl_checked_shift {
+    ($method:ident, $checked_method:ident) => {
+        pub fn $method(&self, other: &Value) -> Option<Value> {
+            match (self, other) {
+                (Value::I8(a), Value::I8(b)) => a.$checked_method(*b as u32).map(Value::I8),
+                (Value::I16(a), Value::I16(b)) => a.$checked_method(*b as u32).map(Value::I16),
+                (Value::I32(a), Value::I32(b)) => a.$checked_method(*b as u32).map(Value::I32),
+                (Value::I64(a), Value::I64(b)) => a.$checked_method(*b as u32).map(Value::I64),
+                (Value::I128(a), Value::I128(b)) => a.$checked_method(*b as u32).map(Value::I128),
+                (Value::Isize(a), Value::Isize(b)) => a.$checked_method(*b as u32).map(Value::Isize),
+                (Value::U8(a), Value::U8(b)) => a.$checked_method(*b as u32).map(Value::U8),
+                (Value::U16(a), Value::U16(b)) => a.$checked_method(*b as u32).map(Value::U16),
+                (Value::U32(a), Value::U32(b)) => a.$checked_method(*b as u32).map(Value::U32),
+                (Value::U64(a), Value::U64(b)) => a.$checked_method(*b as u32).map(Value::U64),
+                (Value::U128(a), Value::U128(b)) => a.$checked_method(*b as u32).map(Value::U128),
+                (Value::Usize(a), Value::Usize(b)) => a.$checked_method(*b as u32).map(Value::Usize),
+                _ => None,
+            }
+        }
+    };
+}
+
 impl Value {
-    impl_numeric_binop!(add, +);
-    impl_numeric_binop!(sub, -);
-    impl_numeric_binop!(mul, *);
-    impl_numeric_binop!(div, /);
-    impl_numeric_binop!(rem, %);
+    impl_numeric_wrapping_binop!(add, wrapping_add, +);
+    impl_numeric_wrapping_binop!(sub, wrapping_sub, -);
+    impl_numeric_wrapping_binop!(mul, wrapping_mul, *);
+    impl_checked_binop!(div, checked_div, /);
+    impl_checked_binop!(rem, checked_rem, %);
 
     impl_integer_binop!(bitand, &);
     impl_integer_binop!(bitor, |);
     impl_integer_binop!(bitxor, ^);
-    impl_integer_binop!(shl, <<);
-    impl_integer_binop!(shr, >>);
+    impl_checked_shift!(shl, checked_shl);
+    impl_checked_shift!(shr, checked_shr);
 
     pub fn neg(&self) -> Option<Value> {
         match self {
