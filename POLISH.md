@@ -1,7 +1,7 @@
 # Polish State
 
 Created: 98bf464
-Last run: 2026-03-22
+Last run: 2026-03-23
 Round: 1
 Project type: Rust multi-crate workspace (interpreter + JIT compiler for Ascent Datalog)
 
@@ -17,59 +17,53 @@ Public-facing crates (ascent-eval, ascent-interpreter, ascent-syntax, ascent-ir)
 
 ## Findings — Round 1
 
-### HIGH — all resolved
+### HIGH — 10/10 resolved
 
-- [DONE] `value.rs:481-482` — Integer div/rem by zero panics — fixed with `checked_div`/`checked_rem` _(severity: high)_
-- [DONE] `value.rs:487-488` — Shift overflow panics — fixed with `checked_shl`/`checked_shr` _(severity: high)_
-- [DONE] `value.rs:478-480` — Integer overflow panics in debug — fixed with `wrapping_*` _(severity: high)_
-- [DONE] `eval.rs:482` — `Engine::insert` warns on unknown relation _(severity: high)_
-- [DONE] `eval.rs:472` — `relation()` now `&self` with stale-data warning via `Cell<bool>` _(severity: high)_
-- [DONE] `eval.rs:384` — `enable_jit()` returns `Result<(), String>` _(severity: high)_
-- [DONE] `ascent-ir/lib.rs:204` — `Program::from_ast` returns `Result<Program, String>` _(severity: high)_
-- [DONE] `aggregators.rs:20` — Unknown aggregator warns to stderr _(severity: high)_
-- [DONE] `README.md` — Rewritten with installation, usage, examples, features _(severity: high)_
-- [DONE] `docs/` — Embedding guide added at `docs/guide/embedding.md` _(severity: high)_
+- [DONE] `value.rs` — Integer div/rem by zero, shift overflow, add/sub/mul overflow panics — fixed with checked/wrapping ops
+- [DONE] `eval.rs` — `Engine::insert` warns on unknown relation and arity mismatch
+- [DONE] `eval.rs` — `relation()` takes `&self`, warns on stale data via `Cell<bool>`
+- [DONE] `eval.rs` — `enable_jit()` returns `Result<(), String>`
+- [DONE] `ascent-ir` — `Program::from_ast` returns `Result<Program, String>`
+- [DONE] `aggregators.rs` — Unknown aggregator warns to stderr
+- [DONE] `README.md` — Full rewrite with installation, usage, examples, architecture
+- [DONE] `docs/guide/embedding.md` — Library embedding guide
 
-### MEDIUM — 14 resolved, 6 remaining
+### MEDIUM — 16/20 resolved
 
-- [DONE] `eval.rs:770` — Fixpoint iteration limit (10,000 default) _(severity: medium)_
-- [DONE] `expr.rs:352` — Range expansion limit (1M) _(severity: medium)_
-- [DONE] `eval.rs:309` — `type_registry` field now `pub(crate)` with getter _(severity: medium)_
-- [DONE] `eval.rs:159` — `TypeRegistry::get` renamed to `constructor` _(severity: medium)_
-- [DONE] `eval.rs:482` — `Engine::insert` warns on arity mismatch _(severity: medium)_
-- [DONE] `lib.rs:53` — `Bindings`, `VarId`, `VarInterner` removed from public exports _(severity: medium)_
-- [DONE] `lib.rs:56` — `RelationStorage` removed from public exports _(severity: medium)_
-- [DONE] `syntax.rs:342,359` — `exp` → `expr` field naming _(severity: medium)_
-- [DONE] `value.rs:31-38` — `DynValue` trait methods documented _(severity: medium)_
-- [DONE] `docs/reference/types.md:82,118` — Fixed `Engine::new()` examples _(severity: medium)_
-- [DONE] `eval.rs:554` — `Engine::run` takes redundant `&Program` param _(severity: medium)_
-- [DONE] `eval.rs:588` — `run_incremental` leaks `FxHashSet` in public API _(severity: medium)_
-- [PENDING] `ascent-ir/lib.rs:33` — `syn::Expr` leaks into IR public API _(severity: medium)_
-- [PENDING] `value.rs:114` — `Value::Interned` variant exposes `Rc<dyn InternTable>` _(severity: medium)_
-- [DONE] `eval.rs/syntax.rs/ir` — `field_types` vs `column_types` vs `col_types` inconsistency _(severity: medium)_
-- [PENDING] `ascent-ir/lib.rs` — No crate-level usage example _(severity: medium)_
-- [PENDING] `value.rs` — No module-level usage examples _(severity: medium)_
-- [PENDING] `expr.rs:12` — `eval_expr` returns `Option<Value>` with no error diagnostics _(severity: medium)_
-- [PENDING] No error types exist anywhere in the codebase _(severity: medium)_
-- [PENDING] `syntax.rs` — Inconsistent `Node` suffix on AST types _(severity: medium)_
+- [DONE] `eval.rs` — Fixpoint iteration limit (10,000), range expansion limit (1M)
+- [DONE] `eval.rs` — `type_registry` field private with getter, `constructor`/`destructor` naming
+- [DONE] `eval.rs` — `Engine` stores `Program` internally, `run()` takes no args
+- [DONE] `eval.rs` — `run_incremental` accepts `&[&str]` instead of `FxHashSet`
+- [DONE] `eval.rs` — `Engine::insert` warns on arity mismatch
+- [DONE] `lib.rs` — `Bindings`, `VarId`, `VarInterner`, `RelationStorage` removed from public exports
+- [DONE] `syntax.rs` — `exp` → `expr`, `field_types` → `column_types` naming
+- [DONE] `value.rs` — `DynValue` trait methods documented, module-level examples added
+- [DONE] `ascent-ir` — Crate-level usage example added
+- [DONE] `docs/reference/types.md` — Fixed `Engine::new()` examples
+- [PENDING] `ascent-ir/lib.rs:33` — `syn::Expr` leaks into IR public API _(architectural — requires new expression AST)_
+- [PENDING] `value.rs:114` — `Value::Interned` variant exposes `Rc<dyn InternTable>` _(architectural — requires Value enum redesign)_
+- [PENDING] `expr.rs:12` — `eval_expr` returns `Option<Value>` with no error diagnostics _(requires EvalError type)_
+- [PENDING] No error types exist anywhere in the codebase _(design work needed)_
 
-### LOW — 10 resolved, 5 remaining
+### LOW — 15/15 resolved
 
-- [DONE] `jit/asm_codegen.rs:75` — Safety comments on `unsafe impl Send/Sync` _(severity: low)_
-- [DONE] `jit_index.rs:85,494,750,777` — Safety comments on `unsafe impl Send/Sync` _(severity: low)_
-- [DONE] `jit/packed_helpers.rs:611,623,683` — Safety comments on `unsafe impl Send/Sync` _(severity: low)_
-- [DONE] `eval.rs` — `unwrap()` → `expect()` with context on stratification/min_by_key _(severity: low)_
-- [DONE] `main.rs:83` — REPL `read_line` error handling improved _(severity: low)_
-- [DONE] `main.rs:217` — `:retract` now prints parse errors _(severity: low)_
-- [DONE] `desugar.rs` — `unwrap()` → `expect("internal: generated syntax must parse")` _(severity: low)_
-- [DONE] `eval.rs:403` — `with_jit_compiler` → `set_jit_compiler` _(severity: low)_
-- [PENDING] `value.rs:368` — `Tuple` is a type alias, not a newtype _(severity: low)_
-- [DONE] `value.rs:537` — `partial_cmp_val` → `try_cmp` _(severity: low)_
-- [DONE] `syntax.rs:20` — `is_wild_card` → `is_wildcard` _(severity: low)_
-- [PENDING] `bytecode.rs:58` — Constant pool index truncated to u16 _(severity: low)_
-- [PENDING] `bytecode.rs:233` — Stack underflow panics via `unwrap()` _(severity: low)_
-- [PENDING] `jit/asm_codegen.rs:82` — Stack frame overflow with many variables _(severity: low)_
-- [PENDING] `eval.rs:873+` — `lock().unwrap()` on JIT mutex _(severity: low)_
+- [DONE] Safety comments on all `unsafe impl Send/Sync` (13 locations)
+- [DONE] `unwrap()` → `expect()` with context on stratification, min_by_key, desugar parse2
+- [DONE] REPL: `read_line` error handling, `:retract` parse error reporting
+- [DONE] `is_wild_card` → `is_wildcard`, `with_jit_compiler` → `set_jit_compiler`, `partial_cmp_val` → `try_cmp`
+- [DONE] `Tuple` type alias documented
+- [DONE] Bytecode constant pool overflow check, stack underflow `expect()`
+- [DONE] JIT var_count > 10,000 guard
+- [DONE] Mutex `.lock().unwrap_or_else(|e| e.into_inner())` for poisoned-mutex recovery
+
+### Remaining (4 items — all architectural)
+
+These require design decisions, not mechanical fixes:
+
+1. `syn::Expr` in IR API — needs a new `IrExpr` AST independent of `syn`
+2. `Value::Interned` exposure — needs Value enum redesign to hide internals
+3. `eval_expr` error handling — needs `EvalError` type with diagnostic variants
+4. No error types — needs `EvalError`, `LoweringError`, `ParseError` designed as a coherent set
 
 ### Conflicts
 None identified.
