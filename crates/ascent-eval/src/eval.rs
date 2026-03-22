@@ -387,13 +387,14 @@ impl Engine {
 
     /// Enable JIT compilation for eligible rules.
     #[cfg(feature = "jit")]
-    pub fn enable_jit(&mut self) {
+    pub fn enable_jit(&mut self) -> Result<(), String> {
         if self.jit.is_none() {
             match crate::jit::JitCompiler::new() {
                 Ok(compiler) => self.jit = Some(Arc::new(Mutex::new(compiler))),
-                Err(e) => eprintln!("JIT init failed: {e}"),
+                Err(e) => return Err(format!("JIT init failed: {e}")),
             }
         }
+        Ok(())
     }
 
     /// Return a shared handle to the compiled JIT state.
@@ -596,7 +597,10 @@ impl Engine {
     pub fn run(&mut self, program: &Program) {
         self.materialized = false;
         self.ensure_stratification(program);
-        let strat = self.stratification.as_ref().unwrap();
+        let strat = self
+            .stratification
+            .as_ref()
+            .expect("stratification must be set by ensure_stratification");
 
         // Clone the SCC indices to avoid borrow conflict with self.
         let sccs: Vec<Vec<usize>> = strat.sccs.clone();
@@ -639,7 +643,10 @@ impl Engine {
         }
 
         self.ensure_stratification(program);
-        let strat = self.stratification.as_ref().unwrap();
+        let strat = self
+            .stratification
+            .as_ref()
+            .expect("stratification must be set by ensure_stratification");
 
         let sccs: Vec<Vec<usize>> = strat.sccs.clone();
         let scc_reads: Vec<FxHashSet<String>> = strat.scc_reads.clone();
@@ -878,7 +885,10 @@ impl Engine {
             // analysis avoids marking a relation as a sink in one stratum when it will
             // be probed as a body clause in a later stratum.
             {
-                let strat = self.stratification.as_ref().unwrap();
+                let strat = self
+                    .stratification
+                    .as_ref()
+                    .expect("stratification must be set by ensure_stratification");
                 let program_body_rels: rustc_hash::FxHashSet<&str> = strat
                     .compiled
                     .iter()
@@ -2173,7 +2183,7 @@ impl Engine {
                 .iter()
                 .enumerate()
                 .min_by_key(|&(_, (col, val))| rel.lookup(*col, val).len())
-                .unwrap();
+                .expect("bound_cols is non-empty");
             let (primary_col, primary_val) = &bound_cols[primary_pos];
             let indices = if use_recent {
                 rel.lookup_recent(*primary_col, primary_val)
@@ -2474,7 +2484,7 @@ impl Engine {
                     .iter()
                     .enumerate()
                     .min_by_key(|&(_, (col, val))| rel.lookup(*col, val).len())
-                    .unwrap();
+                    .expect("bound_cols is non-empty");
                 let (primary_col, primary_val) = &bound_cols[primary_pos];
                 let indices = rel.lookup(*primary_col, primary_val);
 
@@ -3018,7 +3028,7 @@ mod tests {
 
     fn run_program(input: &str) -> Engine {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         engine.run(&program);
         engine
@@ -3026,7 +3036,7 @@ mod tests {
 
     fn run_with_facts(input: &str, facts: Vec<(&str, Vec<Tuple>)>) -> Engine {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
 
         for (rel, tuples) in facts {
@@ -3712,7 +3722,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
 
         engine.insert(
@@ -3743,7 +3753,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
 
         let p = Value::custom(Point { x: 1, y: 2 });
@@ -3766,7 +3776,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
 
         engine.register_type(
@@ -3826,7 +3836,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         register_point(&mut engine);
 
@@ -3857,7 +3867,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         register_point(&mut engine);
 
@@ -3883,7 +3893,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         register_point(&mut engine);
 
@@ -3909,7 +3919,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         register_point(&mut engine);
 
@@ -3936,7 +3946,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         register_point(&mut engine);
         engine.run(&program);
@@ -3981,7 +3991,7 @@ mod tests {
                 "#,
             )
             .unwrap();
-            let program = Program::from_ast(ast);
+            let program = Program::from_ast(ast).expect("lowering should succeed");
             let mut engine = Engine::new(&program);
             engine.register_serde_type::<Point>("Point");
             engine.run(&program);
@@ -4004,7 +4014,7 @@ mod tests {
             path(x, z) <-- edge(x, y), path(y, z);
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
         engine.run(&program);
@@ -4025,7 +4035,7 @@ mod tests {
             path(x, z) <-- edge(x, y), path(y, z);
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
 
         let src = engine.intern_source("initial");
@@ -4062,7 +4072,7 @@ mod tests {
             unrelated(42);
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         engine.insert("a", vec![Value::I32(1)]);
         engine.run(&program);
@@ -4105,7 +4115,7 @@ mod tests {
             derived(x) <-- src(x);
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         engine.insert("src", vec![Value::I32(1)]);
         engine.run(&program);
@@ -4128,7 +4138,7 @@ mod tests {
             path(x, z) <-- edge(x, y), path(y, z);
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
         engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
@@ -4162,7 +4172,7 @@ mod tests {
             included(x) <-- node(x), !excluded(x);
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         engine.insert("node", vec![Value::I32(1)]);
         engine.insert("node", vec![Value::I32(2)]);
@@ -4195,7 +4205,7 @@ mod tests {
             filtered(x) <-- derived(x), !excluded(x);
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         engine.insert("raw", vec![Value::I32(1)]);
         engine.insert("raw", vec![Value::I32(2)]);
@@ -4233,7 +4243,7 @@ mod tests {
             doubled(x) <-- kept(x);
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         engine.insert("node", vec![Value::I32(1)]);
         engine.insert("node", vec![Value::I32(2)]);
@@ -4265,7 +4275,7 @@ mod tests {
             dst(x) <-- src(x);
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(&program);
         engine.insert("src", vec![Value::I32(1)]);
         engine.run(&program);
@@ -4290,10 +4300,10 @@ mod jit_hot_tests {
 
     fn run_shared_jit(source: &str) {
         let ast: AscentProgram = syn::parse_str(source).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         // warmup
         let mut warmup = Engine::new(&program);
-        warmup.enable_jit();
+        warmup.enable_jit().expect("JIT init should succeed");
         warmup.run(&program);
         let jit = warmup.share_jit_compiler().unwrap();
         // hot run
@@ -4316,11 +4326,11 @@ mod jit_hot_tests {
         // Use small n and few iterations to keep debug-mode runtime acceptable.
         let source = "relation edge(i32,i32);\nrelation path(i32,i32);\npath(x,y) <-- edge(x,y);\npath(x,z) <-- edge(x,y),path(y,z);\n";
         let ast: AscentProgram = syn::parse_str(source).unwrap();
-        let program = Program::from_ast(ast);
+        let program = Program::from_ast(ast).expect("lowering should succeed");
         let n = 10i32;
         // warmup
         let mut warmup = Engine::new(&program);
-        warmup.enable_jit();
+        warmup.enable_jit().expect("JIT init should succeed");
         for i in 1..n {
             warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
         }

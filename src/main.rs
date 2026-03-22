@@ -47,17 +47,17 @@ fn run_file(path: &str) {
     }
 }
 
-fn eval_source(source: &str) -> Result<(Engine, Program), syn::Error> {
-    let ast: AscentProgram = syn::parse_str(source)?;
-    let program = Program::from_ast(ast);
+fn eval_source(source: &str) -> Result<(Engine, Program), String> {
+    let ast: AscentProgram = syn::parse_str(source).map_err(|e| e.to_string())?;
+    let program = Program::from_ast(ast)?;
     let mut engine = Engine::new(&program);
     engine.run(&program);
     Ok((engine, program))
 }
 
-fn try_parse_program(source: &str) -> Result<Program, syn::Error> {
-    let ast: AscentProgram = syn::parse_str(source)?;
-    Ok(Program::from_ast(ast))
+fn try_parse_program(source: &str) -> Result<Program, String> {
+    let ast: AscentProgram = syn::parse_str(source).map_err(|e| e.to_string())?;
+    Program::from_ast(ast)
 }
 
 fn repl() {
@@ -80,9 +80,16 @@ fn repl() {
         io::stderr().flush().ok();
 
         let mut line = String::new();
-        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
-            eprintln!();
-            break;
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => {
+                eprintln!();
+                break;
+            }
+            Err(e) => {
+                eprintln!("read error: {e}");
+                break;
+            }
+            Ok(_) => {}
         }
 
         let trimmed = line.trim();
@@ -214,11 +221,18 @@ fn repl() {
                             if source.trim().is_empty() {
                                 engine = None;
                                 current_program = None;
-                            } else if let Ok(prog) = try_parse_program(&source) {
-                                let mut eng = Engine::new(&prog);
-                                eng.run(&prog);
-                                engine = Some(eng);
-                                current_program = Some(prog);
+                            } else {
+                                match try_parse_program(&source) {
+                                    Ok(prog) => {
+                                        let mut eng = Engine::new(&prog);
+                                        eng.run(&prog);
+                                        engine = Some(eng);
+                                        current_program = Some(prog);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("parse error after retraction: {e}");
+                                    }
+                                }
                             }
                             prev_counts.clear();
                             eprintln!("(retracted: {needle})");

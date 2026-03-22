@@ -81,7 +81,9 @@ pub struct JitHashIndex {
     pub is_contiguous: bool,
 }
 
-// Safety: JitHashIndex contains raw pointers that we own and never alias.
+// SAFETY: JitHashIndex contains raw pointers that are owned (not aliased) and only
+// accessed from the JIT execution thread. The struct is created, used, and dropped
+// within a single Engine::run() call.
 unsafe impl Send for JitHashIndex {}
 unsafe impl Sync for JitHashIndex {}
 
@@ -491,6 +493,8 @@ pub struct JitLookupHandle {
     pub _pad: u32,
 }
 
+// SAFETY: JitLookupHandle contains raw pointers that are owned (not aliased) and only
+// accessed from the JIT execution thread within a single Engine::run() call.
 unsafe impl Send for JitLookupHandle {}
 unsafe impl Sync for JitLookupHandle {}
 
@@ -747,6 +751,8 @@ pub struct JitDedupHandle {
     pub _pad: u32,
 }
 
+// SAFETY: JitDedupHandle contains raw pointers that are owned (not aliased) and only
+// accessed from the JIT execution thread within a single Engine::run() call.
 unsafe impl Send for JitDedupHandle {}
 unsafe impl Sync for JitDedupHandle {}
 
@@ -774,6 +780,8 @@ pub struct JitDedupTable {
     count: usize,
 }
 
+// SAFETY: JitDedupTable contains raw pointers that are owned (not aliased) and only
+// accessed from the JIT execution thread within a single Engine::run() call.
 unsafe impl Send for JitDedupTable {}
 unsafe impl Sync for JitDedupTable {}
 

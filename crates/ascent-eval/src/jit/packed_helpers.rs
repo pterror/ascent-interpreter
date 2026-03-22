@@ -446,6 +446,8 @@ pub struct LookupSpec {
     pub use_recent: u32,
 }
 
+// SAFETY: LookupSpec contains raw pointers that are owned (not aliased) and only
+// accessed from the JIT execution thread within a single Engine::run() call.
 unsafe impl Send for LookupSpec {}
 unsafe impl Sync for LookupSpec {}
 
@@ -471,6 +473,8 @@ pub struct JitRelSpec {
     pub _pad: u32,
 }
 
+// SAFETY: JitRelSpec contains raw pointers that are owned (not aliased) and only
+// accessed from the JIT execution thread within a single Engine::run() call.
 unsafe impl Send for JitRelSpec {}
 unsafe impl Sync for JitRelSpec {}
 
@@ -534,6 +538,8 @@ pub struct StratumStage4Ctx {
     pub _pad5: u32,
 }
 
+// SAFETY: StratumStage4Ctx contains raw pointers that are owned (not aliased) and only
+// accessed from the JIT execution thread within a single Engine::run() call.
 unsafe impl Send for StratumStage4Ctx {}
 unsafe impl Sync for StratumStage4Ctx {}
 
@@ -608,6 +614,8 @@ pub struct NativeScanSpec {
     pub _pad: u32,
 }
 
+// SAFETY: NativeScanSpec contains raw pointers that are owned (not aliased) and only
+// accessed from the JIT execution thread within a single Engine::run() call.
 unsafe impl Send for NativeScanSpec {}
 unsafe impl Sync for NativeScanSpec {}
 
@@ -620,6 +628,8 @@ pub struct NativeHeadSpec {
     pub rel: *mut PackedStorage,
 }
 
+// SAFETY: NativeHeadSpec contains raw pointers that are owned (not aliased) and only
+// accessed from the JIT execution thread within a single Engine::run() call.
 unsafe impl Send for NativeHeadSpec {}
 unsafe impl Sync for NativeHeadSpec {}
 
@@ -680,6 +690,8 @@ pub struct StratumStage4NativeCtx {
     pub head_specs: *const NativeHeadSpec,
 }
 
+// SAFETY: StratumStage4NativeCtx contains raw pointers that are owned (not aliased)
+// and only accessed from the JIT execution thread within a single Engine::run() call.
 unsafe impl Send for StratumStage4NativeCtx {}
 unsafe impl Sync for StratumStage4NativeCtx {}
 

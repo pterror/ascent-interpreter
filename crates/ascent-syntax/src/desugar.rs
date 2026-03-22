@@ -146,9 +146,12 @@ pub fn desugar_pattern_args(rule: RuleNode) -> RuleNode {
                     let pattern = pat.pattern;
                     let ident = gensym.next_ident("__pat", pattern.span());
                     let new_cond_clause: CondClause =
-                        parse2(quote! { if let #pattern = #ident }).unwrap();
+                        parse2(quote! { if let #pattern = #ident })
+                            .expect("internal: generated syntax must parse");
                     new_cond_clauses.push(new_cond_clause);
-                    BodyClauseArg::Expr(parse2(quote! { #ident }).unwrap())
+                    BodyClauseArg::Expr(
+                        parse2(quote! { #ident }).expect("internal: generated syntax must parse"),
+                    )
                 }
             };
             new_args.push_value(new_arg);
@@ -192,7 +195,8 @@ pub fn desugar_wildcards(mut rule: RuleNode) -> RuleNode {
                     && is_wild_card(expr)
                 {
                     let new_ident = gensym.next_ident("_", expr.span());
-                    *expr = parse2(quote! { #new_ident }).unwrap();
+                    *expr = parse2(quote! { #new_ident })
+                        .expect("internal: generated syntax must parse");
                 }
             }
         }
@@ -231,10 +235,14 @@ pub fn desugar_repeated_vars(mut rule: RuleNode) -> RuleNode {
                             expr.span(),
                         );
                         let check: CondClause =
-                            parse2(quote_spanned! {expr.span()=> if #new_ident == #expr }).unwrap();
+                            parse2(quote_spanned! {expr.span()=> if #new_ident == #expr })
+                                .expect("internal: generated syntax must parse");
                         new_cond_clauses.push(check);
                         cl.args[arg_ind] =
-                            BodyClauseArg::Expr(parse2(quote! { #new_ident }).unwrap());
+                            BodyClauseArg::Expr(
+                                parse2(quote! { #new_ident })
+                                    .expect("internal: generated syntax must parse"),
+                            );
                     } else if let Some(ident) = expr_to_ident(expr) {
                         grounded_vars.entry(ident).or_insert(i);
                     }
@@ -288,7 +296,7 @@ pub fn desugar_negation(mut rule: RuleNode) -> RuleNode {
             let replacement: AggClauseNode = parse2(quote_spanned! {span=>
                 agg () = ::ascent::aggregators::not() in #rel(#args)
             })
-            .unwrap();
+            .expect("internal: generated syntax must parse");
             *bi = BodyItemNode::Agg(replacement);
         }
     }

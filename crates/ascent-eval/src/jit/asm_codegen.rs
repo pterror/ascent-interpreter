@@ -72,6 +72,9 @@ pub struct AsmStratum {
     pub fn_ptr: StratumStage4Fn,
 }
 
+// SAFETY: Raw pointers in AsmStratum (fn_ptr, _buffer) are owned and not aliased.
+// The struct is created, used, and dropped within a single Engine::run() call,
+// and only accessed from the JIT execution thread.
 unsafe impl Send for AsmStratum {}
 unsafe impl Sync for AsmStratum {}
 
