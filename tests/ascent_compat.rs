@@ -58,7 +58,7 @@ impl FromIterator<Vec<Value>> for RelSet {
     }
 }
 
-fn rel_set(engine: &Engine, name: &str) -> RelSet {
+fn rel_set(engine: &mut Engine, name: &str) -> RelSet {
     RelSet(
         engine
             .relation(name)
@@ -79,7 +79,7 @@ fn i(v: i32) -> Value {
 
 #[test]
 fn test_fizzbuzz() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation number(i32);
         relation divisible(i32, i32);
         relation fizz(i32);
@@ -96,19 +96,19 @@ fn test_fizzbuzz() {
         other(x) <-- number(x), !divisible(x, 3), !divisible(x, 5);
     "#);
 
-    let fizz = rel_set(&engine, "fizz");
+    let fizz = rel_set(&mut engine,"fizz");
     assert_eq!(
         fizz,
         [3, 6, 9, 12].into_iter().map(|v| vec![i(v)]).collect()
     );
 
-    let buzz = rel_set(&engine, "buzz");
+    let buzz = rel_set(&mut engine,"buzz");
     assert_eq!(buzz, [5, 10].into_iter().map(|v| vec![i(v)]).collect());
 
-    let fizz_buzz = rel_set(&engine, "fizz_buzz");
+    let fizz_buzz = rel_set(&mut engine,"fizz_buzz");
     assert_eq!(fizz_buzz, [vec![i(15)]].into_iter().collect());
 
-    let other = rel_set(&engine, "other");
+    let other = rel_set(&mut engine,"other");
     assert_eq!(
         other,
         [1, 2, 4, 7, 8, 11, 13, 14]
@@ -124,7 +124,7 @@ fn test_fizzbuzz() {
 
 #[test]
 fn test_even_odd_negation() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation number(i32);
         relation even(i32);
         relation odd(i32);
@@ -134,10 +134,10 @@ fn test_even_odd_negation() {
         odd(x) <-- number(x), !even(x);
     "#);
 
-    let even = rel_set(&engine, "even");
+    let even = rel_set(&mut engine,"even");
     assert_eq!(even, [2, 4].into_iter().map(|v| vec![i(v)]).collect());
 
-    let odd = rel_set(&engine, "odd");
+    let odd = rel_set(&mut engine,"odd");
     assert_eq!(odd, [1, 3, 5].into_iter().map(|v| vec![i(v)]).collect());
 }
 
@@ -147,7 +147,7 @@ fn test_even_odd_negation() {
 
 #[test]
 fn test_nested_generators() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation pair(i32, i32);
         pair(x, y) <-- for x in 0..10, for y in (x + 1)..10;
     "#);
@@ -168,7 +168,7 @@ fn test_nested_generators() {
 
 #[test]
 fn test_cross_product() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation foo(i32, i32);
         relation bar(i32, i32);
         relation baz(i32, i32, i32, i32);
@@ -194,7 +194,7 @@ fn test_cross_product() {
 
 #[test]
 fn test_arithmetic_join() {
-    let engine = run_with_facts(
+    let mut engine = run_with_facts(
         r#"
         relation foo1(i32, i32);
         relation foo2(i32, i32);
@@ -218,7 +218,7 @@ fn test_arithmetic_join() {
         ],
     );
 
-    let bar = rel_set(&engine, "bar");
+    let bar = rel_set(&mut engine,"bar");
     assert!(bar.contains(&[i(1), i(6)])); // 1, 2+4
     assert!(bar.contains(&[i(1), i(3)])); // 1, 2+1
     assert!(bar.contains(&[i(10), i(60)])); // 10, 20+40
@@ -232,7 +232,7 @@ fn test_arithmetic_join() {
 
 #[test]
 fn test_factorial() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation do_fac(i32);
         relation fac(i32, i32);
 
@@ -254,7 +254,7 @@ fn test_factorial() {
 
 #[test]
 fn test_multi_head_rule() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation source(i32, i32);
         relation left(i32);
         relation right(i32);
@@ -265,10 +265,10 @@ fn test_multi_head_rule() {
         left(x), right(y) <-- source(x, y);
     "#);
 
-    let left = rel_set(&engine, "left");
+    let left = rel_set(&mut engine,"left");
     assert_eq!(left, [1, 2, 3].into_iter().map(|v| vec![i(v)]).collect());
 
-    let right = rel_set(&engine, "right");
+    let right = rel_set(&mut engine,"right");
     assert_eq!(
         right,
         [10, 20, 30].into_iter().map(|v| vec![i(v)]).collect()
@@ -281,7 +281,7 @@ fn test_multi_head_rule() {
 
 #[test]
 fn test_self_loop_repeated_vars() {
-    let engine = run_with_facts(
+    let mut engine = run_with_facts(
         r#"
         relation edge(i32, i32);
         relation self_loop(i32);
@@ -298,7 +298,7 @@ fn test_self_loop_repeated_vars() {
         )],
     );
 
-    let self_loop = rel_set(&engine, "self_loop");
+    let self_loop = rel_set(&mut engine,"self_loop");
     assert_eq!(self_loop, [2, 3].into_iter().map(|v| vec![i(v)]).collect());
 }
 
@@ -308,7 +308,7 @@ fn test_self_loop_repeated_vars() {
 
 #[test]
 fn test_disjunction() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation number(i32);
         relation even(i32);
         relation square(i32);
@@ -320,7 +320,7 @@ fn test_disjunction() {
         even_or_square(x) <-- (even(x) | square(x));
     "#);
 
-    let eos = rel_set(&engine, "even_or_square");
+    let eos = rel_set(&mut engine,"even_or_square");
     // Even: 2, 4, 6, 8, 10
     // Square: 1, 4, 9, 16, 25, 36, 49, 64, 81, 100
     // Union: 1, 2, 4, 6, 8, 9, 10, 16, 25, 36, 49, 64, 81, 100
@@ -337,7 +337,7 @@ fn test_disjunction() {
 
 #[test]
 fn test_disjunction_transitive() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation road(i32, i32);
         relation rail(i32, i32);
         relation connected(i32, i32);
@@ -351,7 +351,7 @@ fn test_disjunction_transitive() {
         connected(x, z) <-- connected(x, y), (road(y, z) | rail(y, z));
     "#);
 
-    let conn = rel_set(&engine, "connected");
+    let conn = rel_set(&mut engine,"connected");
     // 1→2 (road), 2→3 (road), 3→4 (rail), 4→5 (rail)
     // Plus transitive: 1→3, 1→4, 1→5, 2→4, 2→5, 3→5
     assert!(conn.contains(&[i(1), i(2)]));
@@ -366,7 +366,7 @@ fn test_disjunction_transitive() {
 
 #[test]
 fn test_negation_simple() {
-    let engine = run_with_facts(
+    let mut engine = run_with_facts(
         r#"
         relation foo(i32, i32);
         relation bar(i32, i32, i32);
@@ -394,7 +394,7 @@ fn test_negation_simple() {
         ],
     );
 
-    let baz = rel_set(&engine, "baz");
+    let baz = rel_set(&mut engine,"baz");
     assert_eq!(
         baz,
         [vec![i(0), i(1)], vec![i(100), i(101)]]
@@ -409,7 +409,7 @@ fn test_negation_simple() {
 
 #[test]
 fn test_negation_with_arithmetic() {
-    let engine = run_with_facts(
+    let mut engine = run_with_facts(
         r#"
         relation foo(i32, i32);
         relation bar(i32, i32, i32);
@@ -436,7 +436,7 @@ fn test_negation_with_arithmetic() {
         ],
     );
 
-    let baz = rel_set(&engine, "baz");
+    let baz = rel_set(&mut engine,"baz");
     // (0,1): no bar(0,1,2) → included
     // (1,2): bar(1,2,3) matches y+1=3 → excluded
     // (10,11): bar(10,11,13) but y+1=12≠13 → included
@@ -455,7 +455,7 @@ fn test_negation_with_arithmetic() {
 
 #[test]
 fn test_aggregation_all() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation number(i32);
         relation lowest(i32);
         relation greatest(i32);
@@ -480,7 +480,7 @@ fn test_aggregation_all() {
 
 #[test]
 fn test_aggregation_grouped() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation score(i32, i32);
         relation team_max(i32, i32);
 
@@ -493,7 +493,7 @@ fn test_aggregation_grouped() {
         team_max(team, m) <-- score(team, _), agg m = max(s) in score(team, s);
     "#);
 
-    let team_max = rel_set(&engine, "team_max");
+    let team_max = rel_set(&mut engine,"team_max");
     assert_eq!(
         team_max,
         [vec![i(1), i(20)], vec![i(2), i(25)]].into_iter().collect()
@@ -505,7 +505,7 @@ fn test_aggregation_grouped() {
 
 #[test]
 fn test_connected_components() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation edge(i32, i32);
         relation reach(i32, i32);
 
@@ -536,7 +536,7 @@ fn test_connected_components() {
 
 #[test]
 fn test_generator_with_seed() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation seed(i32);
         relation number(i32);
 
@@ -545,7 +545,7 @@ fn test_generator_with_seed() {
         number(x + y) <-- seed(x), for y in 0..3;
     "#);
 
-    let number = rel_set(&engine, "number");
+    let number = rel_set(&mut engine,"number");
     assert_eq!(
         number,
         [0, 1, 2, 10, 11, 12]
@@ -560,7 +560,7 @@ fn test_generator_with_seed() {
 
 #[test]
 fn test_multiple_conditions() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation number(i32);
         relation special(i32);
 
@@ -568,7 +568,7 @@ fn test_multiple_conditions() {
         special(x) <-- number(x), if x % 3 == 0, if x % 5 == 0, if x < 50;
     "#);
 
-    let special = rel_set(&engine, "special");
+    let special = rel_set(&mut engine,"special");
     assert_eq!(
         special,
         [15, 30, 45].into_iter().map(|v| vec![i(v)]).collect()
@@ -580,7 +580,7 @@ fn test_multiple_conditions() {
 
 #[test]
 fn test_three_way_join() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation a(i32, i32);
         relation b(i32, i32);
         relation c(i32, i32);
@@ -596,7 +596,7 @@ fn test_three_way_join() {
         result(x, w) <-- a(x, y), b(y, z), c(z, w);
     "#);
 
-    let result = rel_set(&engine, "result");
+    let result = rel_set(&mut engine,"result");
     assert_eq!(
         result,
         [vec![i(1), i(100)], vec![i(1), i(200)]]
@@ -610,7 +610,7 @@ fn test_three_way_join() {
 
 #[test]
 fn test_mutual_recursion() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation is_even(i32);
         relation is_odd(i32);
 
@@ -619,8 +619,8 @@ fn test_mutual_recursion() {
         is_even(x + 1) <-- is_odd(x), if x < 10;
     "#);
 
-    let is_even = rel_set(&engine, "is_even");
-    let is_odd = rel_set(&engine, "is_odd");
+    let is_even = rel_set(&mut engine,"is_even");
+    let is_odd = rel_set(&mut engine,"is_odd");
 
     assert_eq!(
         is_even,
@@ -640,7 +640,7 @@ fn test_mutual_recursion() {
 
 #[test]
 fn test_duplicate_elimination() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation source(i32);
         relation result(i32);
 
@@ -653,7 +653,7 @@ fn test_duplicate_elimination() {
         result(x) <-- source(x);
     "#);
 
-    let result = rel_set(&engine, "result");
+    let result = rel_set(&mut engine,"result");
     // Despite multiple rules producing result(1), only one copy exists
     assert_eq!(result, [1, 2, 3].into_iter().map(|v| vec![i(v)]).collect());
 }
@@ -663,7 +663,7 @@ fn test_duplicate_elimination() {
 
 #[test]
 fn test_empty_relations() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation empty(i32);
         relation nonempty(i32);
         relation joined(i32, i32);
@@ -678,7 +678,7 @@ fn test_empty_relations() {
 
     assert!(engine.relation("joined").unwrap().is_empty());
 
-    let negated = rel_set(&engine, "negated");
+    let negated = rel_set(&mut engine,"negated");
     assert_eq!(negated, [1, 2].into_iter().map(|v| vec![i(v)]).collect());
 }
 
@@ -687,7 +687,7 @@ fn test_empty_relations() {
 
 #[test]
 fn test_rule_chaining() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation input(i32);
         relation doubled(i32);
         relation filtered(i32);
@@ -699,7 +699,7 @@ fn test_rule_chaining() {
         final_result(x - 10) <-- filtered(x);
     "#);
 
-    let result = rel_set(&engine, "final_result");
+    let result = rel_set(&mut engine,"final_result");
     // input: 1..10, doubled: 2,4,6,8,10,12,14,16,18
     // filtered: 12,14,16,18, final_result: 2,4,6,8
     assert_eq!(
@@ -713,7 +713,7 @@ fn test_rule_chaining() {
 
 #[test]
 fn test_aggregation_over_recursive() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation edge(i32, i32);
         relation path(i32, i32);
         relation path_count(i32);
@@ -741,7 +741,7 @@ fn test_aggregation_over_recursive() {
 
 #[test]
 fn test_constant_in_clause() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation data(i32, i32);
         relation ones(i32);
 
@@ -753,7 +753,7 @@ fn test_constant_in_clause() {
         ones(y) <-- data(1, y);
     "#);
 
-    let ones = rel_set(&engine, "ones");
+    let ones = rel_set(&mut engine,"ones");
     assert_eq!(ones, [10, 20].into_iter().map(|v| vec![i(v)]).collect());
 }
 
@@ -763,7 +763,7 @@ fn test_constant_in_clause() {
 
 #[test]
 fn test_if_let_option() {
-    let engine = run_with_facts(
+    let mut engine = run_with_facts(
         r#"
         relation input(i32, Option<i32>);
         relation output(i32, i32);
@@ -780,7 +780,7 @@ fn test_if_let_option() {
         )],
     );
 
-    let output = rel_set(&engine, "output");
+    let output = rel_set(&mut engine,"output");
     assert_eq!(
         output,
         [vec![i(2), i(20)], vec![i(3), i(30)]].into_iter().collect()
@@ -793,7 +793,7 @@ fn test_if_let_option() {
 
 #[test]
 fn test_if_let_with_filter() {
-    let engine = run_with_facts(
+    let mut engine = run_with_facts(
         r#"
         relation input(i32, Option<i32>);
         relation output(i32, i32);
@@ -808,7 +808,7 @@ fn test_if_let_with_filter() {
         )],
     );
 
-    let output = rel_set(&engine, "output");
+    let output = rel_set(&mut engine,"output");
     // (2, 2) filtered out because y == x
     assert_eq!(output, [vec![i(3), i(30)]].into_iter().collect());
 }
@@ -818,7 +818,7 @@ fn test_if_let_with_filter() {
 
 #[test]
 fn test_let_binding() {
-    let engine = run(r#"
+    let mut engine = run(r#"
         relation input(i32);
         relation output(i32, i32);
 
@@ -826,7 +826,7 @@ fn test_let_binding() {
         output(x, doubled) <-- input(x), let doubled = x * 2;
     "#);
 
-    let output = rel_set(&engine, "output");
+    let output = rel_set(&mut engine,"output");
     assert!(output.contains(&[i(1), i(2)]));
     assert!(output.contains(&[i(3), i(6)]));
     assert!(output.contains(&[i(5), i(10)]));
@@ -838,7 +838,7 @@ fn test_let_binding() {
 
 #[test]
 fn test_if_let_join() {
-    let engine = run_with_facts(
+    let mut engine = run_with_facts(
         r#"
         relation source(i32, Option<i32>);
         relation lookup(i32, i32);
@@ -858,7 +858,7 @@ fn test_if_let_join() {
         ],
     );
 
-    let result = rel_set(&engine, "result");
+    let result = rel_set(&mut engine,"result");
     assert_eq!(
         result,
         [vec![i(1), i(100)], vec![i(3), i(200)]]

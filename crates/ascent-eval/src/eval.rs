@@ -3027,7 +3027,7 @@ mod tests {
     fn test_unsuffixed_literal_coercion() {
         // Unsuffixed literals default to i32 in the evaluator, but should be
         // coerced to the declared column type (e.g. u32) at head insertion time.
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation node(u32);
             relation edge(u32, u32);
@@ -3049,7 +3049,7 @@ mod tests {
 
     #[test]
     fn test_fact_with_literals() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation edge(i32, i32);
             edge(1, 2);
@@ -3065,7 +3065,7 @@ mod tests {
 
     #[test]
     fn test_transitive_closure() {
-        let engine = run_with_facts(
+        let mut engine = run_with_facts(
             r#"
             relation edge(i32, i32);
             relation path(i32, i32);
@@ -3094,7 +3094,7 @@ mod tests {
 
     #[test]
     fn test_transitive_closure_from_facts() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation edge(i32, i32);
             relation path(i32, i32);
@@ -3112,7 +3112,7 @@ mod tests {
 
     #[test]
     fn test_join() {
-        let engine = run_with_facts(
+        let mut engine = run_with_facts(
             r#"
             relation r(i32, i32);
             relation s(i32, i32);
@@ -3145,7 +3145,7 @@ mod tests {
 
     #[test]
     fn test_condition_filter() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation number(i32);
             relation even(i32);
@@ -3166,7 +3166,7 @@ mod tests {
 
     #[test]
     fn test_generator() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation number(i32);
             number(x) <-- for x in 0..5;
@@ -3181,7 +3181,7 @@ mod tests {
 
     #[test]
     fn test_arithmetic_in_head() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation input(i32);
             relation doubled(i32);
@@ -3201,7 +3201,7 @@ mod tests {
 
     #[test]
     fn test_generator_with_condition() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation number(i32);
             relation small_even(i32);
@@ -3219,7 +3219,7 @@ mod tests {
 
     #[test]
     fn test_fibonacci_like() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation fib(i32, i32);
             fib(0, 1);
@@ -3239,7 +3239,7 @@ mod tests {
 
     #[test]
     fn test_aggregation_min() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation number(i32);
             relation lowest(i32);
@@ -3259,7 +3259,7 @@ mod tests {
 
     #[test]
     fn test_aggregation_max() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation number(i32);
             relation highest(i32);
@@ -3277,7 +3277,7 @@ mod tests {
 
     #[test]
     fn test_aggregation_sum() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation number(i32);
             relation total(i32);
@@ -3295,7 +3295,7 @@ mod tests {
 
     #[test]
     fn test_aggregation_count() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation number(i32);
             relation card(i32);
@@ -3313,7 +3313,7 @@ mod tests {
 
     #[test]
     fn test_negation_as_aggregation() {
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation a(i32);
             relation b(i32);
@@ -3337,7 +3337,7 @@ mod tests {
     fn test_stratification_agg_after_recursion() {
         // Aggregation over a recursively-computed relation.
         // fib_max should see the complete fib relation, not partial results.
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation fib(i32, i32);
             relation fib_max(i32);
@@ -3357,7 +3357,7 @@ mod tests {
     fn test_negation_with_recursive_input() {
         // Negation (which uses aggregation internally) should see complete
         // recursive results thanks to stratification.
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation edge(i32, i32);
             relation path(i32, i32);
@@ -3387,7 +3387,7 @@ mod tests {
     #[test]
     fn test_scc_multi_stratum_chain() {
         // Three strata: base facts → recursive path → aggregation on path
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation edge(i32, i32);
             relation path(i32, i32);
@@ -3425,7 +3425,7 @@ mod tests {
     #[test]
     fn test_scc_independent_sccs() {
         // Two independent recursive computations that don't depend on each other
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation a_edge(i32, i32);
             relation a_path(i32, i32);
@@ -3454,7 +3454,7 @@ mod tests {
     #[test]
     fn test_scc_aggregation_feeds_downstream() {
         // Aggregation result used by a subsequent non-aggregation rule
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation score(i32, i32);
             relation total(i32);
@@ -3487,7 +3487,7 @@ mod tests {
     #[test]
     fn test_scc_cascading_aggregations() {
         // Multiple layers of aggregation: data → grouped agg → global agg
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation score(i32, i32);
             relation best(i32, i32);
@@ -3520,7 +3520,7 @@ mod tests {
     #[test]
     fn test_scc_negation_after_recursion() {
         // Negation (desugared to aggregation) depends on recursive relation
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation edge(i32, i32);
             relation node(i32);
@@ -3553,7 +3553,7 @@ mod tests {
     #[test]
     fn test_lattice_max_value() {
         // Lattice relation keeps the max value per key
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             lattice best_score(i32, i32);
             best_score(1, 10);
@@ -3575,7 +3575,7 @@ mod tests {
     #[test]
     fn test_lattice_dual_shortest_path() {
         // Shortest path using Dual (reverses ordering so join = min)
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation edge(i32, i32, i32);
             lattice shortest(i32, i32, Dual<i32>);
@@ -3614,7 +3614,7 @@ mod tests {
     #[test]
     fn test_lattice_recursive_max() {
         // Lattice with recursive rule: max propagates through edges
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             relation edge(i32, i32);
             relation source_val(i32, i32);
@@ -3647,7 +3647,7 @@ mod tests {
     #[test]
     fn test_lattice_with_pattern_match() {
         // Pattern matching with ?Dual(x) to extract inner value
-        let engine = run_program(
+        let mut engine = run_program(
             r#"
             lattice best(i32, Dual<i32>);
             relation result(i32, i32);

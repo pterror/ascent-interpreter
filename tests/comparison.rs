@@ -20,7 +20,7 @@ fn run(input: &str) -> Engine {
 }
 
 /// Extract a 1-column i32 relation from the interpreter.
-fn interp1(engine: &Engine, name: &str) -> BTreeSet<(i32,)> {
+fn interp1(engine: &mut Engine, name: &str) -> BTreeSet<(i32,)> {
     engine
         .relation(name)
         .unwrap()
@@ -33,7 +33,7 @@ fn interp1(engine: &Engine, name: &str) -> BTreeSet<(i32,)> {
 }
 
 /// Extract a 2-column i32 relation from the interpreter.
-fn interp2(engine: &Engine, name: &str) -> BTreeSet<(i32, i32)> {
+fn interp2(engine: &mut Engine, name: &str) -> BTreeSet<(i32, i32)> {
     engine
         .relation(name)
         .unwrap()
@@ -46,7 +46,7 @@ fn interp2(engine: &Engine, name: &str) -> BTreeSet<(i32, i32)> {
 }
 
 /// Extract a 3-column i32 relation from the interpreter.
-fn interp3(engine: &Engine, name: &str) -> BTreeSet<(i32, i32, i32)> {
+fn interp3(engine: &mut Engine, name: &str) -> BTreeSet<(i32, i32, i32)> {
     engine
         .relation(name)
         .unwrap()
@@ -70,7 +70,7 @@ fn set2(v: Vec<(i32, i32)>) -> BTreeSet<(i32, i32)> {
 
 #[test]
 fn compare_transitive_closure() {
-    let engine = run("
+    let mut engine = run("
         relation edge(i32, i32);
         relation path(i32, i32);
         edge(1, 2); edge(2, 3); edge(3, 4);
@@ -88,14 +88,14 @@ fn compare_transitive_closure() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "path"), set2(prog.path));
+    assert_eq!(interp2(&mut engine, "path"), set2(prog.path));
 }
 
 // ─── FizzBuzz ───────────────────────────────────────────────────────
 
 #[test]
 fn compare_fizzbuzz() {
-    let engine = run("
+    let mut engine = run("
         relation number(i32);
         relation divisible(i32, i32);
         relation fizz(i32);
@@ -129,21 +129,21 @@ fn compare_fizzbuzz() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "fizz"), set1(prog.fizz), "fizz");
-    assert_eq!(interp1(&engine, "buzz"), set1(prog.buzz), "buzz");
+    assert_eq!(interp1(&mut engine, "fizz"), set1(prog.fizz), "fizz");
+    assert_eq!(interp1(&mut engine, "buzz"), set1(prog.buzz), "buzz");
     assert_eq!(
-        interp1(&engine, "fizz_buzz"),
+        interp1(&mut engine, "fizz_buzz"),
         set1(prog.fizz_buzz),
         "fizz_buzz"
     );
-    assert_eq!(interp1(&engine, "other"), set1(prog.other), "other");
+    assert_eq!(interp1(&mut engine, "other"), set1(prog.other), "other");
 }
 
 // ─── Factorial ──────────────────────────────────────────────────────
 
 #[test]
 fn compare_factorial() {
-    let engine = run("
+    let mut engine = run("
         relation fac(i32, i32);
         fac(0, 1);
         fac(n + 1, (n + 1) * f) <-- fac(n, f), if *n < 5;
@@ -157,14 +157,14 @@ fn compare_factorial() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "fac"), set2(prog.fac));
+    assert_eq!(interp2(&mut engine, "fac"), set2(prog.fac));
 }
 
 // ─── Generators ─────────────────────────────────────────────────────
 
 #[test]
 fn compare_generators() {
-    let engine = run("
+    let mut engine = run("
         relation nums(i32);
         relation pairs(i32, i32);
         nums(x) <-- for x in 0..5;
@@ -180,15 +180,15 @@ fn compare_generators() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "nums"), set1(prog.nums));
-    assert_eq!(interp2(&engine, "pairs"), set2(prog.pairs));
+    assert_eq!(interp1(&mut engine, "nums"), set1(prog.nums));
+    assert_eq!(interp2(&mut engine, "pairs"), set2(prog.pairs));
 }
 
 // ─── Three-Way Join ─────────────────────────────────────────────────
 
 #[test]
 fn compare_three_way_join() {
-    let engine = run("
+    let mut engine = run("
         relation a(i32, i32);
         relation b(i32, i32);
         relation c(i32, i32);
@@ -236,7 +236,7 @@ fn compare_three_way_join() {
 fn compare_mutual_recursion() {
     // Use head arithmetic (y+1) instead of body arithmetic (x-1) since
     // ascent macro requires body clause args to be bound variables.
-    let engine = run("
+    let mut engine = run("
         relation even(i32);
         relation odd(i32);
 
@@ -256,15 +256,15 @@ fn compare_mutual_recursion() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "even"), set1(prog.even), "even");
-    assert_eq!(interp1(&engine, "odd"), set1(prog.odd), "odd");
+    assert_eq!(interp1(&mut engine, "even"), set1(prog.even), "even");
+    assert_eq!(interp1(&mut engine, "odd"), set1(prog.odd), "odd");
 }
 
 // ─── Self-Join ──────────────────────────────────────────────────────
 
 #[test]
 fn compare_self_join() {
-    let engine = run("
+    let mut engine = run("
         relation edge(i32, i32);
         relation triangle(i32, i32, i32);
 
@@ -287,7 +287,7 @@ fn compare_self_join() {
     prog.run();
 
     assert_eq!(
-        interp3(&engine, "triangle"),
+        interp3(&mut engine, "triangle"),
         prog.triangle.into_iter().collect()
     );
 }
@@ -296,7 +296,7 @@ fn compare_self_join() {
 
 #[test]
 fn compare_negation() {
-    let engine = run("
+    let mut engine = run("
         relation a(i32);
         relation b(i32);
         relation only_a(i32);
@@ -318,14 +318,14 @@ fn compare_negation() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "only_a"), set1(prog.only_a));
+    assert_eq!(interp1(&mut engine, "only_a"), set1(prog.only_a));
 }
 
 // ─── Arithmetic Conditions ──────────────────────────────────────────
 
 #[test]
 fn compare_arithmetic() {
-    let engine = run("
+    let mut engine = run("
         relation n(i32);
         relation square(i32, i32);
         relation big_square(i32, i32);
@@ -347,15 +347,15 @@ fn compare_arithmetic() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "square"), set2(prog.square));
-    assert_eq!(interp2(&engine, "big_square"), set2(prog.big_square));
+    assert_eq!(interp2(&mut engine, "square"), set2(prog.square));
+    assert_eq!(interp2(&mut engine, "big_square"), set2(prog.big_square));
 }
 
 // ─── Duplicate Elimination ──────────────────────────────────────────
 
 #[test]
 fn compare_duplicate_elimination() {
-    let engine = run("
+    let mut engine = run("
         relation input(i32, i32);
         relation unique_first(i32);
 
@@ -373,14 +373,14 @@ fn compare_duplicate_elimination() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "unique_first"), set1(prog.unique_first));
+    assert_eq!(interp1(&mut engine, "unique_first"), set1(prog.unique_first));
 }
 
 // ─── Disjunction ────────────────────────────────────────────────────
 
 #[test]
 fn compare_disjunction() {
-    let engine = run("
+    let mut engine = run("
         relation a(i32);
         relation b(i32);
         relation c(i32);
@@ -402,14 +402,14 @@ fn compare_disjunction() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "c"), set1(prog.c));
+    assert_eq!(interp1(&mut engine, "c"), set1(prog.c));
 }
 
 // ─── Connected Components ───────────────────────────────────────────
 
 #[test]
 fn compare_connected_components() {
-    let engine = run("
+    let mut engine = run("
         relation edge(i32, i32);
         relation reach(i32, i32);
         relation comp(i32, i32);
@@ -441,15 +441,15 @@ fn compare_connected_components() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "reach"), set2(prog.reach), "reach");
-    assert_eq!(interp2(&engine, "comp"), set2(prog.comp), "comp");
+    assert_eq!(interp2(&mut engine, "reach"), set2(prog.reach), "reach");
+    assert_eq!(interp2(&mut engine, "comp"), set2(prog.comp), "comp");
 }
 
 // ─── Aggregation: count and sum ─────────────────────────────────────
 
 #[test]
 fn compare_aggregation() {
-    let engine = run("
+    let mut engine = run("
         relation score(i32, i32);
         relation total(i32);
         relation cnt(i32);
@@ -472,9 +472,9 @@ fn compare_aggregation() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "total"), set1(prog.total), "total");
+    assert_eq!(interp1(&mut engine, "total"), set1(prog.total), "total");
     // count: compare as i32 (interpreter) vs usize (ascent)
-    let interp_cnt = interp1(&engine, "cnt");
+    let interp_cnt = interp1(&mut engine, "cnt");
     let macro_cnt: BTreeSet<(i32,)> = prog.cnt.into_iter().map(|(c,)| (c as i32,)).collect();
     assert_eq!(interp_cnt, macro_cnt, "cnt");
 }
@@ -483,7 +483,7 @@ fn compare_aggregation() {
 
 #[test]
 fn compare_grouped_aggregation() {
-    let engine = run("
+    let mut engine = run("
         relation score(i32, i32);
         relation best(i32, i32);
 
@@ -507,14 +507,14 @@ fn compare_grouped_aggregation() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "best"), set2(prog.best));
+    assert_eq!(interp2(&mut engine, "best"), set2(prog.best));
 }
 
 // ─── Recursive with Aggregation ─────────────────────────────────────
 
 #[test]
 fn compare_recursive_with_aggregation() {
-    let engine = run("
+    let mut engine = run("
         relation edge(i32, i32);
         relation path(i32, i32);
         relation path_count(i32);
@@ -541,8 +541,8 @@ fn compare_recursive_with_aggregation() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "path"), set2(prog.path), "path");
-    let interp_cnt = interp1(&engine, "path_count");
+    assert_eq!(interp2(&mut engine, "path"), set2(prog.path), "path");
+    let interp_cnt = interp1(&mut engine, "path_count");
     let macro_cnt: BTreeSet<(i32,)> = prog
         .path_count
         .into_iter()
@@ -555,7 +555,7 @@ fn compare_recursive_with_aggregation() {
 
 #[test]
 fn compare_constant_in_clause() {
-    let engine = run("
+    let mut engine = run("
         relation data(i32, i32);
         relation filtered(i32);
 
@@ -573,14 +573,14 @@ fn compare_constant_in_clause() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "filtered"), set1(prog.filtered));
+    assert_eq!(interp1(&mut engine, "filtered"), set1(prog.filtered));
 }
 
 // ─── Rule Chaining ──────────────────────────────────────────────────
 
 #[test]
 fn compare_rule_chaining() {
-    let engine = run("
+    let mut engine = run("
         relation base(i32);
         relation step1(i32);
         relation step2(i32);
@@ -606,16 +606,16 @@ fn compare_rule_chaining() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "step1"), set1(prog.step1), "step1");
-    assert_eq!(interp1(&engine, "step2"), set1(prog.step2), "step2");
-    assert_eq!(interp1(&engine, "step3"), set1(prog.step3), "step3");
+    assert_eq!(interp1(&mut engine, "step1"), set1(prog.step1), "step1");
+    assert_eq!(interp1(&mut engine, "step2"), set1(prog.step2), "step2");
+    assert_eq!(interp1(&mut engine, "step3"), set1(prog.step3), "step3");
 }
 
 // ─── Cascading Aggregation ──────────────────────────────────────────
 
 #[test]
 fn compare_cascading_aggregation() {
-    let engine = run("
+    let mut engine = run("
         relation score(i32, i32);
         relation best(i32, i32);
         relation overall_best(i32);
@@ -641,9 +641,9 @@ fn compare_cascading_aggregation() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "best"), set2(prog.best), "best");
+    assert_eq!(interp2(&mut engine, "best"), set2(prog.best), "best");
     assert_eq!(
-        interp1(&engine, "overall_best"),
+        interp1(&mut engine, "overall_best"),
         set1(prog.overall_best),
         "overall_best"
     );
@@ -653,7 +653,7 @@ fn compare_cascading_aggregation() {
 
 #[test]
 fn compare_lattice_max() {
-    let engine = run("
+    let mut engine = run("
         lattice best(i32, i32);
         best(1, 10);
         best(1, 20);
@@ -673,14 +673,14 @@ fn compare_lattice_max() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "best"), set2(prog.best));
+    assert_eq!(interp2(&mut engine, "best"), set2(prog.best));
 }
 
 // ─── Lattice: Shortest Path with Dual ──────────────────────────────
 
 #[test]
 fn compare_lattice_shortest_path() {
-    let engine = run("
+    let mut engine = run("
         relation edge(i32, i32, i32);
         lattice shortest(i32, i32, Dual<i32>);
 
@@ -745,7 +745,7 @@ fn run_jit(input: &str) -> Engine {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_transitive_closure() {
-    let engine = run_jit("
+    let mut engine = run_jit("
         relation edge(i32, i32);
         relation path(i32, i32);
         edge(1, 2); edge(2, 3); edge(3, 4);
@@ -763,13 +763,13 @@ fn compare_jit_transitive_closure() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "path"), set2(prog.path));
+    assert_eq!(interp2(&mut engine, "path"), set2(prog.path));
 }
 
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_self_join() {
-    let engine = run_jit("
+    let mut engine = run_jit("
         relation edge(i32, i32);
         relation triangle(i32, i32, i32);
 
@@ -792,7 +792,7 @@ fn compare_jit_self_join() {
     prog.run();
 
     assert_eq!(
-        interp3(&engine, "triangle"),
+        interp3(&mut engine, "triangle"),
         prog.triangle.into_iter().collect()
     );
 }
@@ -800,7 +800,7 @@ fn compare_jit_self_join() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_mutual_recursion() {
-    let engine = run_jit("
+    let mut engine = run_jit("
         relation even(i32);
         relation odd(i32);
 
@@ -820,14 +820,14 @@ fn compare_jit_mutual_recursion() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "even"), set1(prog.even), "even");
-    assert_eq!(interp1(&engine, "odd"), set1(prog.odd), "odd");
+    assert_eq!(interp1(&mut engine, "even"), set1(prog.even), "even");
+    assert_eq!(interp1(&mut engine, "odd"), set1(prog.odd), "odd");
 }
 
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_factorial() {
-    let engine = run_jit("
+    let mut engine = run_jit("
         relation fac(i32, i32);
         fac(0, 1);
         fac(n + 1, (n + 1) * f) <-- fac(n, f), if *n < 5;
@@ -841,13 +841,13 @@ fn compare_jit_factorial() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "fac"), set2(prog.fac));
+    assert_eq!(interp2(&mut engine, "fac"), set2(prog.fac));
 }
 
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_arithmetic() {
-    let engine = run_jit("
+    let mut engine = run_jit("
         relation n(i32);
         relation square(i32, i32);
         relation big_square(i32, i32);
@@ -869,14 +869,14 @@ fn compare_jit_arithmetic() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "square"), set2(prog.square));
-    assert_eq!(interp2(&engine, "big_square"), set2(prog.big_square));
+    assert_eq!(interp2(&mut engine, "square"), set2(prog.square));
+    assert_eq!(interp2(&mut engine, "big_square"), set2(prog.big_square));
 }
 
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_constant_in_clause() {
-    let engine = run_jit("
+    let mut engine = run_jit("
         relation data(i32, i32);
         relation filtered(i32);
 
@@ -894,13 +894,13 @@ fn compare_jit_constant_in_clause() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "filtered"), set1(prog.filtered));
+    assert_eq!(interp1(&mut engine, "filtered"), set1(prog.filtered));
 }
 
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_rule_chaining() {
-    let engine = run_jit("
+    let mut engine = run_jit("
         relation base(i32);
         relation step1(i32);
         relation step2(i32);
@@ -926,15 +926,15 @@ fn compare_jit_rule_chaining() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "step1"), set1(prog.step1), "step1");
-    assert_eq!(interp1(&engine, "step2"), set1(prog.step2), "step2");
-    assert_eq!(interp1(&engine, "step3"), set1(prog.step3), "step3");
+    assert_eq!(interp1(&mut engine, "step1"), set1(prog.step1), "step1");
+    assert_eq!(interp1(&mut engine, "step2"), set1(prog.step2), "step2");
+    assert_eq!(interp1(&mut engine, "step3"), set1(prog.step3), "step3");
 }
 
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_generators() {
-    let engine = run_jit("
+    let mut engine = run_jit("
         relation nums(i32);
         relation pairs(i32, i32);
         nums(x) <-- for x in 0..5;
@@ -950,14 +950,14 @@ fn compare_jit_generators() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "nums"), set1(prog.nums));
-    assert_eq!(interp2(&engine, "pairs"), set2(prog.pairs));
+    assert_eq!(interp1(&mut engine, "nums"), set1(prog.nums));
+    assert_eq!(interp2(&mut engine, "pairs"), set2(prog.pairs));
 }
 
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_three_way_join() {
-    let engine = run_jit("
+    let mut engine = run_jit("
         relation a(i32, i32);
         relation b(i32, i32);
         relation c(i32, i32);
@@ -1002,7 +1002,7 @@ fn compare_jit_three_way_join() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_duplicate_elimination() {
-    let engine = run_jit("
+    let mut engine = run_jit("
         relation input(i32, i32);
         relation unique_first(i32);
 
@@ -1020,13 +1020,13 @@ fn compare_jit_duplicate_elimination() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp1(&engine, "unique_first"), set1(prog.unique_first));
+    assert_eq!(interp1(&mut engine, "unique_first"), set1(prog.unique_first));
 }
 
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_recursive_with_aggregation() {
-    let engine = run_jit("
+    let mut engine = run_jit("
         relation edge(i32, i32);
         relation path(i32, i32);
         relation path_count(i32);
@@ -1053,8 +1053,8 @@ fn compare_jit_recursive_with_aggregation() {
     let mut prog = AscentProgram::default();
     prog.run();
 
-    assert_eq!(interp2(&engine, "path"), set2(prog.path), "path");
-    let interp_cnt = interp1(&engine, "path_count");
+    assert_eq!(interp2(&mut engine, "path"), set2(prog.path), "path");
+    let interp_cnt = interp1(&mut engine, "path_count");
     let macro_cnt: BTreeSet<(i32,)> = prog
         .path_count
         .into_iter()
@@ -1067,7 +1067,7 @@ fn compare_jit_recursive_with_aggregation() {
 
 #[test]
 fn compare_lattice_recursive_max() {
-    let engine = run("
+    let mut engine = run("
         relation edge(i32, i32);
         relation source_val(i32, i32);
         lattice max_reach(i32, i32);
@@ -1096,7 +1096,7 @@ fn compare_lattice_recursive_max() {
     prog.run();
 
     assert_eq!(
-        interp2(&engine, "max_reach"),
+        interp2(&mut engine, "max_reach"),
         set2(prog.max_reach),
         "max_reach"
     );
