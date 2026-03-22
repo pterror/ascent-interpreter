@@ -42,8 +42,8 @@ Public-facing crates (ascent-eval, ascent-interpreter, ascent-syntax, ascent-ir)
 - [DONE] `syntax.rs:342,359` — `exp` → `expr` field naming _(severity: medium)_
 - [DONE] `value.rs:31-38` — `DynValue` trait methods documented _(severity: medium)_
 - [DONE] `docs/reference/types.md:82,118` — Fixed `Engine::new()` examples _(severity: medium)_
-- [PENDING] `eval.rs:554` — `Engine::run` takes redundant `&Program` param _(severity: medium)_
-- [PENDING] `eval.rs:588` — `run_incremental` leaks `FxHashSet` in public API _(severity: medium)_
+- [DONE] `eval.rs:554` — `Engine::run` takes redundant `&Program` param _(severity: medium)_
+- [DONE] `eval.rs:588` — `run_incremental` leaks `FxHashSet` in public API _(severity: medium)_
 - [PENDING] `ascent-ir/lib.rs:33` — `syn::Expr` leaks into IR public API _(severity: medium)_
 - [PENDING] `value.rs:114` — `Value::Interned` variant exposes `Rc<dyn InternTable>` _(severity: medium)_
 - [DONE] `eval.rs/syntax.rs/ir` — `field_types` vs `column_types` vs `col_types` inconsistency _(severity: medium)_
