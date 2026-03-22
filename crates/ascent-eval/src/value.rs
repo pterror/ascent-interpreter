@@ -1,4 +1,35 @@
 //! Runtime values for the interpreter.
+//!
+//! # Examples
+//!
+//! Creating values:
+//!
+//! ```
+//! use ascent_eval::value::Value;
+//!
+//! let i = Value::I32(42);
+//! let b = Value::Bool(true);
+//! let c = Value::Char('x');
+//! ```
+//!
+//! Arithmetic (wrapping):
+//!
+//! ```
+//! use ascent_eval::value::Value;
+//!
+//! let result = Value::I32(10).add(&Value::I32(20));
+//! assert_eq!(result, Some(Value::I32(30)));
+//! ```
+//!
+//! Comparison:
+//!
+//! ```
+//! use ascent_eval::value::Value;
+//! use std::cmp::Ordering;
+//!
+//! let ord = Value::I32(1).try_cmp(&Value::I32(2));
+//! assert_eq!(ord, Some(Ordering::Less));
+//! ```
 
 use std::any::Any;
 use std::cmp::Ordering;
@@ -369,7 +400,10 @@ impl fmt::Display for Value {
     }
 }
 
-/// A tuple of values, used as a row in a relation.
+/// A tuple of values. Alias for `Vec<Value>`.
+///
+/// Tuples are the basic unit of data in relations. Each tuple has a fixed
+/// arity (number of columns) determined by the relation it belongs to.
 pub type Tuple = Vec<Value>;
 
 impl Value {

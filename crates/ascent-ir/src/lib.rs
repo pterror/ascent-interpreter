@@ -2,6 +2,18 @@
 //!
 //! This IR is a simplified form of the AST, designed for efficient interpretation.
 //! It removes syntactic sugar and normalizes the program structure.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use ascent_syntax::AscentProgram;
+//! use ascent_ir::Program;
+//!
+//! let src = "relation edge(i32, i32); relation path(i32, i32); path(x,y) <-- edge(x,y);";
+//! let ast: AscentProgram = syn::parse_str(src).unwrap();
+//! let program = Program::from_ast(ast).unwrap();
+//! assert_eq!(program.rules.len(), 1);
+//! ```
 
 use std::collections::HashMap;
 
