@@ -273,15 +273,17 @@ impl PackedStorage {
     /// - `new`:    empty write buffer with initial capacity 64 tuples.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) fn build_native_projection(
-        &mut self,
+        &self,
     ) -> crate::jit::storage::JitNativeRelData {
         use crate::jit::storage::{JitNativeRelData, JitRelData};
 
         let arity = self.arity;
-        // Column indices (JitColIndex for EDB, RelIndex for IDB) are used for inner
-        // scans in the asm native path. Sink relations are never body clauses so they
-        // don't need indices.
-        let build_indices = !self.jit_is_sink;
+        // JitColIndex is only used for inner scans in the asm native path.
+        // The native path enforces that inner-scan relations must be EDB (IDB inner clauses
+        // are rejected — see asm_codegen.rs "asm native: clause N is IDB" error).
+        // Therefore, only EDB, non-sink relations need JitColIndex; all other relations
+        // (IDB, sink) can skip the O(n log n) sort + index build entirely.
+        let build_indices = self.jit_is_edb && !self.jit_is_sink;
         let total_slice = &self.packed_data[0..self.count * arity.max(1)];
 
         // Gather recent tuples into a contiguous slice.
@@ -321,21 +323,8 @@ impl PackedStorage {
             JitRelData::build_from_packed_no_tupleset(recent_data, arity, false)
         };
 
-        let mut total = JitRelData::build_from_packed(total_slice, arity, build_indices);
-        // For sink relations, alias total.tuple_set to jit_dedup immediately so the
-        // first JIT iteration can insert into the aliased table inline.
-        if self.jit_is_sink {
-            // Ensure jit_dedup has a minimum capacity so the alias is valid.
-            if self.jit_dedup.handle.cap == 0 {
-                self.jit_dedup.reserve(16);
-            }
-            let handle = &self.jit_dedup.handle;
-            let mask = (handle.cap - 1) as u64;
-            let count = self.jit_dedup.count() as u64;
-            unsafe { total.alias_tuple_set(handle.entries, mask, count) };
-        }
         JitNativeRelData {
-            total,
+            total: JitRelData::build_from_packed(total_slice, arity, build_indices),
             recent,
             // `new` must have an allocated tuple_set so the JIT can probe it inline.
             // `build_from_packed` on an empty slice allocates a minimum-capacity (16 slots)
@@ -350,12 +339,12 @@ impl PackedStorage {
     /// instead of re-sorting and rebuilding JitColIndex. O(n) memcpy for total vs O(n log n).
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) fn build_native_projection_with_total(
-        &mut self,
+        &self,
         total: Box<crate::jit::storage::JitRelData>,
     ) -> crate::jit::storage::JitNativeRelData {
         use crate::jit::storage::{JitNativeRelData, JitRelData};
         let arity = self.arity;
-        let build_indices = !self.jit_is_sink;
+        let build_indices = self.jit_is_edb && !self.jit_is_sink;
         let recent = if self.jit_is_sink {
             JitRelData::build_from_packed_no_tupleset(&[], arity, false)
         } else {
@@ -383,16 +372,6 @@ impl PackedStorage {
             };
             JitRelData::build_from_packed_no_tupleset(recent_data, arity, false)
         };
-        let mut total = total;
-        if self.jit_is_sink {
-            if self.jit_dedup.handle.cap == 0 {
-                self.jit_dedup.reserve(16);
-            }
-            let handle = &self.jit_dedup.handle;
-            let mask = (handle.cap - 1) as u64;
-            let count = self.jit_dedup.count() as u64;
-            unsafe { total.alias_tuple_set(handle.entries, mask, count) };
-        }
         JitNativeRelData {
             total,
             recent,
@@ -675,34 +654,27 @@ impl PackedStorage {
                     let data = unsafe {
                         std::slice::from_raw_parts(data_ptr, new_len * arity)
                     };
-                    // Batch flush: one extend for packed_data, one extend for delta.
+                    // Batch flush: one extend for packed_data, one extend for delta,
+                    // then a tight per-tuple loop for jit_dedup (unavoidable per-tuple
+                    // hash+insert), eliminating per-tuple function call overhead.
                     let start_idx = self.count;
                     self.packed_data.extend_from_slice(data);
                     self.count += new_len;
                     self.delta.extend(start_idx..start_idx + new_len);
-
-                    if rebuild_jit_native && self.jit_is_sink {
-                        // Sink + native path: the JIT already inserted each new tuple into
-                        // total.tuple_set (aliased to jit_dedup) inline during emit_heads.
-                        // Just sync jit_dedup.count from the number of tuples we now have.
-                        self.jit_dedup.set_count(self.count);
-                    } else {
-                        // Non-sink or non-native: insert into jit_dedup the traditional way.
-                        // Pre-size jit_dedup before the insert loop to avoid rehash cascades.
-                        // Without this, inserting N new tuples into a fresh table triggers
-                        // ceil(log2(N)) do_grow calls (e.g. 7 rehashes for 1140 tuples).
-                        // Each rehash allocates a new Vec + copies all existing entries.
-                        // One upfront reserve eliminates all rehashes.
-                        {
-                            let needed_cap =
-                                (((self.count) * 4 / 3) + 1).next_power_of_two().max(16) as u32;
-                            self.jit_dedup.reserve(needed_cap);
-                        }
-                        for i in 0..new_len {
-                            let tuple = &data[i * arity..(i + 1) * arity];
-                            let hash = crate::jit_index::jit_dedup_hash(tuple);
-                            self.jit_dedup.insert(hash, tuple);
-                        }
+                    // Pre-size jit_dedup before the insert loop to avoid rehash cascades.
+                    // Without this, inserting N new tuples into a fresh table triggers
+                    // ceil(log2(N)) do_grow calls (e.g. 7 rehashes for 1140 tuples).
+                    // Each rehash allocates a new Vec + copies all existing entries.
+                    // One upfront reserve eliminates all rehashes.
+                    {
+                        let needed_cap =
+                            (((self.count) * 4 / 3) + 1).next_power_of_two().max(16) as u32;
+                        self.jit_dedup.reserve(needed_cap);
+                    }
+                    for i in 0..new_len {
+                        let tuple = &data[i * arity..(i + 1) * arity];
+                        let hash = crate::jit_index::jit_dedup_hash(tuple);
+                        self.jit_dedup.insert(hash, tuple);
                     }
                 }
                 // Reset the `new` buffer in-place: zero len + tuple_set so the JIT
@@ -794,8 +766,7 @@ impl PackedStorage {
                     if is_sink_native {
                         let handle = &self.jit_dedup.handle;
                         let mask = if handle.cap == 0 { 0 } else { (handle.cap - 1) as u64 };
-                        let count = self.jit_dedup.count() as u64;
-                        unsafe { native.total.alias_tuple_set(handle.entries, mask, count) };
+                        unsafe { native.total.alias_tuple_set(handle.entries, mask) };
                     }
                 }
 

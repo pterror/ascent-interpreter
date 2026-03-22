@@ -3,7 +3,6 @@
 //! Cranelift has been removed. Stage 4 (asm backend) is the sole JIT execution path.
 
 pub(crate) mod layout;
-pub mod rel_index;
 pub mod storage;
 #[cfg(feature = "specialized")]
 pub(crate) mod packed_helpers;
@@ -305,7 +304,6 @@ impl JitCompiler {
         &mut self,
         stratum_key: usize,
         rules: &[&CRule],
-        head_is_sink: &[bool],
     ) -> Option<packed_helpers::StratumStage4Fn> {
         if let Some(cached) = self.stratum_stage4_native_fn_cache.get(&stratum_key) {
             return *cached;
@@ -351,7 +349,6 @@ impl JitCompiler {
             &rules_refs,
             self.var_count,
             packed_helpers::jit_advance_native as usize,
-            head_is_sink,
         ) {
             Ok(asm_stratum) => {
                 let fn_ptr = asm_stratum.fn_ptr;

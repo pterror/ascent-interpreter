@@ -542,7 +542,7 @@ ascent_macro ~196µs. All 261 tests pass. fibonacci/triangle unaffected.
 
 - **`packed_try_insert` for non-native path (TC/fibonacci)** — asm already probes dedup inline; `packed_try_insert` is only called for genuinely new tuples. It redundantly re-probes (`insert_if_new`) before appending. Replacing with a `packed_insert_no_dedup` helper would save ~5–10 instructions per new tuple. TC/50: ~1225 new tuples across the full run → ~2–4µs total savings. **Below noise floor; not worth implementing.**
 
-- **`jit_dedup.insert` batch in advance (triangle native path)** — ~~1140 per-tuple hash+insert calls after batch flush~~ **ELIMINATED (2026-03-22, commit `5ceee4d`)**: JIT now inserts directly into the aliased `total.tuple_set` (= `jit_dedup`) during step 2a probe miss. Batch flush skips the insert loop entirely for sink relations; `jit_dedup.count` is synced from `total.tuple_set.len`. Also skips step 2b (`new.tuple_set` probe) and step 6c/6d (`new.tuple_set` insert + grow). Net effect: eliminates per-tuple dedup overhead (~16% at n=200) for sink IDB relations.
+- **`jit_dedup.insert` batch in advance (triangle native path)** — 1140 per-tuple hash+insert calls after batch flush, inserting into a pre-sized table (~2048 slots, ~55% load). ~20 cycles/insert × 1140 = ~23K cycles = ~7.5µs per benchmark run. Unavoidable with current architecture (needed for cross-iteration dedup alias). A bulk-load rebuild (knowing all tuples unique) could save the per-slot collision checks, but savings are small (~2–3 instructions per insert at low load factor).
 
 - **Scalar inner-loop column scan vs LLVM vectorized** — triangle inner loop iterates a flat u32 array (col-values in JitColIndex.vals). LLVM auto-vectorizes this with AVX2 (~8 values/iteration); our asm emits scalar. For triangle n=20, each outer iteration scans ~19 values per key → 190 outer × 19 inner = 3610 scalar comparisons. With AVX2 this is ~452 SIMD iterations. Estimated: ~3–5µs savings at n=20, larger gains at higher n. **Clear implementation path: emit `vmovdqu`/`vpcmpeqd`/`vmovmskps` for the contiguous values scan in `asm_codegen.rs`. ~150 lines.**
 
@@ -589,96 +589,6 @@ The JIT executes **2.83× more instructions** and hits main memory **101× more 
 - **JitColIndex linear scan for fully-bound existence checks (2026-03-21, evaluated):** Tried replacing `JitTupleSet` probe with JitColIndex linear scan for EDB arity-2 existence checks (triangle's `edge(a,c)`). Rationale: JitTupleSet at n=100 (4950 edges) has cap=8192 slots × 12 bytes = 96KB exceeding L1; scan of sorted ~99-element range (≤400 bytes) stays in L1. **Result: consistently slower.** Scan depth = O(n) per probe ≈ 99 iterations × 5 instructions = ~495 instructions/probe vs JitTupleSet's ~43. Even with L1-residency for the vals slice, the instruction overhead dominates. Adaptive threshold (JitTupleSet for len≤2048, scan for larger) still made n=100 worse (5.96× vs JitTupleSet's ~4×). Root cause: JitTupleSet is L2-resident (not L3) in hot benchmarks, so cache miss savings do not offset the 10× extra instructions. The initial "2.3×" improvement measurement from the previous session was noise. `emit_native_edb_full_probe` kept as dead code for future binary-search variant. Correctness test `test_stage4_triangle_large` added (n=65, 2080 edges).
 
 - [x] **JitColIndex binary-search existence check / merge intersection (2026-03-21):** Implemented as a full two-pointer sorted-merge intersection (`detect_merge_pattern` + `emit_merge_scan_exist`). Instead of binary-searching per inner element, fuses the arity-2 EDB col-scan (level L) and the fully-bound arity-2 EDB existence check (level L+1) into a single O(|A|+|B|) merge loop. Both JitColIndex sorted slices (~|A| and ~|B| entries) are L1-resident. Results (same-machine, separate runs): n=50: neutral (JitTupleSet 49KB still L2-resident, merge branch mispredictions offset ~50% instruction savings); n=100: ~2% improvement (noise); n=200: eval-only 333ms → 270ms = **1.23×** speedup (JitTupleSet 393KB spills to L3, merge slices stay in L1). The sorted merge is neutral-or-better for all n and closes the large-n gap progressively.
-
-### Data-structure parity with ascent_macro (next major initiative)
-
-**Diagnosis (2026-03-22):** The instruction gap at n=50 is 3.5× (8.43M vs 2.43M per iter). Disassembly
-of the macro's triangle run function reveals the reference implementation:
-
-- **Index**: `FxHashMap<i32, Vec<i32>>` — one FxHash probe to get a bucket, then sequential scan of a flat Vec
-- **Dedup**: single `FxHashSet<(i32,i32,i32)>` — one FxHash insert, deduplication is natural
-- **Hot inner loop**: `imul rcx, 0xf1357aea2e62a9c5` (FxHash), then hashbrown Swiss table probe (`pcmpeqb`/`pmovmskb`)
-
-The JIT uses THREE separate hash structures where the macro uses ONE:
-1. `JitColIndex` (sorted arrays, bulk-rebuilt each iteration) — replaces `FxHashMap<u32, Vec<u32>>`
-2. `JitTupleSet` (separate full-tuple hash set for existence checks)
-3. `JitDedupTable` (another separate hash set just for output dedup) + batch flush to PackedStorage
-
-The batch flush alone (writing 19,600 triangles at n=50 through three separate paths into PackedStorage,
-then rebuilding JitColIndex sorted arrays) accounts for ~4–6M extra instructions per iteration. The
-reference code has none of this — tuples go directly into the output HashSet.
-
-**Root cause:** PackedStorage requires bulk index rebuilds; this forced the batch-flush architecture,
-which required the separate JitDedupTable, which is the primary overhead. The fix is to make the JIT
-write directly into live data structures that support incremental insert.
-
-**Goal:** make both the JIT and the interpreter fallback use the same data layout as the macro —
-`FxHash` key→`Vec<u32>` for column indices, a single hash set for output dedup — so the JIT can
-emit exactly the asm the macro emits, and the interpreter fallback gets the same data structures
-optimized by LLVM.
-
-**Why this is achievable:** We have the reference machine code. It is `imul` + hashbrown probe.
-The JIT already emits inline hash probes (JitTupleSet). Matching the macro requires only:
-1. Same data layout (FxHash key→Vec instead of sorted-array JitColIndex)
-2. Same output path (direct insert into the output relation, not a separate dedup table + flush)
-
-No JIT code quality problem. No LLVM magic. Just wrong data structures.
-
-**New architecture:**
-
-```
-RelIndex (#[repr(C)]):          — replaces JitColIndex
-  buckets: *mut u32  @ 0        — FxHash open-addressed keys (u32::MAX = empty)
-  offsets: *mut u32  @ 8        — offsets[i] = start in vals; offsets[i+1] = end
-  vals:    *mut u32  @ 16       — flat value array (sequential scan, no sort needed)
-  mask:    u32       @ 24       — cap-1 (power-of-2)
-  len:     u32       @ 28       — occupied bucket count
-
-  insert(key, val): FxHash(key) & mask → probe buckets[] → append val to vals[],
-                    update offsets[]. JIT inlines this. Rust callback only for resize.
-  probe(key) → (ptr, len): FxHash(key) & mask → probe buckets[] → return
-                    (vals + offsets[slot], offsets[slot+1] - offsets[slot]).
-```
-
-Output relation: use `JitTupleSet` (already exists) directly as the output dedup + storage.
-No separate `JitDedupTable`. No batch flush. JIT emits:
-1. Probe output `JitTupleSet` (already inlined) — skip if duplicate
-2. Insert into output `JitTupleSet` (extend existing inline insert logic)
-3. Append to output `data` flat buffer (already inlined for JitRelData)
-
-`advance()` at end of fixpoint iteration: swap `new` → `recent` → merged into `total`.
-No JitColIndex sort. No PackedStorage rebuild cycle. Just pointer swaps + RelIndex incremental inserts.
-
-**Implementation plan:**
-
-- [x] **Phase 1 — `RelIndex` struct** (commit `2986532`): new `#[repr(C)]` 16-byte index with
-  32-byte bucket stride (enables `slot << 5` in JIT). FxHash probe + incremental insert. Per-key
-  vals arrays grow independently (rehash-safe). ~470 lines in `rel_index.rs`.
-
-- [x] **Phase 1b — wire RelIndex into native IDB path** (commit `cd61fc5`): replaced "asm native:
-  clause N is IDB" rejection with `emit_rel_index_probe`. JitRelData gains `rel_col_indices` at
-  offset 64. RelIndex built alongside JitColIndex when `build_indices=true`; incrementally updated
-  in `extend_and_rebuild_indices`. **Result: TC jit_hot/50 at parity with ascent_macro** (~139µs
-  vs ~140µs, previously 1.49×).
-
-- [x] **Phase 2 — inline dedup insert for sink heads** (commit `5ceee4d`): for sink relations
-  (head-only, never in body), JIT inserts directly into `total.tuple_set` (aliased to `jit_dedup`)
-  during step 2a probe. Skips `new.tuple_set` probe entirely. Batch flush skips per-tuple
-  `jit_dedup.insert()` loop. Added `jit_dedup_grow_relink` callback for load-factor management.
-  **Result: triangle jit_hot/20 from 2.1× → 1.48×** (~49µs vs ~33µs macro).
-
-- [ ] **Phase 3 — interpreter uses same layout**: replace `PackedStorage`'s interpreter-path
-  indices (`indices`, `value_data`, `recent_col_indices`) with `RelIndex`. Interpreter inner loop
-  iterates `vals` slice directly — tight sequential scan, LLVM optimizes. Eliminates the dual
-  storage format (interpreter-path + JIT-path) that currently requires `ensure_interp_synced()`.
-
-- [ ] **Phase 4 — delete dead infrastructure**: remove `JitColIndex` (sorted, bulk-rebuilt),
-  `JitDedupTable`, `advance_jit_inner` batch flush loop, `ensure_interp_synced`, dual-buffer
-  bookkeeping in `PackedStorage`. Net: large reduction in code and allocations.
-
-**Expected outcome:** JIT hot path matches the macro's instruction pattern (FxHash probe + sequential
-Vec scan + single HashSet insert). Interpreter fallback uses the same structures with LLVM optimization.
-Both paths share one data layout — no conversion overhead, no sync needed.
 
 ### Not planned
 

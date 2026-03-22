@@ -62,7 +62,6 @@ mod macro_tc {
 }
 
 #[test]
-#[ignore = "SIGSEGV in JIT TC from root crate integration tests (pre-existing, not a regression — internal ascent-eval tests pass)"]
 fn test_jit_tc_chain_30_standalone() {
     let src = "relation edge(i32, i32);\n\
                relation path(i32, i32);\n\
@@ -73,7 +72,6 @@ fn test_jit_tc_chain_30_standalone() {
 }
 
 #[test]
-#[ignore = "SIGSEGV — depends on test_jit_tc_chain_30_standalone fix"]
 fn test_macro_parity_tc_chain_30() {
     let mut macro_results = macro_tc::run(30);
     macro_results.sort();

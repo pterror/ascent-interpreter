@@ -629,7 +629,7 @@ unsafe impl Sync for NativeHeadSpec {}
 /// The `scan_rels` and `head_rels` buffers are refreshed by `jit_advance_native`
 /// after each `advance_jit()` call.
 ///
-/// The C-visible region ends at offset 72. Fields beyond that are private
+/// The C-visible region ends at offset 56. Fields beyond that are private
 /// bookkeeping used by `jit_advance_native` and are NOT accessed by JIT code.
 ///
 /// repr(C) layout (64-bit):
@@ -643,8 +643,6 @@ unsafe impl Sync for NativeHeadSpec {}
 ///   offset 40: advance_rels   *const *mut PackedStorage (8 bytes)
 ///   offset 48: n_advance_rels u32                     (4 bytes)
 ///   offset 52: _pad2          u32
-///   offset 56: head_total_rels  *mut *mut JitRelData  (8 bytes) — refreshed each iter
-///   offset 64: head_packed_rels *mut *mut PackedStorage (8 bytes) — for jit_dedup_grow_relink
 ///   -- private (not JIT-visible) --
 ///   scan_specs  *const NativeScanSpec  (n_scan_rels entries)
 ///   head_specs  *const NativeHeadSpec  (n_head_rels entries)
@@ -672,9 +670,6 @@ pub struct StratumStage4NativeCtx {
     /// `head_total_rels[i]` = the total JitRelData for the same relation as `head_rels[i]`.
     /// Refreshed by `jit_advance_native` each iteration.
     pub head_total_rels: *mut *mut JitRelData,  // @ 56
-    /// Parallel to head_rels: `*mut PackedStorage` for each head relation.
-    /// Used by `jit_dedup_grow_relink` to access the `jit_dedup` field on grow.
-    pub head_packed_rels: *mut *mut PackedStorage, // @ 64
     // ── private: not JIT-visible ────────────────────────────────────────────
     /// Parallel to scan_rels / total_rels: tells `jit_advance_native` which
     /// `PackedStorage` and `use_recent` flag maps to each slot so the buffer
@@ -703,7 +698,6 @@ const _: () = {
     assert!(offset_of!(StratumStage4NativeCtx, advance_rels) == 40);
     assert!(offset_of!(StratumStage4NativeCtx, n_advance_rels) == 48);
     assert!(offset_of!(StratumStage4NativeCtx, head_total_rels) == 56);
-    assert!(offset_of!(StratumStage4NativeCtx, head_packed_rels) == 64);
 };
 
 /// Pinned runtime data keeping all backing allocations alive for a native Stage 4 context.
@@ -715,7 +709,6 @@ pub struct StratumStage4NativeRuntime {
     pub(crate) _total_rels_buf:       Box<[*mut JitRelData]>,
     pub(crate) _head_rels_buf:        Box<[*mut JitRelData]>,
     pub(crate) _head_total_rels_buf:  Box<[*mut JitRelData]>,
-    pub(crate) _head_packed_rels_buf: Box<[*mut PackedStorage]>,
     pub(crate) _advance_rels_buf:     Box<[*mut PackedStorage]>,
     pub(crate) _scan_specs_buf:       Box<[NativeScanSpec]>,
     pub(crate) _head_specs_buf:       Box<[NativeHeadSpec]>,
