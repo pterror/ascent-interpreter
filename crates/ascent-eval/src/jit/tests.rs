@@ -11,13 +11,13 @@ fn assert_jit_equivalence(input: &str, facts: &[(&str, Vec<Vec<Value>>)], query_
     let program = Program::from_ast(ast).expect("lowering should succeed");
 
     // Run without JIT
-    let mut engine_interp = Engine::new(&program);
+    let mut engine_interp = Engine::new(program.clone());
     for (rel, tuples) in facts {
         for tuple in tuples {
             engine_interp.insert(rel, tuple.clone());
         }
     }
-    engine_interp.run(&program);
+    engine_interp.run();
     let mut interp_results: Vec<Vec<Value>> = engine_interp
         .relation(query_rel)
         .unwrap()
@@ -27,14 +27,14 @@ fn assert_jit_equivalence(input: &str, facts: &[(&str, Vec<Vec<Value>>)], query_
     interp_results.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
 
     // Run with JIT
-    let mut engine_jit = Engine::new(&program);
+    let mut engine_jit = Engine::new(program);
     engine_jit.enable_jit().expect("JIT init should succeed");
     for (rel, tuples) in facts {
         for tuple in tuples {
             engine_jit.insert(rel, tuple.clone());
         }
     }
-    engine_jit.run(&program);
+    engine_jit.run();
     engine_jit.materialize();
     let mut jit_results: Vec<Vec<Value>> = engine_jit
         .relation(query_rel)

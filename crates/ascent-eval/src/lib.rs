@@ -19,14 +19,14 @@
 //!
 //! let ast: AscentProgram = syn::parse_str(input).unwrap();
 //! let program = Program::from_ast(ast).unwrap();
-//! let mut engine = Engine::new(&program);
+//! let mut engine = Engine::new(program);
 //!
 //! // Insert initial facts
 //! engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
 //! engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
 //!
 //! // Run to fixpoint
-//! engine.run(&program);
+//! engine.run();
 //!
 //! // Query results
 //! let path = engine.relation("path").unwrap();

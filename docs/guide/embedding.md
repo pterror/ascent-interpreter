@@ -54,7 +54,7 @@ fn main() {
     let program = Program::from_ast(ast).unwrap();
 
     // 3. Create the evaluation engine
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
 
     // 4. Insert ground facts
     engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
@@ -62,7 +62,7 @@ fn main() {
     engine.insert("edge", vec![Value::I32(3), Value::I32(4)]);
 
     // 5. Run to fixpoint (semi-naive evaluation)
-    engine.run(&program);
+    engine.run();
 
     // 6. Query results
     let path = engine.relation("path").unwrap();
@@ -157,22 +157,18 @@ let source = r#"
 "#;
 let ast: AscentProgram = syn::parse_str(source).unwrap();
 let program = Program::from_ast(ast).unwrap();
-let mut engine = Engine::new(&program);
+let mut engine = Engine::new(program);
 
 // Initial facts and evaluation
 engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
 engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
-engine.run(&program);
+engine.run();
 assert_eq!(engine.relation("path").unwrap().len(), 3);
 
 // Add a new edge and re-evaluate incrementally
 engine.insert("edge", vec![Value::I32(3), Value::I32(4)]);
 
-let mut dirty = FxHashSet::default();
-dirty.insert("edge".to_string());
-let retracted = FxHashSet::default(); // no retractions
-
-let rederived = engine.run_incremental(&program, &dirty, &retracted);
+let rederived = engine.run_incremental(&["edge"], &[]);
 // rederived contains the names of relations that were updated
 assert_eq!(engine.relation("path").unwrap().len(), 6);
 ```
@@ -188,18 +184,14 @@ let src = engine.intern_source("file_a.rs");
 // Insert facts tagged with a source
 engine.insert_with_source("edge", vec![Value::I32(10), Value::I32(20)], src);
 engine.insert_with_source("edge", vec![Value::I32(20), Value::I32(30)], src);
-engine.run(&program);
+engine.run();
 
 // Later: retract all facts from that source
 let removed = engine.retract_source(src);
 println!("removed {removed} tuples");
 
 // Re-derive without those facts
-let mut dirty = FxHashSet::default();
-dirty.insert("edge".to_string());
-let mut retracted_rels = FxHashSet::default();
-retracted_rels.insert("edge".to_string());
-engine.run_incremental(&program, &dirty, &retracted_rels);
+engine.run_incremental(&["edge"], &["edge"]);
 ```
 
 ## 5. Custom Types
@@ -265,14 +257,14 @@ The `jit-asm` feature implies `jit` and `specialized`.
 ### Enabling JIT at runtime
 
 ```rust
-let mut engine = Engine::new(&program);
+let mut engine = Engine::new(program);
 
 // Enable JIT — returns Err if initialization fails
 engine.enable_jit()?;
 
 // Insert facts and run as normal
 engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-engine.run(&program);
+engine.run();
 ```
 
 Rules that the JIT cannot compile fall back to the interpreter automatically. No code changes are needed beyond calling `enable_jit()`.
@@ -282,18 +274,18 @@ Rules that the JIT cannot compile fall back to the interpreter automatically. No
 If you create multiple engines for the same program (e.g., for different datasets), you can share the compiled JIT code to avoid recompilation:
 
 ```rust
-let mut engine1 = Engine::new(&program);
+let mut engine1 = Engine::new(program.clone());
 engine1.enable_jit()?;
-engine1.run(&program);
+engine1.run();
 
 // Extract the shared JIT handle
 let jit_handle = engine1.share_jit_compiler().unwrap();
 
 // Inject into a second engine — no recompilation needed
-let mut engine2 = Engine::new(&program);
+let mut engine2 = Engine::new(program);
 engine2.set_jit_compiler(jit_handle);
 engine2.insert("edge", vec![Value::I32(10), Value::I32(20)]);
-engine2.run(&program);
+engine2.run();
 ```
 
 ## 7. Error Handling

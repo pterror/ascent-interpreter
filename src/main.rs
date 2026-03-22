@@ -39,7 +39,7 @@ fn run_file(path: &str) {
     };
 
     match eval_source(&source) {
-        Ok((mut engine, program)) => dump_all(&mut engine, &program),
+        Ok(mut engine) => dump_all(&mut engine),
         Err(e) => {
             eprintln!("parse error: {e}");
             std::process::exit(1);
@@ -47,12 +47,12 @@ fn run_file(path: &str) {
     }
 }
 
-fn eval_source(source: &str) -> Result<(Engine, Program), String> {
+fn eval_source(source: &str) -> Result<Engine, String> {
     let ast: AscentProgram = syn::parse_str(source).map_err(|e| e.to_string())?;
     let program = Program::from_ast(ast)?;
-    let mut engine = Engine::new(&program);
-    engine.run(&program);
-    Ok((engine, program))
+    let mut engine = Engine::new(program);
+    engine.run();
+    Ok(engine)
 }
 
 fn try_parse_program(source: &str) -> Result<Program, String> {
@@ -69,7 +69,6 @@ fn repl() {
     let mut line_buf = String::new();
     let mut prev_counts: HashMap<String, usize> = HashMap::new();
     let mut engine: Option<Engine> = None;
-    let mut current_program: Option<Program> = None;
 
     loop {
         if line_buf.is_empty() {
@@ -116,7 +115,6 @@ fn repl() {
                     source.clear();
                     prev_counts.clear();
                     engine = None;
-                    current_program = None;
                     eprintln!("(cleared)");
                 }
                 ":source" | ":src" => {
@@ -127,8 +125,8 @@ fn repl() {
                     }
                 }
                 ":dump" | ":d" => {
-                    if let (Some(eng), Some(prog)) = (&mut engine, &current_program) {
-                        dump_all(eng, prog);
+                    if let Some(eng) = &mut engine {
+                        dump_all(eng);
                     } else {
                         eprintln!("(no program)");
                     }
@@ -165,10 +163,9 @@ fn repl() {
                             match try_parse_program(&source) {
                                 Ok(prog) => {
                                     // Destructive: rebuild from scratch
-                                    let mut eng = Engine::new(&prog);
-                                    eng.run(&prog);
+                                    let mut eng = Engine::new(prog);
+                                    eng.run();
                                     engine = Some(eng);
-                                    current_program = Some(prog);
                                     prev_counts.clear();
                                     eprintln!("(removed: {removed})");
                                 }
@@ -181,7 +178,6 @@ fn repl() {
                             }
                         } else {
                             engine = None;
-                            current_program = None;
                             prev_counts.clear();
                             eprintln!("(removed: {removed})");
                         }
@@ -189,7 +185,6 @@ fn repl() {
                         let removed = source.trim().to_string();
                         source.clear();
                         engine = None;
-                        current_program = None;
                         prev_counts.clear();
                         eprintln!("(removed: {removed})");
                     }
@@ -220,14 +215,12 @@ fn repl() {
                             // Destructive: rebuild from scratch
                             if source.trim().is_empty() {
                                 engine = None;
-                                current_program = None;
                             } else {
                                 match try_parse_program(&source) {
                                     Ok(prog) => {
-                                        let mut eng = Engine::new(&prog);
-                                        eng.run(&prog);
+                                        let mut eng = Engine::new(prog);
+                                        eng.run();
                                         engine = Some(eng);
-                                        current_program = Some(prog);
                                     }
                                     Err(e) => {
                                         eprintln!("parse error after retraction: {e}");
@@ -242,8 +235,8 @@ fn repl() {
                     }
                 }
                 ":relations" | ":rels" => {
-                    if let (Some(eng), Some(prog)) = (&mut engine, &current_program) {
-                        list_relations(eng, prog);
+                    if let Some(eng) = &mut engine {
+                        list_relations(eng);
                     } else {
                         eprintln!("(no relations)");
                     }
@@ -273,20 +266,18 @@ fn repl() {
             Ok(program) => {
                 match engine.as_mut() {
                     Some(eng) => {
-                        eng.update_program(&program);
-                        eng.run(&program);
+                        eng.update_program(program);
+                        eng.run();
                     }
                     None => {
-                        let mut eng = Engine::new(&program);
-                        eng.run(&program);
+                        let mut eng = Engine::new(program);
+                        eng.run();
                         engine = Some(eng);
                     }
                 }
                 source = candidate;
-                current_program = Some(program);
                 show_changes(
                     engine.as_mut().unwrap(),
-                    current_program.as_ref().unwrap(),
                     &mut prev_counts,
                 );
             }
@@ -313,15 +304,15 @@ fn print_help() {
     eprintln!("Multi-line input continues until ';'. Empty line cancels.");
 }
 
-fn show_changes(engine: &mut Engine, program: &Program, prev_counts: &mut HashMap<String, usize>) {
+fn show_changes(engine: &mut Engine, prev_counts: &mut HashMap<String, usize>) {
     let mut any_change = false;
-    let mut names: Vec<&str> = program.relations.keys().map(String::as_str).collect();
+    let mut names: Vec<String> = engine.program().relations.keys().cloned().collect();
     names.sort();
 
-    for name in names {
+    for name in &names {
         let count = engine.relation(name).map_or(0, Relation::len);
-        let prev = prev_counts.get(name).copied().unwrap_or(0);
-        prev_counts.insert(name.to_string(), count);
+        let prev = prev_counts.get(name.as_str()).copied().unwrap_or(0);
+        prev_counts.insert(name.clone(), count);
 
         if count != prev {
             let delta = count as isize - prev as isize;
@@ -339,11 +330,11 @@ fn show_changes(engine: &mut Engine, program: &Program, prev_counts: &mut HashMa
     }
 }
 
-fn list_relations(engine: &mut Engine, program: &Program) {
-    let mut names: Vec<&str> = program.relations.keys().map(String::as_str).collect();
+fn list_relations(engine: &mut Engine) {
+    let mut names: Vec<String> = engine.program().relations.keys().cloned().collect();
     names.sort();
 
-    for name in names {
+    for name in &names {
         let count = engine.relation(name).map_or(0, Relation::len);
         println!(
             "  {name}: {count} tuple{}",
@@ -453,12 +444,12 @@ fn print_filtered(name: &str, rel: &Relation, pats: &[QueryPat]) {
     }
 }
 
-fn dump_all(engine: &mut Engine, program: &Program) {
-    let mut names: Vec<&str> = program.relations.keys().map(String::as_str).collect();
+fn dump_all(engine: &mut Engine) {
+    let mut names: Vec<String> = engine.program().relations.keys().cloned().collect();
     names.sort();
 
     let mut first = true;
-    for name in names {
+    for name in &names {
         if let Some(rel) = engine.relation(name)
             && !rel.is_empty()
         {

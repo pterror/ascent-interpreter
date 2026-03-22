@@ -28,12 +28,12 @@ fn rerun_idempotent() {
         path(x, z) <-- edge(x, y), path(y, z);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
-    engine.run(&program);
+    let mut engine = Engine::new(program);
+    engine.run();
     let first = collect_rel(&mut engine, "path");
 
     // Run again on same engine — should produce identical results.
-    engine.run(&program);
+    engine.run();
     let second = collect_rel(&mut engine, "path");
     assert_eq!(first, second);
 }
@@ -47,14 +47,14 @@ fn additive_facts() {
         path(x, z) <-- edge(x, y), path(y, z);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
     engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-    engine.run(&program);
+    engine.run();
     assert_eq!(collect_rel(&mut engine, "path").len(), 1); // (1,2)
 
     // Add a new fact and re-run.
     engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
-    engine.run(&program);
+    engine.run();
     assert_eq!(collect_rel(&mut engine, "path").len(), 3); // (1,2), (2,3), (1,3)
 }
 
@@ -69,8 +69,8 @@ fn additive_rules() {
         path(x, y) <-- edge(x, y);
     "#;
     let prog1 = parse(src1);
-    let mut engine = Engine::new(&prog1);
-    engine.run(&prog1);
+    let mut engine = Engine::new(prog1);
+    engine.run();
     assert_eq!(collect_rel(&mut engine, "path").len(), 2); // (1,2), (2,3)
 
     // Add transitive rule.
@@ -83,8 +83,8 @@ fn additive_rules() {
         path(x, z) <-- edge(x, y), path(y, z);
     "#;
     let prog2 = parse(src2);
-    engine.update_program(&prog2);
-    engine.run(&prog2);
+    engine.update_program(prog2);
+    engine.run();
     assert_eq!(collect_rel(&mut engine, "path").len(), 3); // (1,2), (2,3), (1,3)
 }
 
@@ -96,8 +96,8 @@ fn clean_deltas_after_run() {
         node(2);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
-    engine.run(&program);
+    let mut engine = Engine::new(program);
+    engine.run();
 
     // After run, recent should be empty (no pending delta/recent data).
     let rel = engine.relation("node").unwrap();
@@ -115,8 +115,8 @@ fn update_program_adds_new_relation() {
         a(1);
     "#;
     let prog1 = parse(src1);
-    let mut engine = Engine::new(&prog1);
-    engine.run(&prog1);
+    let mut engine = Engine::new(prog1);
+    engine.run();
 
     // Expand program with a new relation.
     let src2 = r#"
@@ -126,8 +126,8 @@ fn update_program_adds_new_relation() {
         b(2);
     "#;
     let prog2 = parse(src2);
-    engine.update_program(&prog2);
-    engine.run(&prog2);
+    engine.update_program(prog2);
+    engine.run();
 
     assert_eq!(collect_rel(&mut engine, "a"), vec![vec![Value::I32(1)]]);
     assert_eq!(collect_rel(&mut engine, "b"), vec![vec![Value::I32(2)]]);
@@ -141,7 +141,7 @@ fn source_insert_and_retract() {
         relation edge(i32, i32);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
 
     let s1 = engine.intern_source("file_a");
     let s2 = engine.intern_source("file_b");
@@ -170,7 +170,7 @@ fn source_retract_and_rederive() {
         path(x, z) <-- edge(x, y), path(y, z);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
 
     let s1 = engine.intern_source("file_a");
     let s2 = engine.intern_source("file_b");
@@ -178,7 +178,7 @@ fn source_retract_and_rederive() {
     // file_a contributes edge(1,2), file_b contributes edge(2,3)
     engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s1);
     engine.insert_with_source("edge", vec![Value::I32(2), Value::I32(3)], s2);
-    engine.run(&program);
+    engine.run();
 
     assert_eq!(collect_rel(&mut engine, "path").len(), 3); // (1,2), (2,3), (1,3)
 
@@ -194,7 +194,7 @@ fn source_retract_and_rederive() {
         .relation_mut("path")
         .unwrap()
         .retract_source(SourceId::ANONYMOUS);
-    engine.run(&program);
+    engine.run();
     assert_eq!(collect_rel(&mut engine, "path").len(), 1); // only (2,3)
 }
 
@@ -204,7 +204,7 @@ fn source_intern_idempotent() {
         relation node(i32);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
 
     let s1 = engine.intern_source("my_source");
     let s2 = engine.intern_source("my_source");
@@ -223,11 +223,11 @@ fn source_from_empty_body_rules() {
         node(2);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
 
     let s = engine.intern_source("file_x");
     engine.set_source(s);
-    engine.run(&program);
+    engine.run();
 
     assert_eq!(engine.relation("node").unwrap().len(), 2);
 
@@ -246,12 +246,12 @@ fn source_derived_facts_stay_anonymous() {
         path(x, y) <-- edge(x, y);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
 
     let s = engine.intern_source("my_file");
     engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s);
     engine.set_source(s);
-    engine.run(&program);
+    engine.run();
 
     // edge(1,2) is tagged with s, path(1,2) is derived (anonymous)
     assert_eq!(engine.relation("path").unwrap().len(), 1);
@@ -268,7 +268,7 @@ fn source_multiple_sources_independent() {
         relation fact(i32);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
 
     let a = engine.intern_source("a");
     let b = engine.intern_source("b");
@@ -299,7 +299,7 @@ fn source_retract_then_reinsert() {
         relation edge(i32, i32);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
 
     let s = engine.intern_source("file");
     engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s);
@@ -319,7 +319,7 @@ fn source_untagged_facts_survive_retraction() {
         relation node(i32);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
 
     let s = engine.intern_source("tagged");
 
@@ -344,7 +344,7 @@ fn source_batch_retract() {
         relation fact(i32);
     "#;
     let program = parse(src);
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
 
     let a = engine.intern_source("a");
     let b = engine.intern_source("b");

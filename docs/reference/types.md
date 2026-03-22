@@ -84,7 +84,7 @@ impl std::fmt::Display for Point {
 let src = "relation points(Point);";
 let ast = syn::parse_str::<AscentProgram>(src).unwrap();
 let program = Program::from_ast(ast);
-let mut engine = Engine::new(&program);
+let mut engine = Engine::new(program);
 engine.register_type(
     "Point",
     |args| {
@@ -125,7 +125,7 @@ impl std::fmt::Display for Point {
 let src = "relation points(Point);";
 let ast = syn::parse_str::<AscentProgram>(src).unwrap();
 let program = Program::from_ast(ast);
-let mut engine = Engine::new(&program);
+let mut engine = Engine::new(program);
 engine.register_serde_type::<Point>("Point");
 ```
 

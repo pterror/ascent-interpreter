@@ -11,14 +11,14 @@ use ascent_syntax::AscentProgram as AstProgram;
 fn jit_run(src: &str, facts: &[(&str, Vec<Vec<Value>>)], rel: &str) -> Vec<Vec<Value>> {
     let ast: AstProgram = syn::parse_str(src).expect("parse");
     let program = Program::from_ast(ast).expect("lowering should succeed");
-    let mut engine = Engine::new(&program);
+    let mut engine = Engine::new(program);
     engine.enable_jit().expect("JIT init should succeed");
     for (name, tuples) in facts {
         for t in tuples {
             engine.insert(name, t.clone());
         }
     }
-    engine.run(&program);
+    engine.run();
     engine.materialize();
     engine
         .relation(rel)

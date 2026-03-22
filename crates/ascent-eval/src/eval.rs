@@ -344,7 +344,7 @@ pub struct SharedJitCompiler(Arc<Mutex<crate::jit::JitCompiler>>);
 
 impl Engine {
     /// Create a new engine from a program.
-    pub fn new(program: &Program) -> Self {
+    pub fn new(program: Program) -> Self {
         let mut relations = FxHashMap::default();
         let mut column_types = FxHashMap::default();
 
@@ -369,6 +369,7 @@ impl Engine {
         }
 
         Engine {
+            program,
             relations,
             column_types,
             type_registry: TypeRegistry::new(),
@@ -385,6 +386,11 @@ impl Engine {
             max_iterations: 10_000,
             materialized: true,
         }
+    }
+
+    /// Return a reference to the program this engine was created with.
+    pub fn program(&self) -> &Program {
+        &self.program
     }
 
     /// Enable JIT compilation for eligible rules.
@@ -596,9 +602,9 @@ impl Engine {
     ///
     /// Rules are grouped into strongly connected components and processed in
     /// topological order. Each SCC runs to fixpoint before dependent SCCs begin.
-    pub fn run(&mut self, program: &Program) {
+    pub fn run(&mut self) {
         self.materialized = false;
-        self.ensure_stratification(program);
+        self.ensure_stratification();
         let strat = self
             .stratification
             .as_ref()
@@ -636,15 +642,17 @@ impl Engine {
     /// Returns the set of all relation names that were re-derived.
     pub fn run_incremental(
         &mut self,
-        program: &Program,
-        dirty: &FxHashSet<String>,
-        retracted: &FxHashSet<String>,
+        dirty: &[&str],
+        retracted: &[&str],
     ) -> FxHashSet<String> {
         if dirty.is_empty() {
             return FxHashSet::default();
         }
 
-        self.ensure_stratification(program);
+        let dirty: FxHashSet<String> = dirty.iter().map(|s| s.to_string()).collect();
+        let retracted: FxHashSet<String> = retracted.iter().map(|s| s.to_string()).collect();
+
+        self.ensure_stratification();
         let strat = self
             .stratification
             .as_ref()
@@ -746,18 +754,19 @@ impl Engine {
     }
 
     /// Ensure the stratification cache is populated.
-    fn ensure_stratification(&mut self, program: &Program) {
+    fn ensure_stratification(&mut self) {
         if self.stratification.is_none() {
-            self.stratification = Some(Stratification::build(program, &self.var_interner));
+            self.stratification =
+                Some(Stratification::build(&self.program, &self.var_interner));
         }
     }
 
-    /// Sync the engine's relation registry with a (potentially changed) program.
+    /// Replace the engine's program and sync the relation registry.
     ///
     /// Creates storage for new relations without disturbing existing ones.
     /// Existing relation data is preserved for incremental re-evaluation.
     /// Invalidates the cached stratification so it is rebuilt on next run.
-    pub fn update_program(&mut self, program: &Program) {
+    pub fn update_program(&mut self, program: Program) {
         self.stratification = None;
         for (name, rel) in &program.relations {
             let arity = rel.column_types.len();
@@ -777,6 +786,7 @@ impl Engine {
                 .or_insert_with(|| Relation::new_auto(arity, rel.is_lattice, &types));
             self.column_types.entry(name.clone()).or_insert_with(|| types);
         }
+        self.program = program;
     }
 
     /// Run a set of rules to fixpoint.
@@ -3031,15 +3041,15 @@ mod tests {
     fn run_program(input: &str) -> Engine {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
-        engine.run(&program);
+        let mut engine = Engine::new(program);
+        engine.run();
         engine
     }
 
     fn run_with_facts(input: &str, facts: Vec<(&str, Vec<Tuple>)>) -> Engine {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
 
         for (rel, tuples) in facts {
             for tuple in tuples {
@@ -3047,7 +3057,7 @@ mod tests {
             }
         }
 
-        engine.run(&program);
+        engine.run();
         engine
     }
 
@@ -3725,7 +3735,7 @@ mod tests {
         )
         .unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
 
         engine.insert(
             "point",
@@ -3735,7 +3745,7 @@ mod tests {
             "point",
             vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })],
         );
-        engine.run(&program);
+        engine.run();
 
         let hp = engine.relation("has_point").unwrap();
         assert!(hp.contains(&[Value::I32(1)]));
@@ -3756,12 +3766,12 @@ mod tests {
         )
         .unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
 
         let p = Value::custom(Point { x: 1, y: 2 });
         engine.insert("r", vec![Value::I32(1), p.clone()]);
         engine.insert("s", vec![p, Value::I32(99)]);
-        engine.run(&program);
+        engine.run();
 
         let joined = engine.relation("joined").unwrap();
         assert!(joined.contains(&[Value::I32(1), Value::I32(99)]));
@@ -3779,7 +3789,7 @@ mod tests {
         )
         .unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
 
         engine.register_type(
             "Point",
@@ -3794,7 +3804,7 @@ mod tests {
             },
         );
 
-        engine.run(&program);
+        engine.run();
 
         let data = engine.relation("data").unwrap();
         assert_eq!(data.len(), 2);
@@ -3839,7 +3849,7 @@ mod tests {
         )
         .unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         register_point(&mut engine);
 
         engine.insert(
@@ -3850,7 +3860,7 @@ mod tests {
             "data",
             vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })],
         );
-        engine.run(&program);
+        engine.run();
 
         let coords = engine.relation("coords").unwrap();
         assert_eq!(coords.len(), 2);
@@ -3870,14 +3880,14 @@ mod tests {
         )
         .unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         register_point(&mut engine);
 
         engine.insert(
             "data",
             vec![Value::I32(1), Value::custom(Point { x: 5, y: 15 })],
         );
-        engine.run(&program);
+        engine.run();
 
         let coords = engine.relation("coords").unwrap();
         assert_eq!(coords.len(), 1);
@@ -3896,14 +3906,14 @@ mod tests {
         )
         .unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         register_point(&mut engine);
 
         engine.insert(
             "data",
             vec![Value::I32(1), Value::custom(Point { x: 7, y: 99 })],
         );
-        engine.run(&program);
+        engine.run();
 
         let x_only = engine.relation("x_only").unwrap();
         assert_eq!(x_only.len(), 1);
@@ -3922,12 +3932,12 @@ mod tests {
         )
         .unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         register_point(&mut engine);
 
         // Insert a plain i32 instead of a Point — should not match
         engine.insert("data", vec![Value::I32(1), Value::I32(42)]);
-        engine.run(&program);
+        engine.run();
 
         let coords = engine.relation("coords").unwrap();
         assert_eq!(coords.len(), 0);
@@ -3949,9 +3959,9 @@ mod tests {
         )
         .unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         register_point(&mut engine);
-        engine.run(&program);
+        engine.run();
 
         let unwrapped = engine.relation("unwrapped").unwrap();
         assert_eq!(unwrapped.len(), 2);
@@ -3994,9 +4004,9 @@ mod tests {
             )
             .unwrap();
             let program = Program::from_ast(ast).expect("lowering should succeed");
-            let mut engine = Engine::new(&program);
+            let mut engine = Engine::new(program);
             engine.register_serde_type::<Point>("Point");
-            engine.run(&program);
+            engine.run();
 
             let unwrapped = engine.relation("unwrapped").unwrap();
             assert_eq!(unwrapped.len(), 2);
@@ -4017,12 +4027,12 @@ mod tests {
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-        engine.run(&program);
+        engine.run();
 
         let rederived =
-            engine.run_incremental(&program, &FxHashSet::default(), &FxHashSet::default());
+            engine.run_incremental(&[], &[]);
         assert!(rederived.is_empty());
         // path should still have its data
         assert_eq!(engine.relation("path").unwrap().len(), 1);
@@ -4038,12 +4048,12 @@ mod tests {
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
 
         let src = engine.intern_source("initial");
         engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], src);
         engine.insert_with_source("edge", vec![Value::I32(2), Value::I32(3)], src);
-        engine.run(&program);
+        engine.run();
         assert_eq!(engine.relation("path").unwrap().len(), 3); // (1,2), (2,3), (1,3)
 
         // Retract and add different edges
@@ -4051,9 +4061,7 @@ mod tests {
         let src2 = engine.intern_source("updated");
         engine.insert_with_source("edge", vec![Value::I32(10), Value::I32(20)], src2);
 
-        let dirty = FxHashSet::from_iter(["edge".to_string()]);
-        let retracted = FxHashSet::from_iter(["edge".to_string()]);
-        let rederived = engine.run_incremental(&program, &dirty, &retracted);
+        let rederived = engine.run_incremental(&["edge"], &["edge"]);
 
         assert!(rederived.contains("path"));
         let path = engine.relation("path").unwrap();
@@ -4075,9 +4083,9 @@ mod tests {
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         engine.insert("a", vec![Value::I32(1)]);
-        engine.run(&program);
+        engine.run();
 
         assert_eq!(engine.relation("b").unwrap().len(), 1);
         assert_eq!(engine.relation("c").unwrap().len(), 1);
@@ -4088,9 +4096,7 @@ mod tests {
         engine.insert("a", vec![Value::I32(2)]);
         engine.insert("a", vec![Value::I32(3)]);
 
-        let dirty = FxHashSet::from_iter(["a".to_string()]);
-        let retracted = FxHashSet::from_iter(["a".to_string()]);
-        let rederived = engine.run_incremental(&program, &dirty, &retracted);
+        let rederived = engine.run_incremental(&["a"], &["a"]);
 
         assert!(rederived.contains("b"));
         assert!(rederived.contains("c"));
@@ -4118,12 +4124,11 @@ mod tests {
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         engine.insert("src", vec![Value::I32(1)]);
-        engine.run(&program);
+        engine.run();
 
-        let dirty = FxHashSet::from_iter(["src".to_string()]);
-        let rederived = engine.run_incremental(&program, &dirty, &FxHashSet::default());
+        let rederived = engine.run_incremental(&["src"], &[]);
         assert_eq!(rederived, FxHashSet::from_iter(["derived".to_string()]));
     }
 
@@ -4141,16 +4146,15 @@ mod tests {
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
         engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
-        engine.run(&program);
+        engine.run();
         assert_eq!(engine.relation("path").unwrap().len(), 3); // (1,2), (2,3), (1,3)
 
         // Add a new edge — old paths should be preserved, new ones derived
         engine.insert("edge", vec![Value::I32(3), Value::I32(4)]);
-        let dirty = FxHashSet::from_iter(["edge".to_string()]);
-        engine.run_incremental(&program, &dirty, &FxHashSet::default());
+        engine.run_incremental(&["edge"], &[]);
 
         let path = engine.relation("path").unwrap();
         // Old: (1,2), (2,3), (1,3)
@@ -4175,17 +4179,16 @@ mod tests {
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         engine.insert("node", vec![Value::I32(1)]);
         engine.insert("node", vec![Value::I32(2)]);
         engine.insert("node", vec![Value::I32(3)]);
-        engine.run(&program);
+        engine.run();
         assert_eq!(engine.relation("included").unwrap().len(), 3);
 
         // Add an exclusion — negation SCC must re-derive from scratch
         engine.insert("excluded", vec![Value::I32(2)]);
-        let dirty = FxHashSet::from_iter(["excluded".to_string()]);
-        engine.run_incremental(&program, &dirty, &FxHashSet::default());
+        engine.run_incremental(&["excluded"], &[]);
 
         let included = engine.relation("included").unwrap();
         assert_eq!(included.len(), 2);
@@ -4208,11 +4211,11 @@ mod tests {
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         engine.insert("raw", vec![Value::I32(1)]);
         engine.insert("raw", vec![Value::I32(2)]);
         engine.insert("excluded", vec![Value::I32(2)]);
-        engine.run(&program);
+        engine.run();
 
         let filtered = engine.relation("filtered").unwrap();
         assert_eq!(filtered.len(), 1);
@@ -4220,8 +4223,7 @@ mod tests {
 
         // Add more raw data — derived uses delta, filtered re-derives
         engine.insert("raw", vec![Value::I32(3)]);
-        let dirty = FxHashSet::from_iter(["raw".to_string()]);
-        engine.run_incremental(&program, &dirty, &FxHashSet::default());
+        engine.run_incremental(&["raw"], &[]);
 
         let derived = engine.relation("derived").unwrap();
         assert_eq!(derived.len(), 3);
@@ -4246,17 +4248,16 @@ mod tests {
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         engine.insert("node", vec![Value::I32(1)]);
         engine.insert("node", vec![Value::I32(2)]);
         engine.insert("node", vec![Value::I32(3)]);
-        engine.run(&program);
+        engine.run();
         assert_eq!(engine.relation("doubled").unwrap().len(), 3);
 
         // Exclude node 2 — kept clears (non-monotone), doubled must also re-derive
         engine.insert("excluded", vec![Value::I32(2)]);
-        let dirty = FxHashSet::from_iter(["excluded".to_string()]);
-        engine.run_incremental(&program, &dirty, &FxHashSet::default());
+        engine.run_incremental(&["excluded"], &[]);
 
         let kept = engine.relation("kept").unwrap();
         assert_eq!(kept.len(), 2);
@@ -4278,15 +4279,14 @@ mod tests {
         "#;
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         engine.insert("src", vec![Value::I32(1)]);
-        engine.run(&program);
+        engine.run();
         assert_eq!(engine.relation("dst").unwrap().len(), 1);
 
         // Insert same fact again (deduplication means no actual delta)
         engine.insert("src", vec![Value::I32(1)]);
-        let dirty = FxHashSet::from_iter(["src".to_string()]);
-        engine.run_incremental(&program, &dirty, &FxHashSet::default());
+        engine.run_incremental(&["src"], &[]);
 
         // Should still have exactly 1 tuple
         assert_eq!(engine.relation("dst").unwrap().len(), 1);
@@ -4304,14 +4304,14 @@ mod jit_hot_tests {
         let ast: AscentProgram = syn::parse_str(source).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         // warmup
-        let mut warmup = Engine::new(&program);
+        let mut warmup = Engine::new(program.clone());
         warmup.enable_jit().expect("JIT init should succeed");
-        warmup.run(&program);
+        warmup.run();
         let jit = warmup.share_jit_compiler().unwrap();
         // hot run
-        let mut engine = Engine::new(&program);
+        let mut engine = Engine::new(program);
         engine.set_jit_compiler(jit);
-        engine.run(&program);
+        engine.run();
     }
 
     #[test]
@@ -4331,21 +4331,21 @@ mod jit_hot_tests {
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let n = 10i32;
         // warmup
-        let mut warmup = Engine::new(&program);
+        let mut warmup = Engine::new(program.clone());
         warmup.enable_jit().expect("JIT init should succeed");
         for i in 1..n {
             warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
         }
-        warmup.run(&program);
+        warmup.run();
         let jit = warmup.share_jit_compiler().unwrap();
         // hot runs: verify correctness across several iterations
         for _ in 0..10 {
-            let mut engine = Engine::new(&program);
+            let mut engine = Engine::new(program.clone());
             engine.set_jit_compiler(jit.clone());
             for i in 1..n {
                 engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
             }
-            engine.run(&program);
+            engine.run();
             let rel = engine.relation("path").unwrap();
             let expected = (n * (n - 1) / 2) as usize;
             assert_eq!(
