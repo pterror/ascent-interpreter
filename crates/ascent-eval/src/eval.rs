@@ -156,7 +156,7 @@ impl TypeRegistry {
     }
 
     /// Look up a constructor by name.
-    pub fn get(&self, name: &str) -> Option<&ValueConstructor> {
+    pub fn constructor(&self, name: &str) -> Option<&ValueConstructor> {
         self.constructors.get(name)
     }
 
@@ -328,6 +328,8 @@ pub struct Engine {
     stratum_stage4_cache: FxHashMap<usize, StratumStage4Runtime>,
     /// Maximum number of fixpoint iterations before stopping evaluation.
     max_iterations: usize,
+    /// Whether packed relations have been materialized since the last `run()`.
+    materialized: bool,
 }
 
 /// An opaque, shareable handle to a pre-compiled JIT compiler.
@@ -379,6 +381,7 @@ impl Engine {
             #[cfg(all(feature = "jit", feature = "specialized"))]
             stratum_stage4_cache: FxHashMap::default(),
             max_iterations: 10_000,
+            materialized: true,
         }
     }
 
@@ -464,12 +467,23 @@ impl Engine {
     }
 
     /// Get a relation by name.
-    pub fn relation(&self, name: &str) -> Option<&Relation> {
+    ///
+    /// Automatically calls [`Engine::materialize`] if needed (i.e., if [`Engine::run`]
+    /// was called since the last materialization), so callers never see stale data.
+    pub fn relation(&mut self, name: &str) -> Option<&Relation> {
+        if !self.materialized {
+            self.materialize();
+        }
         self.relations.get(name)
     }
 
     /// Get a mutable relation by name.
+    ///
+    /// Automatically calls [`Engine::materialize`] if needed.
     pub fn relation_mut(&mut self, name: &str) -> Option<&mut Relation> {
+        if !self.materialized {
+            self.materialize();
+        }
         self.relations.get_mut(name)
     }
 
@@ -487,6 +501,7 @@ impl Engine {
                 ps.ensure_interp_synced();
             }
         }
+        self.materialized = true;
     }
 
     /// Insert a tuple into a relation (untagged / [`SourceId::ANONYMOUS`]).
@@ -563,6 +578,7 @@ impl Engine {
     /// Rules are grouped into strongly connected components and processed in
     /// topological order. Each SCC runs to fixpoint before dependent SCCs begin.
     pub fn run(&mut self, program: &Program) {
+        self.materialized = false;
         self.ensure_stratification(program);
         let strat = self.stratification.as_ref().unwrap();
 

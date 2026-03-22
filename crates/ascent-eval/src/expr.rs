@@ -254,7 +254,7 @@ fn eval_call(
 
         // Check type registry for custom constructors
         if let Some(reg) = registry
-            && let Some(constructor) = reg.get(&name)
+            && let Some(constructor) = reg.constructor(&name)
         {
             let args: Option<Vec<Value>> = call
                 .args

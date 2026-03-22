@@ -339,7 +339,7 @@ pub struct IfLetClause {
     #[call(Pat::parse_multi)]
     pub pattern: Pat,
     pub eq_symbol: Token![=],
-    pub exp: syn::Expr,
+    pub expr: syn::Expr,
 }
 
 /// If clause: `if condition`
@@ -356,7 +356,7 @@ pub struct LetClause {
     #[call(Pat::parse_multi)]
     pub pattern: Pat,
     pub eq_symbol: Token![=],
-    pub exp: syn::Expr,
+    pub expr: syn::Expr,
 }
 
 /// Condition clause variants.
@@ -378,9 +378,9 @@ impl CondClause {
 
     pub fn expr(&self) -> &Expr {
         match self {
-            CondClause::IfLet(cl) => &cl.exp,
+            CondClause::IfLet(cl) => &cl.expr,
             CondClause::If(cl) => &cl.cond,
-            CondClause::Let(cl) => &cl.exp,
+            CondClause::Let(cl) => &cl.expr,
         }
     }
 }

@@ -266,11 +266,11 @@ impl Condition {
             CondClause::If(c) => Condition::If(c.cond),
             CondClause::IfLet(c) => Condition::IfLet {
                 pattern: c.pattern,
-                expr: c.exp,
+                expr: c.expr,
             },
             CondClause::Let(c) => Condition::Let {
                 pattern: c.pattern,
-                expr: c.exp,
+                expr: c.expr,
             },
         }
     }

@@ -882,7 +882,7 @@ pub(crate) fn eval_cexpr(
                     .map(|v| Value::Option(Some(Box::new(v)))),
                 "None" => Some(Value::Option(None)),
                 "Dual" => vals.into_iter().next().map(|v| Value::Dual(Box::new(v))),
-                _ => registry.and_then(|r| r.get(name).and_then(|ctor| ctor(&vals))),
+                _ => registry.and_then(|r| r.constructor(name).and_then(|ctor| ctor(&vals))),
             }
         }
         CExpr::MethodCall(receiver, method, args) => {
