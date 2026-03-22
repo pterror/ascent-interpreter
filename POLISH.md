@@ -30,7 +30,7 @@ Public-facing crates (ascent-eval, ascent-interpreter, ascent-syntax, ascent-ir)
 - [DONE] `README.md` — Rewritten with installation, usage, examples, features _(severity: high)_
 - [DONE] `docs/` — Embedding guide added at `docs/guide/embedding.md` _(severity: high)_
 
-### MEDIUM — 8 resolved, 9 remaining
+### MEDIUM — 14 resolved, 6 remaining
 
 - [DONE] `eval.rs:770` — Fixpoint iteration limit (10,000 default) _(severity: medium)_
 - [DONE] `expr.rs:352` — Range expansion limit (1M) _(severity: medium)_
