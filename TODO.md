@@ -651,10 +651,15 @@ No JitColIndex sort. No PackedStorage rebuild cycle. Just pointer swaps + RelInd
 
 **Implementation plan:**
 
-- [ ] **Phase 1 — `RelIndex` struct**: new `#[repr(C)]` index replacing `JitColIndex`. FxHash
-  key→(offset, len) in a single flat allocation. Supports inline probe AND incremental insert
-  (vs JitColIndex's sort-on-rebuild). Rust API for interpreter path; JIT inlines fast path.
-  ~150 lines in `jit_index.rs`.
+- [x] **Phase 1 — `RelIndex` struct** (commit `2986532`): new `#[repr(C)]` 16-byte index with
+  32-byte bucket stride (enables `slot << 5` in JIT). FxHash probe + incremental insert. Per-key
+  vals arrays grow independently (rehash-safe). ~470 lines in `rel_index.rs`.
+
+- [x] **Phase 1b — wire RelIndex into native IDB path** (commit `cd61fc5`): replaced "asm native:
+  clause N is IDB" rejection with `emit_rel_index_probe`. JitRelData gains `rel_col_indices` at
+  offset 64. RelIndex built alongside JitColIndex when `build_indices=true`; incrementally updated
+  in `extend_and_rebuild_indices`. **Result: TC jit_hot/50 at parity with ascent_macro** (~139µs
+  vs ~140µs, previously 1.49×).
 
 - [ ] **Phase 2 — inline insert in JIT**: extend `emit_tuple_set_probe` / head-emission asm to
   write directly into the output `JitTupleSet` and `data` buffer inline. Rust callback only for
