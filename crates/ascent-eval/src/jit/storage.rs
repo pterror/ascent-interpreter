@@ -13,6 +13,8 @@
 use std::alloc::{alloc_zeroed, dealloc, realloc, Layout};
 use std::ptr;
 
+use super::rel_index::RelIndex;
+
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 /// Sentinel key value meaning "empty bucket" in `JitColIndex`.
@@ -475,16 +477,17 @@ impl Drop for JitTupleSet {
 
 /// One relation version (total, delta, or new).
 ///
-/// Layout (C-visible, 64 bytes):
-/// - offset  0: `data`        (*mut u32)
-/// - offset  8: `len`         (u64)
-/// - offset 16: `cap`         (u64)
-/// - offset 24: `col_indices` (*mut *mut JitColIndex)
-/// - offset 32: `tuple_set`   (JitTupleSet, 24 bytes)
-/// - offset 56: `arity`       (u32)
-/// - offset 60: `_pad`        (u32)
+/// Layout (C-visible, 72 bytes):
+/// - offset  0: `data`            (*mut u32)
+/// - offset  8: `len`             (u64)
+/// - offset 16: `cap`             (u64)
+/// - offset 24: `col_indices`     (*mut *mut JitColIndex)
+/// - offset 32: `tuple_set`       (JitTupleSet, 24 bytes)
+/// - offset 56: `arity`           (u32)
+/// - offset 60: `_pad`            (u32)
+/// - offset 64: `rel_col_indices` (*mut *mut RelIndex)
 ///
-/// Private fields follow at offset 64 (not visible to JIT code).
+/// Private fields follow at offset 72 (not visible to JIT code).
 #[repr(C)]
 pub struct JitRelData {
     /// Packed tuples, row-major, stride = arity.
@@ -507,7 +510,11 @@ pub struct JitRelData {
     pub arity: u32,
     #[doc(hidden)]
     pub _pad: u32,
-    // ── private fields beyond the 64-byte C region ───────────────────────
+    /// `array[arity]` of pointers to `RelIndex` (null per column if not built).
+    /// Used for IDB inner-clause probes in the native asm path.
+    /// offset 64
+    pub rel_col_indices: *mut *mut RelIndex,
+    // ── private fields beyond the 72-byte C region ───────────────────────
     // Total words allocated in tuple_set.slots (cap_in_slots * (arity + 1)).
     // Used by Drop to reconstruct the layout for dealloc.
     // Sentinel value `usize::MAX` means the slots are aliased (not owned) and
@@ -530,6 +537,7 @@ impl JitRelData {
             tuple_set: JitTupleSet::new_empty(),
             arity: arity as u32,
             _pad: 0,
+            rel_col_indices: ptr::null_mut(),
             _ts_slots_words: 0,
         })
     }
@@ -603,6 +611,21 @@ impl JitRelData {
         };
         let _ = ptr_bytes; // used only for documentation
 
+        // ── RelIndex pointer array ──────────────────────────────────────
+        let rel_col_indices_ptr: *mut *mut RelIndex = if arity > 0 && build_indices {
+            let layout = Layout::array::<*mut RelIndex>(arity).expect("layout overflow");
+            let raw = unsafe { alloc_zeroed(layout) } as *mut *mut RelIndex;
+            assert!(!raw.is_null(), "allocation failed");
+            for col in 0..arity {
+                let pairs = Self::build_rel_pairs(data, arity, col);
+                let ri = RelIndex::build_from_pairs(&pairs);
+                unsafe { *raw.add(col) = Box::into_raw(Box::new(ri)) };
+            }
+            raw
+        } else {
+            ptr::null_mut()
+        };
+
         Box::new(JitRelData {
             data: data_ptr,
             len: n_tuples as u64,
@@ -615,8 +638,28 @@ impl JitRelData {
             },
             arity: arity as u32,
             _pad: 0,
+            rel_col_indices: rel_col_indices_ptr,
             _ts_slots_words: ts_slots_words,
         })
+    }
+
+    /// Build `(key, val)` pairs for `RelIndex::build_from_pairs` from flat packed data.
+    ///
+    /// For arity 2: key = `data[i*2 + col]`, val = `data[i*2 + (1 - col)]` (other col).
+    /// For other arities: key = `data[i*arity + col]`, val = `i as u32` (row index).
+    fn build_rel_pairs(data: &[u32], arity: usize, col: usize) -> Vec<(u32, u32)> {
+        let n_tuples = if arity == 0 { 0 } else { data.len() / arity };
+        let mut pairs = Vec::with_capacity(n_tuples);
+        for i in 0..n_tuples {
+            let key = data[i * arity + col];
+            let val = if arity == 2 {
+                data[i * arity + (1 - col)]
+            } else {
+                i as u32
+            };
+            pairs.push((key, val));
+        }
+        pairs
     }
 }
 
@@ -868,6 +911,38 @@ impl JitRelData {
             let new_idx = JitColIndex::build(full_slice, arity, col);
             unsafe { *col_indices_ptr.add(col) = Box::into_raw(new_idx) };
         }
+
+        // Incrementally insert new tuples into RelIndex for each column.
+        // RelIndex supports incremental insert with automatic growth, so we
+        // only process the new tuples (old_len..new_len) rather than rebuilding.
+        if !self.rel_col_indices.is_null() {
+            for col in 0..arity {
+                let ri_ptr = unsafe { *self.rel_col_indices.add(col) };
+                if !ri_ptr.is_null() {
+                    let ri = unsafe { &mut *ri_ptr };
+                    for i in old_len..new_len {
+                        let key = unsafe { *self.data.add(i * arity + col) };
+                        let val = if arity == 2 {
+                            unsafe { *self.data.add(i * arity + (1 - col)) }
+                        } else {
+                            i as u32
+                        };
+                        ri.insert(key, val);
+                    }
+                }
+            }
+        } else if arity > 0 {
+            // First time: allocate and build RelIndex from all data.
+            let layout = Layout::array::<*mut RelIndex>(arity).expect("layout overflow");
+            let raw = unsafe { alloc_zeroed(layout) } as *mut *mut RelIndex;
+            assert!(!raw.is_null(), "allocation failed");
+            for col in 0..arity {
+                let pairs = Self::build_rel_pairs(full_slice, arity, col);
+                let ri = RelIndex::build_from_pairs(&pairs);
+                unsafe { *raw.add(col) = Box::into_raw(Box::new(ri)) };
+            }
+            self.rel_col_indices = raw;
+        }
     }
 }
 
@@ -894,6 +969,20 @@ impl Drop for JitRelData {
             let layout = Layout::array::<*mut JitColIndex>(arity).expect("layout overflow");
             unsafe { dealloc(self.col_indices as *mut u8, layout) };
             self.col_indices = ptr::null_mut();
+        }
+
+        // Free rel_col_indices (and the pointer array itself).
+        if !self.rel_col_indices.is_null() {
+            for col in 0..arity {
+                let ri_ptr = unsafe { *self.rel_col_indices.add(col) };
+                if !ri_ptr.is_null() {
+                    // Reconstruct Box so RelIndex::drop runs (frees buckets + vals).
+                    drop(unsafe { Box::from_raw(ri_ptr) });
+                }
+            }
+            let layout = Layout::array::<*mut RelIndex>(arity).expect("layout overflow");
+            unsafe { dealloc(self.rel_col_indices as *mut u8, layout) };
+            self.rel_col_indices = ptr::null_mut();
         }
 
         // Free tuple_set slots (only if owned — not an alias into jit_dedup).
@@ -1007,6 +1096,27 @@ pub(crate) unsafe fn clone_jit_rel_data_with_indices(
         ptr::null_mut()
     };
 
+    // ── rel_col_indices ──────────────────────────────────────────────────────
+    // Rebuild from data rather than cloning internal hash state (simpler, correct).
+    let rel_col_indices_ptr: *mut *mut RelIndex = if arity > 0
+        && !src.rel_col_indices.is_null()
+    {
+        let layout = Layout::array::<*mut RelIndex>(arity).expect("layout overflow");
+        let raw = unsafe { alloc_zeroed(layout) } as *mut *mut RelIndex;
+        assert!(!raw.is_null(), "allocation failed");
+        if n > 0 && !data_ptr.is_null() {
+            let full_slice = unsafe { std::slice::from_raw_parts(data_ptr, n * arity) };
+            for col in 0..arity {
+                let pairs = JitRelData::build_rel_pairs(full_slice, arity, col);
+                let ri = RelIndex::build_from_pairs(&pairs);
+                unsafe { *raw.add(col) = Box::into_raw(Box::new(ri)) };
+            }
+        }
+        raw
+    } else {
+        ptr::null_mut()
+    };
+
     Box::new(JitRelData {
         data: data_ptr,
         len: src.len,
@@ -1015,6 +1125,7 @@ pub(crate) unsafe fn clone_jit_rel_data_with_indices(
         tuple_set: JitTupleSet { slots: ts_slots, mask: ts_mask, len: ts_len },
         arity: src.arity,
         _pad: 0,
+        rel_col_indices: rel_col_indices_ptr,
         _ts_slots_words: ts_slots_words,
     })
 }
@@ -1177,13 +1288,14 @@ const _: () = {
     assert!(offset_of!(JitTupleSet, len) == 16);
     assert!(size_of::<JitTupleSet>() == 24);
 
-    // ── JitRelData C-visible region (first 64 bytes) ──────────────────────
+    // ── JitRelData C-visible region (first 72 bytes) ──────────────────────
     assert!(offset_of!(JitRelData, data) == 0);
     assert!(offset_of!(JitRelData, len) == 8);
     assert!(offset_of!(JitRelData, cap) == 16);
     assert!(offset_of!(JitRelData, col_indices) == 24);
     assert!(offset_of!(JitRelData, tuple_set) == 32);
     assert!(offset_of!(JitRelData, arity) == 56);
-    // Total struct size is 64 (C region) + size_of::<usize>() (private field).
-    assert!(size_of::<JitRelData>() == 64 + size_of::<usize>());
+    assert!(offset_of!(JitRelData, rel_col_indices) == 64);
+    // Total struct size is 72 (C region) + size_of::<usize>() (private field).
+    assert!(size_of::<JitRelData>() == 72 + size_of::<usize>());
 };

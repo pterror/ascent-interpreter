@@ -278,12 +278,10 @@ impl PackedStorage {
         use crate::jit::storage::{JitNativeRelData, JitRelData};
 
         let arity = self.arity;
-        // JitColIndex is only used for inner scans in the asm native path.
-        // The native path enforces that inner-scan relations must be EDB (IDB inner clauses
-        // are rejected — see asm_codegen.rs "asm native: clause N is IDB" error).
-        // Therefore, only EDB, non-sink relations need JitColIndex; all other relations
-        // (IDB, sink) can skip the O(n log n) sort + index build entirely.
-        let build_indices = self.jit_is_edb && !self.jit_is_sink;
+        // Column indices (JitColIndex for EDB, RelIndex for IDB) are used for inner
+        // scans in the asm native path. Sink relations are never body clauses so they
+        // don't need indices.
+        let build_indices = !self.jit_is_sink;
         let total_slice = &self.packed_data[0..self.count * arity.max(1)];
 
         // Gather recent tuples into a contiguous slice.
@@ -344,7 +342,7 @@ impl PackedStorage {
     ) -> crate::jit::storage::JitNativeRelData {
         use crate::jit::storage::{JitNativeRelData, JitRelData};
         let arity = self.arity;
-        let build_indices = self.jit_is_edb && !self.jit_is_sink;
+        let build_indices = !self.jit_is_sink;
         let recent = if self.jit_is_sink {
             JitRelData::build_from_packed_no_tupleset(&[], arity, false)
         } else {

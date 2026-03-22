@@ -656,6 +656,119 @@ fn emit_native_edb_full_probe(
     Ok(())
 }
 
+// ─── RelIndex probe for IDB inner clauses ─────────────────────────────────
+//
+// Probes a `RelIndex` (incrementally-maintained hash map) for IDB body clauses.
+// On hit: sets up r15 = vals_ptr, rbx = end_ptr (same interface as the contiguous
+// JitColIndex col-value scan), so the downstream iteration loop is shared.
+//
+// RelIndex layout (#[repr(C)], 16 bytes):
+//   offset 0: buckets  (*mut RelIndexBucket)
+//   offset 8: mask     (u32)
+//   offset 12: len     (u32)
+//
+// RelIndexBucket layout (#[repr(C)], 32 bytes):
+//   offset 0:  key    (u32; 0xFFFFFFFF = empty)
+//   offset 4:  count  (u32)
+//   offset 8:  cap    (u32)
+//   offset 12: _pad   (u32)
+//   offset 16: vals   (*mut u32)
+//   offset 24: _pad2  (u64)
+//
+// Addressing: bucket_addr = buckets + slot * 32 = buckets + (slot << 5)
+//
+// After a successful probe, falls through with:
+//   r15 = vals pointer (start of value array for this key)
+//   rbx = end pointer  (vals + count * 4)
+// These match the contiguous col-value scan interface exactly.
+fn emit_rel_index_probe(
+    asm: &mut Assembler,
+    p: &EmitParams<'_>,
+    level: usize,
+    clause: &CClause,
+    when_not_found: DynamicLabel,
+) -> Result<(), String> {
+    if clause.bound_cols.is_empty() {
+        return Err(format!("emit_rel_index_probe: clause {level} has no bound_cols"));
+    }
+    let primary_col = clause.bound_cols[0];
+    let primary_col_i32 = (primary_col * 8) as i32;
+
+    // flat handle index for this (level, use_recent)
+    let use_recent = p.use_recent[level];
+    let flat_idx = p.rule_handle_base + level * 2 + if use_recent { 1 } else { 0 };
+    let flat_idx_i32 = (flat_idx * 8) as i32;
+
+    // Load JitRelData* → rdi
+    dynasm!(asm
+        ; mov rdi, [rbp + CTX_SLOT]
+        ; mov rdi, [rdi]                       // scan_rels ptr
+        ; mov rdi, [rdi + flat_idx_i32]        // *mut JitRelData
+    );
+
+    // Load rel_col_indices from JitRelData offset 64 → r8
+    dynasm!(asm
+        ; mov r8, [rdi + 64]                   // rel_col_indices: *mut *mut RelIndex
+        ; mov r8, [r8 + primary_col_i32]       // RelIndex* for primary_col
+    );
+
+    // Load primary key → ecx
+    match &clause.args[primary_col] {
+        CClauseArg::Var(var_id) => emit_load_var_ecx(asm, p.var_locs, *var_id),
+        CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
+            dynasm!(asm; mov ecx, *n);
+        }
+        CClauseArg::Expr(expr) => {
+            emit_expr(asm, expr, p.var_locs)?;
+            dynasm!(asm; mov ecx, eax);
+        }
+    }
+
+    // Hash: slot = (key * 0x9e3779b9) & mask
+    // RelIndex: buckets at offset 0, mask at offset 8
+    dynasm!(asm
+        ; mov eax, ecx
+        ; imul eax, eax, 0x9e3779b9u32 as i32
+        ; mov edx, [r8 + 8]                   // RelIndex.mask (offset 8, u32)
+        ; and eax, edx                        // slot = hash & mask
+        ; mov r9, [r8]                        // r9 = buckets ptr (offset 0)
+    );
+
+    // Linear probe loop: bucket_addr = buckets + slot * 32
+    // Check bucket.key at [bucket_addr + 0]
+    let probe_lp  = asm.new_dynamic_label();
+    let probe_hit = asm.new_dynamic_label();
+
+    dynasm!(asm; =>probe_lp);
+    dynasm!(asm
+        ; mov esi, eax
+        ; shl rsi, 5                          // rsi = slot * 32
+        ; add rsi, r9                         // rsi = bucket_addr
+        ; mov r11d, [rsi]                     // bucket.key
+        ; cmp r11d, -1i32                     // EMPTY_KEY → key absent
+        ; je =>when_not_found
+        ; cmp r11d, ecx
+        ; je =>probe_hit
+        ; inc eax
+        ; and eax, edx                        // slot = (slot + 1) & mask
+        ; jmp =>probe_lp
+    );
+
+    // Hit: load count and vals from bucket
+    // bucket.count at offset 4, bucket.vals at offset 16
+    dynasm!(asm; =>probe_hit);
+    dynasm!(asm
+        ; mov eax, [rsi + 4]                  // eax = bucket.count
+        ; test eax, eax
+        ; jz =>when_not_found                 // count == 0: not in relation
+        ; mov r15, [rsi + 16]                 // r15 = bucket.vals (start of value array)
+        ; lea rbx, [r15 + rax*4]              // rbx = end_ptr = vals + count * 4
+    );
+    // rdi still = *mut JitRelData for this scan slot
+
+    Ok(())
+}
+
 // ─── Merge intersection ───────────────────────────────────────────────────
 
 /// Detected pattern for a two-pointer sorted-merge intersection.
@@ -2081,16 +2194,9 @@ fn emit_clause_level(
         let stride = (arity * 4) as i32;
         let use_recent = p.use_recent[level];
         let is_rec = p.is_rec[level];
-        // Native path only supports EDB (contiguous JitColIndex) inner clauses.
-        // IDB inner clauses require full JitColIndex rebuild per iteration (O(n log n));
-        // the non-native asm path uses O(1) linked-list inserts and handles IDB correctly.
-        if p.use_jit_native && is_rec {
-            return Err(format!(
-                "asm native: clause {level} is IDB \
-                 (per-iteration JitColIndex rebuild would be slower than linked-list path)"
-            ));
-        }
-        let is_contiguous = !is_rec;
+        // On the native path, all relations use contiguous JitColIndex (rebuilt from
+        // scratch on each advance for IDB). On the old path, IDB uses linked-list.
+        let is_contiguous = if p.use_jit_native { true } else { !is_rec };
 
         // Save the ENCLOSING level's r15 and rbx before we clobber them with
         // the new probe.  The enclosing level is `level-1`.
@@ -2175,6 +2281,72 @@ fn emit_clause_level(
         // pair instead of O(|B|×hash_probe)).
         if let Some(mp) = detect_merge_pattern(p, level) {
             emit_merge_scan_exist(asm, p, level, outer_exit, when_exhausted, &mp)?;
+            return Ok(());
+        }
+
+        // ── IDB native path: RelIndex probe ──────────────────────────────────
+        // IDB inner clauses on the native path use RelIndex (incrementally maintained
+        // hash map) instead of JitColIndex. The probe sets up r15 = vals_ptr and
+        // rbx = end_ptr, then falls through to the contiguous col-value scan loop.
+        if p.use_jit_native && is_rec && arity == 2 && !clause.bound_cols.is_empty() {
+            // emit_rel_index_probe loads the key, probes RelIndex, and sets up r15/rbx.
+            emit_rel_index_probe(asm, p, level, clause, when_exhausted)?;
+
+            // r15 = vals_ptr, rbx = end_ptr (same interface as contiguous col-value scan).
+            // Emit the scan loop inline — identical to the contiguous is_col_value path.
+            let inner_hdr = asm.new_dynamic_label();
+            let inner_continue = asm.new_dynamic_label();
+
+            // SIMD prefix for filterable conditions on the free column.
+            {
+                let free_col = 1 - clause.bound_cols[0];
+                if let Some(ref sf) = detect_simd_filter(clause, free_col, p.var_locs) {
+                    emit_col_value_simd_prefix(asm, p, level, outer_exit, inner_hdr, sf)?;
+                }
+            }
+
+            dynasm!(asm; =>inner_hdr);
+            dynasm!(asm; cmp r15, rbx; jge =>when_exhausted);
+
+            // Load next element into ecx and advance position.
+            dynasm!(asm
+                ; mov ecx, [r15]                    // c = *elem_ptr
+                ; add r15, 4                        // elem_ptr++
+            );
+
+            let primary_col = clause.bound_cols[0];
+            let free_col = 1 - primary_col;
+            emit_bind_col_value(asm, clause, free_col, inner_continue, p.var_locs)?;
+
+            for cond in &clause.conditions {
+                if let CCondition::If(expr) = cond {
+                    emit_expr(asm, expr, p.var_locs)?;
+                    dynasm!(asm; test eax, eax; jz =>inner_continue);
+                }
+            }
+
+            if level + 1 == p.clauses.len() {
+                for expr in p.rule_conds {
+                    emit_expr(asm, expr, p.var_locs)?;
+                    dynasm!(asm; test eax, eax; jz =>inner_continue);
+                }
+                emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, inner_continue)?;
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
+            } else {
+                let sub_exhausted = asm.new_dynamic_label();
+                emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
+
+                dynasm!(asm; =>sub_exhausted);
+                let node_slot = level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+                let dptr_slot = level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+                dynasm!(asm
+                    ; mov r15, [rbp + node_slot]
+                    ; mov rbx, [rbp + dptr_slot]
+                );
+            }
+
+            dynasm!(asm; =>inner_continue);
+            dynasm!(asm; jmp =>inner_hdr);
             return Ok(());
         }
 
