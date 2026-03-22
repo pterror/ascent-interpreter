@@ -29,11 +29,11 @@ fn rerun_idempotent() {
     "#;
     let program = parse(src);
     let mut engine = Engine::new(program);
-    engine.run();
+    engine.run().unwrap();
     let first = collect_rel(&mut engine, "path");
 
     // Run again on same engine — should produce identical results.
-    engine.run();
+    engine.run().unwrap();
     let second = collect_rel(&mut engine, "path");
     assert_eq!(first, second);
 }
@@ -48,13 +48,13 @@ fn additive_facts() {
     "#;
     let program = parse(src);
     let mut engine = Engine::new(program);
-    engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-    engine.run();
+    engine.insert("edge", vec![Value::I32(1), Value::I32(2)]).unwrap();
+    engine.run().unwrap();
     assert_eq!(collect_rel(&mut engine, "path").len(), 1); // (1,2)
 
     // Add a new fact and re-run.
-    engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
-    engine.run();
+    engine.insert("edge", vec![Value::I32(2), Value::I32(3)]).unwrap();
+    engine.run().unwrap();
     assert_eq!(collect_rel(&mut engine, "path").len(), 3); // (1,2), (2,3), (1,3)
 }
 
@@ -70,7 +70,7 @@ fn additive_rules() {
     "#;
     let prog1 = parse(src1);
     let mut engine = Engine::new(prog1);
-    engine.run();
+    engine.run().unwrap();
     assert_eq!(collect_rel(&mut engine, "path").len(), 2); // (1,2), (2,3)
 
     // Add transitive rule.
@@ -84,7 +84,7 @@ fn additive_rules() {
     "#;
     let prog2 = parse(src2);
     engine.update_program(prog2);
-    engine.run();
+    engine.run().unwrap();
     assert_eq!(collect_rel(&mut engine, "path").len(), 3); // (1,2), (2,3), (1,3)
 }
 
@@ -97,7 +97,7 @@ fn clean_deltas_after_run() {
     "#;
     let program = parse(src);
     let mut engine = Engine::new(program);
-    engine.run();
+    engine.run().unwrap();
 
     // After run, recent should be empty (no pending delta/recent data).
     let rel = engine.relation("node").unwrap();
@@ -116,7 +116,7 @@ fn update_program_adds_new_relation() {
     "#;
     let prog1 = parse(src1);
     let mut engine = Engine::new(prog1);
-    engine.run();
+    engine.run().unwrap();
 
     // Expand program with a new relation.
     let src2 = r#"
@@ -127,7 +127,7 @@ fn update_program_adds_new_relation() {
     "#;
     let prog2 = parse(src2);
     engine.update_program(prog2);
-    engine.run();
+    engine.run().unwrap();
 
     assert_eq!(collect_rel(&mut engine, "a"), vec![vec![Value::I32(1)]]);
     assert_eq!(collect_rel(&mut engine, "b"), vec![vec![Value::I32(2)]]);
@@ -178,7 +178,7 @@ fn source_retract_and_rederive() {
     // file_a contributes edge(1,2), file_b contributes edge(2,3)
     engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s1);
     engine.insert_with_source("edge", vec![Value::I32(2), Value::I32(3)], s2);
-    engine.run();
+    engine.run().unwrap();
 
     assert_eq!(collect_rel(&mut engine, "path").len(), 3); // (1,2), (2,3), (1,3)
 
@@ -194,7 +194,7 @@ fn source_retract_and_rederive() {
         .relation_mut("path")
         .unwrap()
         .retract_source(SourceId::ANONYMOUS);
-    engine.run();
+    engine.run().unwrap();
     assert_eq!(collect_rel(&mut engine, "path").len(), 1); // only (2,3)
 }
 
@@ -227,7 +227,7 @@ fn source_from_empty_body_rules() {
 
     let s = engine.intern_source("file_x");
     engine.set_source(s);
-    engine.run();
+    engine.run().unwrap();
 
     assert_eq!(engine.relation("node").unwrap().len(), 2);
 
@@ -251,7 +251,7 @@ fn source_derived_facts_stay_anonymous() {
     let s = engine.intern_source("my_file");
     engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s);
     engine.set_source(s);
-    engine.run();
+    engine.run().unwrap();
 
     // edge(1,2) is tagged with s, path(1,2) is derived (anonymous)
     assert_eq!(engine.relation("path").unwrap().len(), 1);
@@ -324,9 +324,9 @@ fn source_untagged_facts_survive_retraction() {
     let s = engine.intern_source("tagged");
 
     // Mix tagged and untagged inserts
-    engine.insert("node", vec![Value::I32(1)]); // anonymous
+    engine.insert("node", vec![Value::I32(1)]).unwrap(); // anonymous
     engine.insert_with_source("node", vec![Value::I32(2)], s); // tagged
-    engine.insert("node", vec![Value::I32(3)]); // anonymous
+    engine.insert("node", vec![Value::I32(3)]).unwrap(); // anonymous
 
     assert_eq!(engine.relation("node").unwrap().len(), 3);
 

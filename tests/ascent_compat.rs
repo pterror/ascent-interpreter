@@ -14,7 +14,7 @@ fn run(input: &str) -> Engine {
     let ast: AscentProgram = syn::parse_str(input).unwrap();
     let program = Program::from_ast(ast).expect("lowering should succeed");
     let mut engine = Engine::new(program);
-    engine.run();
+    engine.run().unwrap();
     engine
 }
 
@@ -24,10 +24,10 @@ fn run_with_facts(input: &str, facts: Vec<(&str, Vec<Vec<Value>>)>) -> Engine {
     let mut engine = Engine::new(program);
     for (rel, tuples) in facts {
         for tuple in tuples {
-            engine.insert(rel, tuple);
+            engine.insert(rel, tuple).unwrap();
         }
     }
-    engine.run();
+    engine.run().unwrap();
     engine
 }
 

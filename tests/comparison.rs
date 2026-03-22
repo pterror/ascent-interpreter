@@ -15,7 +15,7 @@ fn run(input: &str) -> Engine {
     let ast: AscentAst = syn::parse_str(input).unwrap();
     let program = Program::from_ast(ast).expect("lowering should succeed");
     let mut engine = Engine::new(program);
-    engine.run();
+    engine.run().unwrap();
     engine
 }
 
@@ -737,7 +737,7 @@ fn run_jit(input: &str) -> Engine {
     let program = Program::from_ast(ast).expect("lowering should succeed");
     let mut engine = Engine::new(program);
     engine.enable_jit().expect("JIT init should succeed");
-    engine.run();
+    engine.run().unwrap();
     engine.materialize();
     engine
 }

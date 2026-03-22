@@ -9,6 +9,9 @@ use crate::eval::{Bindings, TypeRegistry, VarInterner};
 use crate::value::Value;
 
 /// Evaluate a syn expression with the given variable bindings.
+///
+/// Returns `None` on evaluation failure (undefined variable, type mismatch, etc.).
+/// Future direction: migrate to `Result<Value, EvalError>` for richer diagnostics.
 pub fn eval_expr(expr: &Expr, bindings: &Bindings, interner: &VarInterner) -> Option<Value> {
     eval_expr_inner(expr, bindings, None, interner)
 }

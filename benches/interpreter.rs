@@ -17,7 +17,7 @@ fn run_interpreter(input: &str) -> Engine {
     let ast: AscentProgram = syn::parse_str(input).unwrap();
     let program = Program::from_ast(ast).expect("lowering should succeed");
     let mut engine = Engine::new(program);
-    engine.run();
+    engine.run().unwrap();
     engine
 }
 
@@ -64,9 +64,9 @@ fn bench_transitive_closure(c: &mut Criterion) {
             b.iter(|| {
                 let mut engine = Engine::new(program.clone());
                 for i in 1..n {
-                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
                 }
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -83,9 +83,9 @@ fn bench_transitive_closure(c: &mut Criterion) {
                 let mut engine = Engine::new(program.clone());
                 engine.enable_jit().expect("JIT init should succeed");
                 for i in 1..n {
-                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
                 }
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -99,18 +99,18 @@ fn bench_transitive_closure(c: &mut Criterion) {
             let mut warmup = Engine::new(program.clone());
             warmup.enable_jit().expect("JIT init should succeed");
             for i in 1..n {
-                warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
             }
-            warmup.run();
+            warmup.run().unwrap();
             let compiled = warmup.share_jit_compiler().unwrap();
             // Hot iterations: reuse compiled JIT
             b.iter(|| {
                 let mut engine = Engine::new(program.clone());
                 engine.set_jit_compiler(compiled.clone());
                 for i in 1..n {
-                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
                 }
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -172,10 +172,10 @@ fn bench_triangle(c: &mut Criterion) {
                 let mut engine = Engine::new(program.clone());
                 for i in 1..=n {
                     for j in (i + 1)..=n {
-                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]).unwrap();
                     }
                 }
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -190,10 +190,10 @@ fn bench_triangle(c: &mut Criterion) {
                 engine.enable_jit().expect("JIT init should succeed");
                 for i in 1..=n {
                     for j in (i + 1)..=n {
-                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]).unwrap();
                     }
                 }
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -208,10 +208,10 @@ fn bench_triangle(c: &mut Criterion) {
             warmup.enable_jit().expect("JIT init should succeed");
             for i in 1..=n {
                 for j in (i + 1)..=n {
-                    warmup.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                    warmup.insert("edge", vec![Value::I32(i), Value::I32(j)]).unwrap();
                 }
             }
-            warmup.run();
+            warmup.run().unwrap();
             let compiled = warmup.share_jit_compiler().unwrap();
             // Hot iterations: reuse compiled JIT
             b.iter(|| {
@@ -219,10 +219,10 @@ fn bench_triangle(c: &mut Criterion) {
                 engine.set_jit_compiler(compiled.clone());
                 for i in 1..=n {
                     for j in (i + 1)..=n {
-                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]).unwrap();
                     }
                 }
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -236,17 +236,17 @@ fn bench_triangle(c: &mut Criterion) {
             warmup.enable_jit().expect("JIT init should succeed");
             for i in 1..=n {
                 for j in (i + 1)..=n {
-                    warmup.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                    warmup.insert("edge", vec![Value::I32(i), Value::I32(j)]).unwrap();
                 }
             }
-            warmup.run();
+            warmup.run().unwrap();
             let compiled = warmup.share_jit_compiler().unwrap();
             b.iter(|| {
                 let mut engine = Engine::new(program.clone());
                 engine.set_jit_compiler(compiled.clone());
                 for i in 1..=n {
                     for j in (i + 1)..=n {
-                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]);
+                        engine.insert("edge", vec![Value::I32(i), Value::I32(j)]).unwrap();
                     }
                 }
                 engine
@@ -320,12 +320,12 @@ fn bench_connected_components(c: &mut Criterion) {
                 let half = n / 2;
                 let mut engine = Engine::new(program.clone());
                 for i in 1..half {
-                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
                 }
                 for i in (half + 1)..n {
-                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
                 }
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -340,12 +340,12 @@ fn bench_connected_components(c: &mut Criterion) {
                 let mut engine = Engine::new(program.clone());
                 engine.enable_jit().expect("JIT init should succeed");
                 for i in 1..half {
-                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
                 }
                 for i in (half + 1)..n {
-                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
                 }
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -360,12 +360,12 @@ fn bench_connected_components(c: &mut Criterion) {
             warmup.enable_jit().expect("JIT init should succeed");
             let half = n / 2;
             for i in 1..half {
-                warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
             }
             for i in (half + 1)..n {
-                warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                warmup.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
             }
-            warmup.run();
+            warmup.run().unwrap();
             let compiled = warmup.share_jit_compiler().unwrap();
             // Hot iterations: reuse compiled JIT
             b.iter(|| {
@@ -373,12 +373,12 @@ fn bench_connected_components(c: &mut Criterion) {
                 let mut engine = Engine::new(program.clone());
                 engine.set_jit_compiler(compiled.clone());
                 for i in 1..half {
-                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
                 }
                 for i in (half + 1)..n {
-                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                    engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
                 }
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -438,7 +438,7 @@ fn bench_fibonacci(c: &mut Criterion) {
             let program = prepare_program(&source);
             b.iter(|| {
                 let mut engine = Engine::new(program.clone());
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -456,7 +456,7 @@ fn bench_fibonacci(c: &mut Criterion) {
             b.iter(|| {
                 let mut engine = Engine::new(program.clone());
                 engine.enable_jit().expect("JIT init should succeed");
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -474,13 +474,13 @@ fn bench_fibonacci(c: &mut Criterion) {
             // Warmup: compile JIT once (no facts to insert — seeds are in program text)
             let mut warmup = Engine::new(program.clone());
             warmup.enable_jit().expect("JIT init should succeed");
-            warmup.run();
+            warmup.run().unwrap();
             let compiled = warmup.share_jit_compiler().unwrap();
             // Hot iterations: reuse compiled JIT
             b.iter(|| {
                 let mut engine = Engine::new(program.clone());
                 engine.set_jit_compiler(compiled.clone());
-                engine.run();
+                engine.run().unwrap();
                 engine
             });
         });
@@ -533,7 +533,7 @@ fn bench_engine_overhead(c: &mut Criterion) {
     group.bench_function("fib20_new_with_jit", |b| {
         let mut warmup = Engine::new(fib20_program.clone());
         warmup.enable_jit().expect("JIT init should succeed");
-        warmup.run();
+        warmup.run().unwrap();
         let compiled = warmup.share_jit_compiler().unwrap();
         b.iter(|| {
             let mut engine = Engine::new(fib20_program.clone());
@@ -547,8 +547,8 @@ fn bench_engine_overhead(c: &mut Criterion) {
         use ascent_eval::value::Value;
         b.iter(|| {
             let mut engine = Engine::new(fib20_program.clone());
-            engine.insert("fib", vec![Value::I32(0), Value::I32(0)]);
-            engine.insert("fib", vec![Value::I32(1), Value::I32(1)]);
+            engine.insert("fib", vec![Value::I32(0), Value::I32(0)]).unwrap();
+            engine.insert("fib", vec![Value::I32(1), Value::I32(1)]).unwrap();
             engine
         })
     });
@@ -575,10 +575,10 @@ fn bench_triangle_large(c: &mut Criterion) {
             warmup.enable_jit().expect("JIT init should succeed");
             for i in 1..=n {
                 for j in (i + 1)..=n {
-                    warmup.insert("edge", vec![Value::I32(i as i32), Value::I32(j as i32)]);
+                    warmup.insert("edge", vec![Value::I32(i as i32), Value::I32(j as i32)]).unwrap();
                 }
             }
-            warmup.run();
+            warmup.run().unwrap();
             let compiled = warmup.share_jit_compiler().unwrap();
 
             group.bench_with_input(BenchmarkId::new("jit_hot", n), &n, |b, &n| {
@@ -587,10 +587,10 @@ fn bench_triangle_large(c: &mut Criterion) {
                     engine.set_jit_compiler(compiled.clone());
                     for i in 1..=n {
                         for j in (i + 1)..=n {
-                            engine.insert("edge", vec![Value::I32(i as i32), Value::I32(j as i32)]);
+                            engine.insert("edge", vec![Value::I32(i as i32), Value::I32(j as i32)]).unwrap();
                         }
                     }
-                    engine.run();
+                    engine.run().unwrap();
                     engine
                 });
             });
@@ -601,7 +601,7 @@ fn bench_triangle_large(c: &mut Criterion) {
                     engine.set_jit_compiler(compiled.clone());
                     for i in 1..=n {
                         for j in (i + 1)..=n {
-                            engine.insert("edge", vec![Value::I32(i as i32), Value::I32(j as i32)]);
+                            engine.insert("edge", vec![Value::I32(i as i32), Value::I32(j as i32)]).unwrap();
                         }
                     }
                     engine

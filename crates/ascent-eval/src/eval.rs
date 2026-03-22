@@ -395,11 +395,15 @@ impl Engine {
 
     /// Enable JIT compilation for eligible rules.
     #[cfg(feature = "jit")]
-    pub fn enable_jit(&mut self) -> Result<(), String> {
+    pub fn enable_jit(&mut self) -> Result<(), crate::error::EvalError> {
         if self.jit.is_none() {
             match crate::jit::JitCompiler::new() {
                 Ok(compiler) => self.jit = Some(Arc::new(Mutex::new(compiler))),
-                Err(e) => return Err(format!("JIT init failed: {e}")),
+                Err(e) => {
+                    return Err(crate::error::EvalError::Jit(format!(
+                        "JIT init failed: {e}"
+                    )))
+                }
             }
         }
         Ok(())
@@ -519,22 +523,26 @@ impl Engine {
     }
 
     /// Insert a tuple into a relation (untagged / [`SourceId::ANONYMOUS`]).
-    pub fn insert(&mut self, relation: &str, tuple: Tuple) -> bool {
+    pub fn insert(
+        &mut self,
+        relation: &str,
+        tuple: Tuple,
+    ) -> Result<bool, crate::error::EvalError> {
         if let Some(rel) = self.relations.get_mut(relation) {
             if let Some(col) = self.column_types.get(relation)
                 && col.len() != tuple.len()
             {
-                eprintln!(
-                    "warning: tuple arity mismatch for relation '{relation}': expected {}, got {}",
-                    col.len(),
-                    tuple.len()
-                );
-                return false;
+                return Err(crate::error::EvalError::ArityMismatch {
+                    relation: relation.to_string(),
+                    expected: col.len(),
+                    got: tuple.len(),
+                });
             }
-            rel.insert(tuple)
+            Ok(rel.insert(tuple))
         } else {
-            eprintln!("warning: insert into unknown relation '{relation}'");
-            false
+            Err(crate::error::EvalError::UnknownRelation(
+                relation.to_string(),
+            ))
         }
     }
 
@@ -602,7 +610,7 @@ impl Engine {
     ///
     /// Rules are grouped into strongly connected components and processed in
     /// topological order. Each SCC runs to fixpoint before dependent SCCs begin.
-    pub fn run(&mut self) {
+    pub fn run(&mut self) -> Result<(), crate::error::EvalError> {
         self.materialized = false;
         self.ensure_stratification();
         let strat = self
@@ -618,13 +626,14 @@ impl Engine {
 
         for (scc_idx, scc_indices) in sccs.iter().enumerate() {
             let rules: Vec<&CRule> = scc_indices.iter().map(|&i| &compiled[i]).collect();
-            self.run_stratum(&rules, scc_idx, scc_indices);
+            self.run_stratum(&rules, scc_idx, scc_indices)?;
         }
 
         // Clear recent/delta so stale data doesn't confuse the next run.
         for rel in self.relations.values_mut() {
             rel.clear_recent();
         }
+        Ok(())
     }
 
     /// Run only the strata affected by changes to the given "dirty" relations.
@@ -644,9 +653,9 @@ impl Engine {
         &mut self,
         dirty: &[&str],
         retracted: &[&str],
-    ) -> FxHashSet<String> {
+    ) -> Result<FxHashSet<String>, crate::error::EvalError> {
         if dirty.is_empty() {
-            return FxHashSet::default();
+            return Ok(FxHashSet::default());
         }
 
         let dirty: FxHashSet<String> = dirty.iter().map(|s| s.to_string()).collect();
@@ -721,7 +730,7 @@ impl Engine {
             let rules: Vec<&CRule> = scc_indices.iter().map(|&i| &compiled[i]).collect();
 
             if needs_full_eval[scc_idx] {
-                self.run_stratum(&rules, scc_idx, scc_indices);
+                self.run_stratum(&rules, scc_idx, scc_indices)?;
             } else {
                 // Snapshot counts of owned relations before incremental eval
                 let pre_counts: Vec<(String, usize)> = scc_writes[scc_idx]
@@ -750,7 +759,7 @@ impl Engine {
             rel.clear_recent();
         }
 
-        all_rederived
+        Ok(all_rederived)
     }
 
     /// Ensure the stratification cache is populated.
@@ -791,15 +800,20 @@ impl Engine {
 
     /// Run a set of rules to fixpoint.
     #[allow(unused_variables)]
-    fn run_stratum(&mut self, rules: &[&CRule], scc_key: usize, rule_indices: &[usize]) {
+    fn run_stratum(
+        &mut self,
+        rules: &[&CRule],
+        scc_key: usize,
+        rule_indices: &[usize],
+    ) -> Result<(), crate::error::EvalError> {
         if rules.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Fast path: Stage 4 stratum (inlined rule bodies, no call_indirect)
         #[cfg(all(feature = "jit", feature = "specialized"))]
         if self.try_run_stratum_stage4(rules, scc_key, rule_indices) {
-            return;
+            return Ok(());
         }
 
         // Interpreter fallback: sync interpreter state for all packed relations.
@@ -833,12 +847,9 @@ impl Engine {
         while changed {
             iterations += 1;
             if iterations > self.max_iterations {
-                eprintln!(
-                    "Warning: fixpoint iteration limit reached ({} iterations). \
-                     Stopping evaluation — results may be incomplete.",
-                    self.max_iterations
-                );
-                break;
+                return Err(crate::error::EvalError::IterationLimitExceeded {
+                    limit: self.max_iterations,
+                });
             }
             changed = false;
 
@@ -852,6 +863,7 @@ impl Engine {
                 }
             }
         }
+        Ok(())
     }
 
     /// Try to run the stratum via the Stage 4 compiled function (inlined rule bodies).
@@ -3042,7 +3054,7 @@ mod tests {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
-        engine.run();
+        engine.run().unwrap();
         engine
     }
 
@@ -3053,11 +3065,11 @@ mod tests {
 
         for (rel, tuples) in facts {
             for tuple in tuples {
-                engine.insert(rel, tuple);
+                engine.insert(rel, tuple).unwrap();
             }
         }
 
-        engine.run();
+        engine.run().unwrap();
         engine
     }
 
@@ -3740,12 +3752,12 @@ mod tests {
         engine.insert(
             "point",
             vec![Value::I32(1), Value::custom(Point { x: 10, y: 20 })],
-        );
+        ).unwrap();
         engine.insert(
             "point",
             vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })],
-        );
-        engine.run();
+        ).unwrap();
+        engine.run().unwrap();
 
         let hp = engine.relation("has_point").unwrap();
         assert!(hp.contains(&[Value::I32(1)]));
@@ -3769,9 +3781,9 @@ mod tests {
         let mut engine = Engine::new(program);
 
         let p = Value::custom(Point { x: 1, y: 2 });
-        engine.insert("r", vec![Value::I32(1), p.clone()]);
-        engine.insert("s", vec![p, Value::I32(99)]);
-        engine.run();
+        engine.insert("r", vec![Value::I32(1), p.clone()]).unwrap();
+        engine.insert("s", vec![p, Value::I32(99)]).unwrap();
+        engine.run().unwrap();
 
         let joined = engine.relation("joined").unwrap();
         assert!(joined.contains(&[Value::I32(1), Value::I32(99)]));
@@ -3804,7 +3816,7 @@ mod tests {
             },
         );
 
-        engine.run();
+        engine.run().unwrap();
 
         let data = engine.relation("data").unwrap();
         assert_eq!(data.len(), 2);
@@ -3855,12 +3867,12 @@ mod tests {
         engine.insert(
             "data",
             vec![Value::I32(1), Value::custom(Point { x: 10, y: 20 })],
-        );
+        ).unwrap();
         engine.insert(
             "data",
             vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })],
-        );
-        engine.run();
+        ).unwrap();
+        engine.run().unwrap();
 
         let coords = engine.relation("coords").unwrap();
         assert_eq!(coords.len(), 2);
@@ -3886,8 +3898,8 @@ mod tests {
         engine.insert(
             "data",
             vec![Value::I32(1), Value::custom(Point { x: 5, y: 15 })],
-        );
-        engine.run();
+        ).unwrap();
+        engine.run().unwrap();
 
         let coords = engine.relation("coords").unwrap();
         assert_eq!(coords.len(), 1);
@@ -3912,8 +3924,8 @@ mod tests {
         engine.insert(
             "data",
             vec![Value::I32(1), Value::custom(Point { x: 7, y: 99 })],
-        );
-        engine.run();
+        ).unwrap();
+        engine.run().unwrap();
 
         let x_only = engine.relation("x_only").unwrap();
         assert_eq!(x_only.len(), 1);
@@ -3936,8 +3948,8 @@ mod tests {
         register_point(&mut engine);
 
         // Insert a plain i32 instead of a Point — should not match
-        engine.insert("data", vec![Value::I32(1), Value::I32(42)]);
-        engine.run();
+        engine.insert("data", vec![Value::I32(1), Value::I32(42)]).unwrap();
+        engine.run().unwrap();
 
         let coords = engine.relation("coords").unwrap();
         assert_eq!(coords.len(), 0);
@@ -3961,7 +3973,7 @@ mod tests {
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
         register_point(&mut engine);
-        engine.run();
+        engine.run().unwrap();
 
         let unwrapped = engine.relation("unwrapped").unwrap();
         assert_eq!(unwrapped.len(), 2);
@@ -4006,7 +4018,7 @@ mod tests {
             let program = Program::from_ast(ast).expect("lowering should succeed");
             let mut engine = Engine::new(program);
             engine.register_serde_type::<Point>("Point");
-            engine.run();
+            engine.run().unwrap();
 
             let unwrapped = engine.relation("unwrapped").unwrap();
             assert_eq!(unwrapped.len(), 2);
@@ -4028,11 +4040,11 @@ mod tests {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
-        engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-        engine.run();
+        engine.insert("edge", vec![Value::I32(1), Value::I32(2)]).unwrap();
+        engine.run().unwrap();
 
         let rederived =
-            engine.run_incremental(&[], &[]);
+            engine.run_incremental(&[], &[]).unwrap();
         assert!(rederived.is_empty());
         // path should still have its data
         assert_eq!(engine.relation("path").unwrap().len(), 1);
@@ -4053,7 +4065,7 @@ mod tests {
         let src = engine.intern_source("initial");
         engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], src);
         engine.insert_with_source("edge", vec![Value::I32(2), Value::I32(3)], src);
-        engine.run();
+        engine.run().unwrap();
         assert_eq!(engine.relation("path").unwrap().len(), 3); // (1,2), (2,3), (1,3)
 
         // Retract and add different edges
@@ -4061,7 +4073,7 @@ mod tests {
         let src2 = engine.intern_source("updated");
         engine.insert_with_source("edge", vec![Value::I32(10), Value::I32(20)], src2);
 
-        let rederived = engine.run_incremental(&["edge"], &["edge"]);
+        let rederived = engine.run_incremental(&["edge"], &["edge"]).unwrap();
 
         assert!(rederived.contains("path"));
         let path = engine.relation("path").unwrap();
@@ -4084,8 +4096,8 @@ mod tests {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
-        engine.insert("a", vec![Value::I32(1)]);
-        engine.run();
+        engine.insert("a", vec![Value::I32(1)]).unwrap();
+        engine.run().unwrap();
 
         assert_eq!(engine.relation("b").unwrap().len(), 1);
         assert_eq!(engine.relation("c").unwrap().len(), 1);
@@ -4093,10 +4105,10 @@ mod tests {
 
         // Change a's contents
         engine.relation_mut("a").unwrap().clear();
-        engine.insert("a", vec![Value::I32(2)]);
-        engine.insert("a", vec![Value::I32(3)]);
+        engine.insert("a", vec![Value::I32(2)]).unwrap();
+        engine.insert("a", vec![Value::I32(3)]).unwrap();
 
-        let rederived = engine.run_incremental(&["a"], &["a"]);
+        let rederived = engine.run_incremental(&["a"], &["a"]).unwrap();
 
         assert!(rederived.contains("b"));
         assert!(rederived.contains("c"));
@@ -4125,10 +4137,10 @@ mod tests {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
-        engine.insert("src", vec![Value::I32(1)]);
-        engine.run();
+        engine.insert("src", vec![Value::I32(1)]).unwrap();
+        engine.run().unwrap();
 
-        let rederived = engine.run_incremental(&["src"], &[]);
+        let rederived = engine.run_incremental(&["src"], &[]).unwrap();
         assert_eq!(rederived, FxHashSet::from_iter(["derived".to_string()]));
     }
 
@@ -4147,14 +4159,14 @@ mod tests {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
-        engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-        engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
-        engine.run();
+        engine.insert("edge", vec![Value::I32(1), Value::I32(2)]).unwrap();
+        engine.insert("edge", vec![Value::I32(2), Value::I32(3)]).unwrap();
+        engine.run().unwrap();
         assert_eq!(engine.relation("path").unwrap().len(), 3); // (1,2), (2,3), (1,3)
 
         // Add a new edge — old paths should be preserved, new ones derived
-        engine.insert("edge", vec![Value::I32(3), Value::I32(4)]);
-        engine.run_incremental(&["edge"], &[]);
+        engine.insert("edge", vec![Value::I32(3), Value::I32(4)]).unwrap();
+        engine.run_incremental(&["edge"], &[]).unwrap();
 
         let path = engine.relation("path").unwrap();
         // Old: (1,2), (2,3), (1,3)
@@ -4180,15 +4192,15 @@ mod tests {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
-        engine.insert("node", vec![Value::I32(1)]);
-        engine.insert("node", vec![Value::I32(2)]);
-        engine.insert("node", vec![Value::I32(3)]);
-        engine.run();
+        engine.insert("node", vec![Value::I32(1)]).unwrap();
+        engine.insert("node", vec![Value::I32(2)]).unwrap();
+        engine.insert("node", vec![Value::I32(3)]).unwrap();
+        engine.run().unwrap();
         assert_eq!(engine.relation("included").unwrap().len(), 3);
 
         // Add an exclusion — negation SCC must re-derive from scratch
-        engine.insert("excluded", vec![Value::I32(2)]);
-        engine.run_incremental(&["excluded"], &[]);
+        engine.insert("excluded", vec![Value::I32(2)]).unwrap();
+        engine.run_incremental(&["excluded"], &[]).unwrap();
 
         let included = engine.relation("included").unwrap();
         assert_eq!(included.len(), 2);
@@ -4212,18 +4224,18 @@ mod tests {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
-        engine.insert("raw", vec![Value::I32(1)]);
-        engine.insert("raw", vec![Value::I32(2)]);
-        engine.insert("excluded", vec![Value::I32(2)]);
-        engine.run();
+        engine.insert("raw", vec![Value::I32(1)]).unwrap();
+        engine.insert("raw", vec![Value::I32(2)]).unwrap();
+        engine.insert("excluded", vec![Value::I32(2)]).unwrap();
+        engine.run().unwrap();
 
         let filtered = engine.relation("filtered").unwrap();
         assert_eq!(filtered.len(), 1);
         assert!(filtered.contains(&[Value::I32(1)]));
 
         // Add more raw data — derived uses delta, filtered re-derives
-        engine.insert("raw", vec![Value::I32(3)]);
-        engine.run_incremental(&["raw"], &[]);
+        engine.insert("raw", vec![Value::I32(3)]).unwrap();
+        engine.run_incremental(&["raw"], &[]).unwrap();
 
         let derived = engine.relation("derived").unwrap();
         assert_eq!(derived.len(), 3);
@@ -4249,15 +4261,15 @@ mod tests {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
-        engine.insert("node", vec![Value::I32(1)]);
-        engine.insert("node", vec![Value::I32(2)]);
-        engine.insert("node", vec![Value::I32(3)]);
-        engine.run();
+        engine.insert("node", vec![Value::I32(1)]).unwrap();
+        engine.insert("node", vec![Value::I32(2)]).unwrap();
+        engine.insert("node", vec![Value::I32(3)]).unwrap();
+        engine.run().unwrap();
         assert_eq!(engine.relation("doubled").unwrap().len(), 3);
 
         // Exclude node 2 — kept clears (non-monotone), doubled must also re-derive
-        engine.insert("excluded", vec![Value::I32(2)]);
-        engine.run_incremental(&["excluded"], &[]);
+        engine.insert("excluded", vec![Value::I32(2)]).unwrap();
+        engine.run_incremental(&["excluded"], &[]).unwrap();
 
         let kept = engine.relation("kept").unwrap();
         assert_eq!(kept.len(), 2);
@@ -4280,13 +4292,13 @@ mod tests {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
-        engine.insert("src", vec![Value::I32(1)]);
-        engine.run();
+        engine.insert("src", vec![Value::I32(1)]).unwrap();
+        engine.run().unwrap();
         assert_eq!(engine.relation("dst").unwrap().len(), 1);
 
         // Insert same fact again (deduplication means no actual delta)
-        engine.insert("src", vec![Value::I32(1)]);
-        engine.run_incremental(&["src"], &[]);
+        engine.insert("src", vec![Value::I32(1)]).unwrap();
+        engine.run_incremental(&["src"], &[]).unwrap();
 
         // Should still have exactly 1 tuple
         assert_eq!(engine.relation("dst").unwrap().len(), 1);
@@ -4311,7 +4323,7 @@ mod jit_hot_tests {
         // hot run
         let mut engine = Engine::new(program);
         engine.set_jit_compiler(jit);
-        engine.run();
+        engine.run().unwrap();
     }
 
     #[test]
@@ -4343,9 +4355,9 @@ mod jit_hot_tests {
             let mut engine = Engine::new(program.clone());
             engine.set_jit_compiler(jit.clone());
             for i in 1..n {
-                engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]);
+                engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
             }
-            engine.run();
+            engine.run().unwrap();
             let rel = engine.relation("path").unwrap();
             let expected = (n * (n - 1) / 2) as usize;
             assert_eq!(

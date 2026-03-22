@@ -15,10 +15,10 @@ fn jit_run(src: &str, facts: &[(&str, Vec<Vec<Value>>)], rel: &str) -> Vec<Vec<V
     engine.enable_jit().expect("JIT init should succeed");
     for (name, tuples) in facts {
         for t in tuples {
-            engine.insert(name, t.clone());
+            engine.insert(name, t.clone()).unwrap();
         }
     }
-    engine.run();
+    engine.run().unwrap();
     engine.materialize();
     engine
         .relation(rel)

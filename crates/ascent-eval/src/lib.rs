@@ -22,11 +22,11 @@
 //! let mut engine = Engine::new(program);
 //!
 //! // Insert initial facts
-//! engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-//! engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
+//! engine.insert("edge", vec![Value::I32(1), Value::I32(2)]).unwrap();
+//! engine.insert("edge", vec![Value::I32(2), Value::I32(3)]).unwrap();
 //!
 //! // Run to fixpoint
-//! engine.run();
+//! engine.run().unwrap();
 //!
 //! // Query results
 //! let path = engine.relation("path").unwrap();
@@ -36,6 +36,7 @@
 pub mod aggregators;
 mod bytecode;
 mod compiled;
+pub mod error;
 mod eval;
 pub mod expr;
 pub mod intern;
@@ -50,6 +51,7 @@ pub mod serde_bridge;
 mod specialized;
 pub mod value;
 
+pub use error::EvalError;
 pub use eval::{Engine, TypeRegistry, ValueDestructor};
 #[cfg(feature = "jit")]
 pub use eval::SharedJitCompiler;

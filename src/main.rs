@@ -41,17 +41,18 @@ fn run_file(path: &str) {
     match eval_source(&source) {
         Ok(mut engine) => dump_all(&mut engine),
         Err(e) => {
-            eprintln!("parse error: {e}");
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
     }
 }
 
-fn eval_source(source: &str) -> Result<Engine, String> {
-    let ast: AscentProgram = syn::parse_str(source).map_err(|e| e.to_string())?;
-    let program = Program::from_ast(ast)?;
+fn eval_source(source: &str) -> Result<Engine, ascent_eval::EvalError> {
+    let ast: AscentProgram =
+        syn::parse_str(source).map_err(|e| ascent_eval::EvalError::Parse(e.to_string()))?;
+    let program = Program::from_ast(ast).map_err(ascent_eval::EvalError::Lowering)?;
     let mut engine = Engine::new(program);
-    engine.run();
+    engine.run()?;
     Ok(engine)
 }
 
@@ -164,7 +165,9 @@ fn repl() {
                                 Ok(prog) => {
                                     // Destructive: rebuild from scratch
                                     let mut eng = Engine::new(prog);
-                                    eng.run();
+                                    if let Err(e) = eng.run() {
+                                        eprintln!("evaluation error: {e}");
+                                    }
                                     engine = Some(eng);
                                     prev_counts.clear();
                                     eprintln!("(removed: {removed})");
@@ -219,7 +222,9 @@ fn repl() {
                                 match try_parse_program(&source) {
                                     Ok(prog) => {
                                         let mut eng = Engine::new(prog);
-                                        eng.run();
+                                        if let Err(e) = eng.run() {
+                                            eprintln!("evaluation error: {e}");
+                                        }
                                         engine = Some(eng);
                                     }
                                     Err(e) => {
@@ -264,16 +269,20 @@ fn repl() {
 
         match try_parse_program(&candidate) {
             Ok(program) => {
-                match engine.as_mut() {
+                let run_result = match engine.as_mut() {
                     Some(eng) => {
                         eng.update_program(program);
-                        eng.run();
+                        eng.run()
                     }
                     None => {
                         let mut eng = Engine::new(program);
-                        eng.run();
+                        let r = eng.run();
                         engine = Some(eng);
+                        r
                     }
+                };
+                if let Err(e) = run_result {
+                    eprintln!("evaluation error: {e}");
                 }
                 source = candidate;
                 show_changes(
