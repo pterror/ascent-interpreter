@@ -17,7 +17,10 @@ pub fn apply_aggregator<'a>(name: &str, values: impl Iterator<Item = &'a [Value]
         "count" => agg_count(values),
         "mean" => agg_mean(values),
         "not" => agg_not(values),
-        _ => vec![], // Unknown aggregator
+        _ => {
+            eprintln!("warning: unknown aggregator '{name}', producing no results");
+            vec![]
+        }
     }
 }
 

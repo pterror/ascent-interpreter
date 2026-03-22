@@ -306,7 +306,7 @@ pub struct Engine {
     /// Declared column types per relation (primitive type name, or None for complex types).
     col_types: FxHashMap<String, Vec<Option<String>>>,
     /// Registry of custom type constructors.
-    pub type_registry: TypeRegistry,
+    pub(crate) type_registry: TypeRegistry,
     /// Intern table for variable names.
     pub(crate) var_interner: VarInterner,
     /// Number of interned variables (for pre-allocating Bindings).
@@ -507,8 +507,19 @@ impl Engine {
     /// Insert a tuple into a relation (untagged / [`SourceId::ANONYMOUS`]).
     pub fn insert(&mut self, relation: &str, tuple: Tuple) -> bool {
         if let Some(rel) = self.relations.get_mut(relation) {
+            if let Some(col) = self.col_types.get(relation)
+                && col.len() != tuple.len()
+            {
+                eprintln!(
+                    "warning: tuple arity mismatch for relation '{relation}': expected {}, got {}",
+                    col.len(),
+                    tuple.len()
+                );
+                return false;
+            }
             rel.insert(tuple)
         } else {
+            eprintln!("warning: insert into unknown relation '{relation}'");
             false
         }
     }
