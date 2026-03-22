@@ -23,18 +23,23 @@ pub trait InternTable {
     fn cmp_ids(&self, a: u32, b: u32) -> Ordering;
 }
 
-/// Object-safe trait for user-defined types in the interpreter.
-///
-/// Library consumers implement this (typically via the blanket impl) to register
-/// custom Rust types that work with Ascent programs.
+/// Object-safe trait for user-defined value types (custom types registered via `Engine::register_type`).
 pub trait DynValue: Any + Send + Sync {
+    /// Clone into a new `Box<dyn DynValue>`.
     fn clone_box(&self) -> Box<dyn DynValue>;
+    /// Test equality with another `DynValue`.
     fn eq_box(&self, other: &dyn DynValue) -> bool;
+    /// Feed this value into a `Hasher` (object-safe hash).
     fn hash_box(&self, state: &mut dyn Hasher);
+    /// Compare with another `DynValue` for ordering. Returns `None` on type mismatch.
     fn cmp_box(&self, other: &dyn DynValue) -> Option<Ordering>;
+    /// Write `Debug` representation to a formatter.
     fn debug_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+    /// Write `Display` representation to a formatter.
     fn display_fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+    /// Downcast to `Any` for concrete type recovery.
     fn as_any(&self) -> &dyn Any;
+    /// Return the concrete type name of this value.
     fn type_name(&self) -> &'static str;
 }
 
