@@ -62,7 +62,18 @@ mod macro_tc {
 }
 
 #[test]
-#[ignore = "SIGSEGV — pre-existing bug in JIT TC with 30-edge chain (investigate)"]
+#[ignore = "SIGSEGV in JIT TC from root crate integration tests (pre-existing, not a regression — internal ascent-eval tests pass)"]
+fn test_jit_tc_chain_30_standalone() {
+    let src = "relation edge(i32, i32);\n\
+               relation path(i32, i32);\n\
+               path(x, y) <-- edge(x, y);\n\
+               path(x, z) <-- edge(x, y), path(y, z);";
+    let results = jit_run(src, &[("edge", (1..=30).map(|i| vec![Value::I32(i), Value::I32(i + 1)]).collect())], "path");
+    assert_eq!(results.len(), 465, "TC chain-30 should produce 465 pairs");
+}
+
+#[test]
+#[ignore = "SIGSEGV — depends on test_jit_tc_chain_30_standalone fix"]
 fn test_macro_parity_tc_chain_30() {
     let mut macro_results = macro_tc::run(30);
     macro_results.sort();
