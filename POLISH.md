@@ -2,7 +2,7 @@
 
 Created: 98bf464
 Last run: 2026-03-23
-Round: 1
+Round: 3
 Project type: Rust multi-crate workspace (interpreter + JIT compiler for Ascent Datalog)
 
 ## Lenses
@@ -90,3 +90,24 @@ None identified.
 
 ### Conflicts
 None identified.
+
+## Findings — Round 3: 10/10 resolved
+
+### HIGH — 3/3
+
+- [DONE] `aggregators.rs` — `agg_count` returns `I64` instead of truncating to `i32`
+- [DONE] `intern.rs` — `StringTable::resolve` uses `.get()` with descriptive panic
+- [DONE] `README.md` — Code example fixed with `.unwrap()` on Result-returning methods
+
+### MEDIUM — 4/4
+
+- [DONE] `ascent-ir` — `IrLit::Int(i128, Option<String>)` preserves integer suffix
+- [DONE] `intern.rs` — `Box::leak` memory lifecycle documented on `StringTable`
+- [DONE] `expr.rs` — Oversized range returns `None` instead of `Some(vec![])`
+- [DONE] `aggregators.rs` — Unknown aggregator behavior documented
+
+### LOW — 3/3
+
+- [DONE] `value.rs` — `as_i64()` handles `Isize`, `as_f64()` added, `cast_to` handles float-to-int
+- [DONE] `aggregators.rs` — `agg_mean` handles floats, returns `F64` for mixed inputs
+- [DONE] `value.rs` — `cast_to` supports `f32`/`f64` targets
