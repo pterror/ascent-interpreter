@@ -18,6 +18,12 @@ use crate::value::{InternTable, Value};
 /// Uses `Box::leak` for zero-copy `&'static str` resolution, matching the
 /// original `Interner` design. `pack` verifies table identity via pointer
 /// comparison so values from different tables are never confused.
+///
+/// **Memory lifecycle:** Interned strings are intentionally leaked via
+/// `Box::leak` and are never freed. This is acceptable for interpreter/REPL
+/// use where the string set is bounded by program size, but callers should
+/// be aware that repeated interning of dynamic strings will grow memory
+/// monotonically.
 pub struct StringTable {
     to_id: RefCell<FxHashMap<&'static str, u32>>,
     to_val: RefCell<Vec<&'static str>>,
@@ -45,7 +51,12 @@ impl StringTable {
 
     /// Resolve a u32 id back to its `&'static str`. Panics on invalid id.
     pub fn resolve(&self, id: u32) -> &'static str {
-        self.to_val.borrow()[id as usize]
+        self.to_val.borrow().get(id as usize).copied().unwrap_or_else(|| {
+            panic!(
+                "invalid intern id {id}: StringTable contains {} entries",
+                self.to_val.borrow().len()
+            )
+        })
     }
 }
 
@@ -95,6 +106,9 @@ pub fn string_table() -> Rc<StringTable> {
 
 /// Construct a `Value::Interned` for a string, interning it in the
 /// thread-local `StringTable`.
+///
+/// The string is leaked via `Box::leak` and will not be freed for the
+/// lifetime of the thread. See [`StringTable`] for details.
 pub fn string_value(s: &str) -> Value {
     STRING_TABLE.with(|table| {
         let id = table.intern(s);

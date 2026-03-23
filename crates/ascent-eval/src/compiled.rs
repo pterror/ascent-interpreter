@@ -679,14 +679,28 @@ fn compile_expr_inner(expr: &IrExpr, interner: &VarInterner) -> CExpr {
 /// Convert an IR literal to a Value.
 pub(crate) fn ir_lit_to_value(lit: &IrLit) -> Value {
     match lit {
-        IrLit::Int(n) => {
-            // Default to i32 (Rust's default integer type)
-            if let Ok(v) = i32::try_from(*n) {
-                Value::I32(v)
-            } else if let Ok(v) = i64::try_from(*n) {
-                Value::I64(v)
-            } else {
-                Value::I128(*n)
+        IrLit::Int(n, suffix) => match suffix.as_deref() {
+            Some("i8") => Value::I8(*n as i8),
+            Some("i16") => Value::I16(*n as i16),
+            Some("i32") => Value::I32(*n as i32),
+            Some("i64") => Value::I64(*n as i64),
+            Some("i128") => Value::I128(*n),
+            Some("isize") => Value::Isize(*n as isize),
+            Some("u8") => Value::U8(*n as u8),
+            Some("u16") => Value::U16(*n as u16),
+            Some("u32") => Value::U32(*n as u32),
+            Some("u64") => Value::U64(*n as u64),
+            Some("u128") => Value::U128(*n as u128),
+            Some("usize") => Value::Usize(*n as usize),
+            // No suffix or unrecognized: default to i32, widening as needed
+            _ => {
+                if let Ok(v) = i32::try_from(*n) {
+                    Value::I32(v)
+                } else if let Ok(v) = i64::try_from(*n) {
+                    Value::I64(v)
+                } else {
+                    Value::I128(*n)
+                }
             }
         }
         IrLit::Float(f) => Value::F64(crate::value::OrderedFloat(*f)),

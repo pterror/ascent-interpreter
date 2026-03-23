@@ -366,11 +366,7 @@ pub fn expand_range(range: &Value) -> Option<Vec<Value>> {
             let e = end.as_i64()?;
             let size = (e as i128) - (s as i128) + if *inclusive { 1 } else { 0 };
             if size < 0 || size > MAX_RANGE_SIZE as i128 {
-                eprintln!(
-                    "Warning: range {s}..{e} has {size} elements (limit {MAX_RANGE_SIZE}). \
-                     Skipping expansion to prevent OOM."
-                );
-                return Some(Vec::new());
+                return None;
             }
             let values: Vec<Value> = if *inclusive {
                 (s..=e).map(|v| coerce_i64(v, start)).collect()

@@ -74,15 +74,15 @@ let input = r#"
 "#;
 
 let ast: AscentProgram = syn::parse_str(input).unwrap();
-let program = Program::from_ast(ast);
+let program = Program::from_ast(ast).unwrap();
 let mut engine = Engine::new(program);
 
 // Insert initial facts
-engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
+engine.insert("edge", vec![Value::I32(1), Value::I32(2)]).unwrap();
+engine.insert("edge", vec![Value::I32(2), Value::I32(3)]).unwrap();
 
 // Run to fixpoint
-engine.run();
+engine.run().unwrap();
 
 // Query results
 let path = engine.relation("path").unwrap();

@@ -49,7 +49,7 @@ pub enum IrExpr {
 /// IR-native literal value.
 #[derive(Debug, Clone)]
 pub enum IrLit {
-    Int(i128),
+    Int(i128, Option<String>),
     Float(f64),
     Bool(bool),
     Char(char),
@@ -207,7 +207,15 @@ pub fn lower_expr(expr: syn::Expr) -> IrExpr {
 
 fn lower_syn_lit(lit: &syn::Lit) -> Option<IrLit> {
     match lit {
-        syn::Lit::Int(i) => i.base10_parse::<i128>().ok().map(IrLit::Int),
+        syn::Lit::Int(i) => {
+            let suffix = i.suffix();
+            let suffix = if suffix.is_empty() {
+                None
+            } else {
+                Some(suffix.to_string())
+            };
+            i.base10_parse::<i128>().ok().map(|n| IrLit::Int(n, suffix))
+        }
         syn::Lit::Float(f) => f.base10_parse::<f64>().ok().map(IrLit::Float),
         syn::Lit::Bool(b) => Some(IrLit::Bool(b.value)),
         syn::Lit::Str(s) => Some(IrLit::String(s.value())),
