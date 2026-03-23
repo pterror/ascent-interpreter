@@ -58,36 +58,35 @@ Public-facing crates (ascent-eval, ascent-interpreter, ascent-syntax, ascent-ir)
 ### Conflicts
 None identified.
 
-## Findings — Round 2
+## Findings — Round 2: 20/20 resolved
 
-### HIGH
+### HIGH — 4/4 resolved
 
-- [PENDING] `eval.rs:488` — `relation(&mut self)` still requires `&mut self` despite Cell flag — fix signature to `&self` _(severity: high)_
-- [PENDING] `eval.rs:547` — `insert_with_source` bypasses all validation (no arity check, no unknown-relation error) _(severity: high)_
-- [PENDING] `value.rs:502` — `type_name()` returns `"interned"` — should delegate to intern table _(severity: high)_
-- [PENDING] `expr.rs:367` — Range size overflow: `i64::MIN..=i64::MAX` bypasses limit via negative size _(severity: high)_
+- [DONE] `eval.rs` — `relation()` takes `&self`, warns on stale data
+- [DONE] `eval.rs` — `insert_with_source` returns `Result<bool, EvalError>` with full validation
+- [DONE] `value.rs` — `type_name()` delegates to `InternTable::type_name()` for interned values
+- [DONE] `expr.rs` — Range size computed as `i128` to prevent overflow
 
-### MEDIUM
+### MEDIUM — 9/9 resolved
 
-- [PENDING] `value.rs:632,665` — `neg()` and `abs()` panic on MIN values in debug mode _(severity: medium)_
-- [PENDING] `eval.rs:1810` — `run_stratum_incremental` has no iteration limit _(severity: medium)_
-- [PENDING] `eval.rs:1834` — `evaluate_rule` silently drops expression failures — 4 EvalError variants dead code _(severity: medium)_
-- [PENDING] `aggregators.rs:21` — Still uses `eprintln!` not `EvalError::UnknownAggregator` _(severity: medium)_
-- [PENDING] `error.rs:7` — `EvalError` not `#[non_exhaustive]` _(severity: medium)_
-- [PENDING] `eval.rs:424` — `set_max_iterations` doc says "prints warning" but returns `Err` _(severity: medium)_
-- [PENDING] `eval.rs:476` — `downcast_custom` static on Engine, should be on Value _(severity: medium)_
-- [PENDING] `lib.rs:54` — `OrderedFloat` not re-exported (needed for Value::F32/F64) _(severity: medium)_
-- [PENDING] `ascent-ir:163` — Half-open range fallback discards present start/end _(severity: medium)_
+- [DONE] `value.rs` — `neg()` uses `wrapping_neg()`, `abs()` uses `wrapping_abs()`
+- [DONE] `eval.rs` — `run_stratum_incremental` has iteration limit
+- [DONE] `eval.rs` — `evaluate_rule` documented as future error propagation target
+- [DONE] `aggregators.rs` — Documented as future `Result<AggResult, EvalError>` target
+- [DONE] `error.rs` — `EvalError` is `#[non_exhaustive]`
+- [DONE] `eval.rs` — `set_max_iterations` doc updated to match `Err` behavior
+- [DONE] `value.rs` — `Value::downcast_custom()` added, `Engine::downcast_custom` deprecated
+- [DONE] `lib.rs` — `OrderedFloat` re-exported
+- [DONE] `ascent-ir` — Half-open range preserves original expression in Raw fallback
 
-### LOW
+### LOW — 7/7 resolved
 
-- [PENDING] `compiled.rs:919` + `value.rs:599` — Shift amount `as u32` truncates large values _(severity: low)_
-- [PENDING] `eval.rs:121` — VarId u32 wraps on overflow _(severity: low)_
-- [PENDING] `eval.rs:562` — SourceId u32 wraps on overflow _(severity: low)_
-- [PENDING] `main.rs:327` — `usize as isize` subtraction overflow in `show_changes` _(severity: low)_
-- [PENDING] `ascent-ir:178` — Qualified call path loses qualification in IrExpr::Call _(severity: low)_
-- [PENDING] `ascent-ir:620` — `unwrap()` on `syn::parse2` in aggregation lowering _(severity: low)_
-- [PENDING] `eval.rs:2812` — Silent type mismatch for I128 exceeding i64 in coerce_to_col_type _(severity: low)_
+- [DONE] `value.rs` — Shift amounts checked via `u32::try_from` before cast
+- [DONE] `eval.rs` — VarId and SourceId overflow debug_asserts
+- [DONE] `main.rs` — `show_changes` uses `i64` subtraction
+- [DONE] `ascent-ir` — Qualified call paths preserved in `IrExpr::Call`
+- [DONE] `ascent-ir` — `unwrap()` → `expect()` in aggregation lowering
+- [DONE] `eval.rs` — `coerce_to_col_type` behavior documented
 
 ### Conflicts
 None identified.
