@@ -324,7 +324,7 @@ fn show_changes(engine: &mut Engine, prev_counts: &mut HashMap<String, usize>) {
         prev_counts.insert(name.clone(), count);
 
         if count != prev {
-            let delta = count as isize - prev as isize;
+            let delta = count as i64 - prev as i64;
             let sign = if delta > 0 { "+" } else { "" };
             eprintln!(
                 "  {name}: {count} tuple{} ({sign}{delta})",

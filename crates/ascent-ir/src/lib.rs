@@ -178,9 +178,10 @@ pub fn lower_expr(expr: syn::Expr) -> IrExpr {
                 let name = p
                     .path
                     .segments
-                    .last()
+                    .iter()
                     .map(|s| s.ident.to_string())
-                    .unwrap_or_default();
+                    .collect::<Vec<_>>()
+                    .join("::");
                 let args: Vec<IrExpr> = call.args.into_iter().map(lower_expr).collect();
                 IrExpr::Call(name, args)
             } else {
@@ -617,7 +618,8 @@ impl Aggregation {
 
         let aggregator = match agg.aggregator {
             ascent_syntax::AggregatorNode::Path(p) => {
-                let expr: syn::Expr = syn::parse2(quote::quote! { #p }).unwrap();
+                let expr: syn::Expr = syn::parse2(quote::quote! { #p })
+                    .expect("internal: aggregator path must parse as expression");
                 lower_expr(expr)
             }
             ascent_syntax::AggregatorNode::Expr(e) => lower_expr(e),

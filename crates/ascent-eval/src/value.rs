@@ -57,6 +57,12 @@ pub trait InternTable {
     fn resolve_str(&self, _id: u32) -> Option<&str> {
         None
     }
+
+    /// Return the human-readable type name for values in this table
+    /// (e.g. `"String"` for `StringTable`).
+    fn type_name(&self) -> &str {
+        "interned"
+    }
 }
 
 /// Object-safe trait for user-defined value types (custom types registered via `Engine::register_type`).
@@ -432,6 +438,18 @@ impl Value {
         Value::Custom(Box::new(v))
     }
 
+    /// Downcast a `Value::Custom` to a concrete type.
+    ///
+    /// Returns `None` if the value is not a `Custom` variant or if
+    /// the inner type doesn't match `T`.
+    pub fn downcast_custom<T: 'static>(&self) -> Option<&T> {
+        if let Value::Custom(v) = self {
+            v.as_any().downcast_ref::<T>()
+        } else {
+            None
+        }
+    }
+
     /// Create a string value (interns the string in the thread-local string table).
     pub fn string(s: impl AsRef<str>) -> Self {
         crate::intern::string_value(s.as_ref())
@@ -480,7 +498,7 @@ impl Value {
     }
 
     /// Get a display-friendly type name for this value.
-    pub fn type_name(&self) -> &'static str {
+    pub fn type_name(&self) -> &str {
         match self {
             Value::Unit => "()",
             Value::Bool(_) => "bool",
@@ -499,7 +517,7 @@ impl Value {
             Value::F32(_) => "f32",
             Value::F64(_) => "f64",
             Value::Char(_) => "char",
-            Value::Interned(_, _) => "interned",
+            Value::Interned(table, _) => table.type_name(),
             Value::Tuple(_) => "tuple",
             Value::Option(_) => "Option",
             Value::Dual(_) => "Dual",
@@ -596,18 +614,18 @@ macro_rules! impl_checked_shift {
     ($method:ident, $checked_method:ident) => {
         pub fn $method(&self, other: &Value) -> Option<Value> {
             match (self, other) {
-                (Value::I8(a), Value::I8(b)) => a.$checked_method(*b as u32).map(Value::I8),
-                (Value::I16(a), Value::I16(b)) => a.$checked_method(*b as u32).map(Value::I16),
-                (Value::I32(a), Value::I32(b)) => a.$checked_method(*b as u32).map(Value::I32),
-                (Value::I64(a), Value::I64(b)) => a.$checked_method(*b as u32).map(Value::I64),
-                (Value::I128(a), Value::I128(b)) => a.$checked_method(*b as u32).map(Value::I128),
-                (Value::Isize(a), Value::Isize(b)) => a.$checked_method(*b as u32).map(Value::Isize),
-                (Value::U8(a), Value::U8(b)) => a.$checked_method(*b as u32).map(Value::U8),
-                (Value::U16(a), Value::U16(b)) => a.$checked_method(*b as u32).map(Value::U16),
-                (Value::U32(a), Value::U32(b)) => a.$checked_method(*b as u32).map(Value::U32),
-                (Value::U64(a), Value::U64(b)) => a.$checked_method(*b as u32).map(Value::U64),
-                (Value::U128(a), Value::U128(b)) => a.$checked_method(*b as u32).map(Value::U128),
-                (Value::Usize(a), Value::Usize(b)) => a.$checked_method(*b as u32).map(Value::Usize),
+                (Value::I8(a), Value::I8(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::I8),
+                (Value::I16(a), Value::I16(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::I16),
+                (Value::I32(a), Value::I32(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::I32),
+                (Value::I64(a), Value::I64(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::I64),
+                (Value::I128(a), Value::I128(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::I128),
+                (Value::Isize(a), Value::Isize(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::Isize),
+                (Value::U8(a), Value::U8(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::U8),
+                (Value::U16(a), Value::U16(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::U16),
+                (Value::U32(a), Value::U32(b)) => a.$checked_method(*b).map(Value::U32),
+                (Value::U64(a), Value::U64(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::U64),
+                (Value::U128(a), Value::U128(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::U128),
+                (Value::Usize(a), Value::Usize(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::Usize),
                 _ => None,
             }
         }
@@ -629,12 +647,12 @@ impl Value {
 
     pub fn neg(&self) -> Option<Value> {
         match self {
-            Value::I8(v) => Some(Value::I8(-v)),
-            Value::I16(v) => Some(Value::I16(-v)),
-            Value::I32(v) => Some(Value::I32(-v)),
-            Value::I64(v) => Some(Value::I64(-v)),
-            Value::I128(v) => Some(Value::I128(-v)),
-            Value::Isize(v) => Some(Value::Isize(-v)),
+            Value::I8(v) => Some(Value::I8(v.wrapping_neg())),
+            Value::I16(v) => Some(Value::I16(v.wrapping_neg())),
+            Value::I32(v) => Some(Value::I32(v.wrapping_neg())),
+            Value::I64(v) => Some(Value::I64(v.wrapping_neg())),
+            Value::I128(v) => Some(Value::I128(v.wrapping_neg())),
+            Value::Isize(v) => Some(Value::Isize(v.wrapping_neg())),
             Value::F32(OrderedFloat(v)) => Some(Value::F32(OrderedFloat(-v))),
             Value::F64(OrderedFloat(v)) => Some(Value::F64(OrderedFloat(-v))),
             _ => None,
@@ -662,12 +680,12 @@ impl Value {
 
     pub fn abs(&self) -> Option<Value> {
         match self {
-            Value::I8(v) => Some(Value::I8(v.abs())),
-            Value::I16(v) => Some(Value::I16(v.abs())),
-            Value::I32(v) => Some(Value::I32(v.abs())),
-            Value::I64(v) => Some(Value::I64(v.abs())),
-            Value::I128(v) => Some(Value::I128(v.abs())),
-            Value::Isize(v) => Some(Value::Isize(v.abs())),
+            Value::I8(v) => Some(Value::I8(v.wrapping_abs())),
+            Value::I16(v) => Some(Value::I16(v.wrapping_abs())),
+            Value::I32(v) => Some(Value::I32(v.wrapping_abs())),
+            Value::I64(v) => Some(Value::I64(v.wrapping_abs())),
+            Value::I128(v) => Some(Value::I128(v.wrapping_abs())),
+            Value::Isize(v) => Some(Value::Isize(v.wrapping_abs())),
             Value::F32(OrderedFloat(v)) => Some(Value::F32(OrderedFloat(v.abs()))),
             Value::F64(OrderedFloat(v)) => Some(Value::F64(OrderedFloat(v.abs()))),
             _ => None,

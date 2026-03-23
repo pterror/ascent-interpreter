@@ -118,6 +118,7 @@ impl VarInterner {
         }
         drop(ids);
         let id = self.next_id.get();
+        debug_assert!(id < u32::MAX, "VarId overflow");
         self.next_id.set(id + 1);
         self.ids.borrow_mut().insert(name.to_string(), id);
         id
@@ -422,8 +423,8 @@ impl Engine {
 
     /// Set the maximum number of fixpoint iterations before evaluation stops.
     ///
-    /// Default is 10,000. Programs that exceed this limit will print a warning
-    /// to stderr and return partial results.
+    /// Default is 10,000. Programs that exceed this limit will return
+    /// `Err(EvalError::IterationLimitExceeded)`.
     pub fn set_max_iterations(&mut self, limit: usize) {
         self.max_iterations = limit;
     }
@@ -473,21 +474,24 @@ impl Engine {
     }
 
     /// Downcast a custom value to a concrete type.
+    ///
+    /// Deprecated: use [`Value::downcast_custom`] instead.
+    #[deprecated(since = "0.2.0", note = "use Value::downcast_custom instead")]
     pub fn downcast_custom<T: DynValue + 'static>(value: &Value) -> Option<&T> {
-        if let Value::Custom(v) = value {
-            v.as_any().downcast_ref::<T>()
-        } else {
-            None
-        }
+        value.downcast_custom()
     }
 
     /// Get a relation by name.
     ///
-    /// Automatically calls [`Engine::materialize`] if needed (i.e., if [`Engine::run`]
-    /// was called since the last materialization), so callers never see stale data.
-    pub fn relation(&mut self, name: &str) -> Option<&Relation> {
+    /// If [`Engine::run`] was called since the last [`Engine::materialize`],
+    /// packed-relation indices may be stale. Call `materialize()` first when
+    /// you need fully-synced data (e.g., key lookups or index scans).
+    pub fn relation(&self, name: &str) -> Option<&Relation> {
         if !self.materialized {
-            self.materialize();
+            eprintln!(
+                "Warning: relation() called before materialize(). \
+                 Packed relation data may be stale."
+            );
         }
         self.relations.get(name)
     }
@@ -544,11 +548,30 @@ impl Engine {
     }
 
     /// Insert a tuple tagged with a source.
-    pub fn insert_with_source(&mut self, relation: &str, tuple: Tuple, source: SourceId) -> bool {
+    ///
+    /// Validates that the relation exists and the tuple arity matches, just
+    /// like [`Engine::insert`].
+    pub fn insert_with_source(
+        &mut self,
+        relation: &str,
+        tuple: Tuple,
+        source: SourceId,
+    ) -> Result<bool, crate::error::EvalError> {
         if let Some(rel) = self.relations.get_mut(relation) {
-            rel.insert_with_source(tuple, source)
+            if let Some(col) = self.column_types.get(relation)
+                && col.len() != tuple.len()
+            {
+                return Err(crate::error::EvalError::ArityMismatch {
+                    relation: relation.to_string(),
+                    expected: col.len(),
+                    got: tuple.len(),
+                });
+            }
+            Ok(rel.insert_with_source(tuple, source))
         } else {
-            false
+            Err(crate::error::EvalError::UnknownRelation(
+                relation.to_string(),
+            ))
         }
     }
 
@@ -559,6 +582,7 @@ impl Engine {
         if let Some(&id) = self.source_names.get(name) {
             return id;
         }
+        debug_assert!(self.next_source_id < u32::MAX, "SourceId overflow");
         let id = SourceId(self.next_source_id);
         self.next_source_id += 1;
         self.source_names.insert(name.to_string(), id);
@@ -735,7 +759,7 @@ impl Engine {
                     .filter_map(|name| self.relations.get(name).map(|r| (name.clone(), r.len())))
                     .collect();
 
-                self.run_stratum_incremental(&rules, &scc_writes[scc_idx]);
+                self.run_stratum_incremental(&rules, &scc_writes[scc_idx])?;
 
                 // Propagate newly-derived tuples as deltas for downstream SCCs
                 for (name, old_count) in pre_counts {
@@ -1774,9 +1798,13 @@ impl Engine {
     /// `owned` is the set of relation names this SCC writes to.
     /// Owned relations are advanced normally; input relations use peek-advance
     /// so their deltas survive for downstream SCCs.
-    fn run_stratum_incremental(&mut self, rules: &[&CRule], owned: &FxHashSet<String>) {
+    fn run_stratum_incremental(
+        &mut self,
+        rules: &[&CRule],
+        owned: &FxHashSet<String>,
+    ) -> Result<(), crate::error::EvalError> {
         if rules.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Sync interpreter state before incremental evaluation.
@@ -1803,11 +1831,19 @@ impl Engine {
         }
 
         if !changed {
-            return;
+            return Ok(());
         }
 
         // Semi-naive loop: evaluate with use_recent=true, advance, repeat
+        let mut iterations = 0usize;
         loop {
+            iterations += 1;
+            if iterations > self.max_iterations {
+                return Err(crate::error::EvalError::IterationLimitExceeded {
+                    limit: self.max_iterations,
+                });
+            }
+
             for rule in rules {
                 self.evaluate_rule(rule, true);
             }
@@ -1828,9 +1864,12 @@ impl Engine {
                 break;
             }
         }
+
+        Ok(())
     }
 
     /// Evaluate a single rule.
+    // TODO: propagate expression evaluation errors via EvalError
     fn evaluate_rule(&mut self, rule: &CRule, use_recent: bool) {
         if use_recent && !self.rule_has_recent_data(rule) {
             return;
@@ -1847,7 +1886,8 @@ impl Engine {
         };
 
         for (relation, tuple) in derived {
-            self.insert_with_source(relation, tuple, source);
+            // Internal derivation — relation and arity are guaranteed valid.
+            let _ = self.insert_with_source(relation, tuple, source);
         }
     }
 
@@ -2808,6 +2848,11 @@ impl Engine {
 /// This handles the case where an unsuffixed literal (e.g. `0`) is evaluated as
 /// `Value::I32` but the column is declared as `u32` or another integer type.
 /// Only coerces between numeric types; leaves all other values unchanged.
+///
+/// If the cast fails (e.g., negative i32 to u32, or incompatible types), the
+/// original value is kept as-is. This may cause join mismatches when a column
+/// contains mixed types, which is acceptable — it matches Ascent's behavior
+/// where type mismatches simply fail to unify.
 fn coerce_to_col_type(value: Value, ty_name: &str) -> Value {
     value.cast_to(ty_name).unwrap_or(value)
 }
@@ -4035,15 +4080,21 @@ mod tests {
         let mut engine = Engine::new(program);
 
         let src = engine.intern_source("initial");
-        engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], src);
-        engine.insert_with_source("edge", vec![Value::I32(2), Value::I32(3)], src);
+        engine
+            .insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], src)
+            .unwrap();
+        engine
+            .insert_with_source("edge", vec![Value::I32(2), Value::I32(3)], src)
+            .unwrap();
         engine.run().unwrap();
         assert_eq!(engine.relation("path").unwrap().len(), 3); // (1,2), (2,3), (1,3)
 
         // Retract and add different edges
         engine.retract_source(src);
         let src2 = engine.intern_source("updated");
-        engine.insert_with_source("edge", vec![Value::I32(10), Value::I32(20)], src2);
+        engine
+            .insert_with_source("edge", vec![Value::I32(10), Value::I32(20)], src2)
+            .unwrap();
 
         let rederived = engine.run_incremental(&["edge"], &["edge"]).unwrap();
 
