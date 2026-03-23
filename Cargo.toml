@@ -4,7 +4,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "ascent-interpreter"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pterror/ascent-interpreter"
@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 dynasmrt = { version = "5", optional = true }
 
 [features]
+default = ["jit-asm"]
 serde = ["dep:serde"]
 specialized = []
 jit = []
