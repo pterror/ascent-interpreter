@@ -2,7 +2,7 @@
 
 Created: 98bf464
 Last run: 2026-03-23
-Round: 3
+Round: 4 (converged)
 Project type: Rust multi-crate workspace (interpreter + JIT compiler for Ascent Datalog)
 
 ## Lenses
