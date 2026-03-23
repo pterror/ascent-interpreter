@@ -5,8 +5,8 @@
 
 use syn::Expr;
 
-use crate::eval::{Bindings, TypeRegistry, VarInterner};
-use crate::value::Value;
+use crate::eval::engine::{Bindings, TypeRegistry, VarInterner};
+use crate::eval::value::Value;
 
 /// Evaluate a syn expression with the given variable bindings.
 ///
@@ -105,11 +105,11 @@ pub(crate) fn eval_lit(lit: &syn::Lit) -> Option<Value> {
                 "f32" => f
                     .base10_parse::<f32>()
                     .ok()
-                    .map(|v| Value::F32(crate::value::OrderedFloat(v))),
+                    .map(|v| Value::F32(crate::eval::value::OrderedFloat(v))),
                 _ => f
                     .base10_parse::<f64>()
                     .ok()
-                    .map(|v| Value::F64(crate::value::OrderedFloat(v))),
+                    .map(|v| Value::F64(crate::eval::value::OrderedFloat(v))),
             }
         }
         syn::Lit::Bool(b) => Some(Value::Bool(b.value)),

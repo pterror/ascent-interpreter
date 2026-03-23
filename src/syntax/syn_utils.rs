@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use proc_macro2::Ident;
 use syn::{Expr, Pat, Path};
 
-use crate::utils::into_set;
+use crate::syntax::utils::into_set;
 
 /// Extract all variables bound by a pattern.
 pub fn pattern_get_vars(pat: &Pat) -> Vec<Ident> {

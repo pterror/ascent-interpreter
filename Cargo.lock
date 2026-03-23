@@ -61,53 +61,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "ascent-eval"
-version = "0.1.0"
-dependencies = [
- "ascent-ir",
- "ascent-syntax",
- "dynasmrt",
- "hashbrown 0.16.1",
- "itertools 0.14.0",
- "petgraph",
- "rustc-hash",
- "serde",
- "syn",
-]
-
-[[package]]
 name = "ascent-interpreter"
 version = "0.1.0"
 dependencies = [
  "ascent",
- "ascent-eval",
- "ascent-ir",
- "ascent-syntax",
  "criterion",
- "syn",
-]
-
-[[package]]
-name = "ascent-ir"
-version = "0.1.0"
-dependencies = [
- "ascent-syntax",
- "itertools 0.14.0",
- "proc-macro2",
- "proptest",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "ascent-syntax"
-version = "0.1.0"
-dependencies = [
  "derive-syn-parse",
+ "dynasmrt",
+ "hashbrown 0.16.1",
  "itertools 0.14.0",
+ "petgraph",
  "proc-macro2",
  "proptest",
  "quote",
+ "rustc-hash",
+ "serde",
  "syn",
 ]
 

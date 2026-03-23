@@ -55,10 +55,10 @@
 use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi, DynamicLabel};
 use dynasmrt::x64::Assembler;
 
-use crate::compiled::{CAggArg, CAggregation, CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CUnOp};
-use crate::jit::packed_helpers::StratumStage4Fn;
-use crate::jit::storage;
-use crate::value::Value;
+use crate::eval::compiled::{CAggArg, CAggregation, CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CUnOp};
+use crate::eval::jit::packed_helpers::StratumStage4Fn;
+use crate::eval::jit::storage;
+use crate::eval::value::Value;
 
 /// 5-tuple representing one rule for asm codegen:
 /// `(clauses, heads, conditions, not_clauses, agg_clauses)`.
@@ -377,10 +377,10 @@ fn emit_tuple_set_probe_scalar(
                     emit_load_var($asm, var_locs, *var_id);
                     dynasm!($asm; mov $tgt, eax);
                 }
-                CClauseArg::Expr(CExpr::Literal(crate::value::Value::I32(n))) => {
+                CClauseArg::Expr(CExpr::Literal(crate::eval::value::Value::I32(n))) => {
                     dynasm!($asm; mov $tgt, *n);
                 }
-                CClauseArg::Expr(CExpr::Literal(crate::value::Value::Bool(b))) => {
+                CClauseArg::Expr(CExpr::Literal(crate::eval::value::Value::Bool(b))) => {
                     let v = if *b { 1i32 } else { 0i32 };
                     dynasm!($asm; mov $tgt, v);
                 }
@@ -471,8 +471,8 @@ fn emit_tuple_set_probe(
     for arg in &clause.args {
         match arg {
             CClauseArg::Var(_) => {}
-            CClauseArg::Expr(CExpr::Literal(crate::value::Value::I32(_))) => {}
-            CClauseArg::Expr(CExpr::Literal(crate::value::Value::Bool(_))) => {}
+            CClauseArg::Expr(CExpr::Literal(crate::eval::value::Value::I32(_))) => {}
+            CClauseArg::Expr(CExpr::Literal(crate::eval::value::Value::Bool(_))) => {}
             _ => return Err(format!("emit_tuple_set_probe: unsupported arg type: {arg:?}")),
         }
     }
@@ -1621,7 +1621,7 @@ fn emit_not_probes(
     var_locs: &[VarLoc],
     skip_label: DynamicLabel,
 ) -> Result<(), String> {
-    use crate::jit::packed_helpers::{check_not_packed_1, check_not_packed_2, check_not_packed_3};
+    use crate::eval::jit::packed_helpers::{check_not_packed_1, check_not_packed_2, check_not_packed_3};
     for (neg_i, neg) in negations.iter().enumerate() {
         let arity = neg.args.len();
         // Extract var ids (eligibility already checked — all args are Var).
@@ -2618,7 +2618,7 @@ fn emit_aggregations(
     rule_i: usize,
     variant_exit: DynamicLabel,
 ) -> Result<(), String> {
-    use crate::jit::packed_helpers::{AGG_EMPTY, packed_agg_count, packed_agg_max_i32, packed_agg_min_i32, packed_agg_sum_i32};
+    use crate::eval::jit::packed_helpers::{AGG_EMPTY, packed_agg_count, packed_agg_max_i32, packed_agg_min_i32, packed_agg_sum_i32};
     for (agg_i, agg) in aggregations.iter().enumerate() {
         let rel_seq = num_pos_clauses + num_nots + agg_i;
         let result_var = *agg.result_vars.first()

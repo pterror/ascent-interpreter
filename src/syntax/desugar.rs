@@ -15,11 +15,11 @@ use syn::parse2;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 
-use crate::syn_utils::{expr_get_vars, pattern_get_vars};
+use crate::syntax::syn_utils::{expr_get_vars, pattern_get_vars};
 use crate::syntax::{
     AggClauseNode, AscentProgram, BodyClauseArg, BodyClauseNode, BodyItemNode, CondClause, RuleNode,
 };
-use crate::utils::{expr_to_ident, is_wildcard};
+use crate::syntax::utils::{expr_to_ident, is_wildcard};
 
 /// Generator for unique identifiers.
 #[derive(Clone)]

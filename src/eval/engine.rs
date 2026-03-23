@@ -6,19 +6,19 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 
-use ascent_ir::{BodyItem, Program};
+use crate::ir::{BodyItem, Program};
 use petgraph::algo::{condensation, toposort};
 use petgraph::graph::DiGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::aggregators::apply_aggregator;
-use crate::compiled::{
+use crate::eval::aggregators::apply_aggregator;
+use crate::eval::compiled::{
     CAggArg, CAggregation, CBodyItem, CClause, CClauseArg, CCondition, CHeadClause, CRule,
     compile_rule, eval_cexpr,
 };
-use crate::expr::expand_range;
-use crate::relation::{Relation, SourceId};
-use crate::value::{DynValue, Tuple, Value};
+use crate::eval::expr::expand_range;
+use crate::eval::relation::{Relation, SourceId};
+use crate::eval::value::{DynValue, Tuple, Value};
 
 /// Interned variable identifier (u32 index instead of String).
 pub type VarId = u32;
@@ -273,20 +273,20 @@ pub(crate) struct StratumStage4RefreshInfo {
 #[cfg(all(feature = "jit", feature = "specialized"))]
 #[allow(dead_code, clippy::vec_box)]
 pub(crate) struct StratumStage4Runtime {
-    stage4_ctx: Box<crate::jit::packed_helpers::StratumStage4Ctx>,
-    _per_rule_clause_rels: Vec<Box<[*const crate::specialized::PackedStorage]>>,
-    _per_rule_head_rels: Vec<Box<[*mut crate::specialized::PackedStorage]>>,
-    _per_rule_ctxs: Vec<Box<crate::jit::packed_helpers::PackedJitContextV3>>,
-    _rule_ctx_ptrs: Box<[*mut crate::jit::packed_helpers::PackedJitContextV3]>,
-    _all_rels: Box<[*mut crate::specialized::PackedStorage]>,
+    stage4_ctx: Box<crate::eval::jit::packed_helpers::StratumStage4Ctx>,
+    _per_rule_clause_rels: Vec<Box<[*const crate::eval::specialized::PackedStorage]>>,
+    _per_rule_head_rels: Vec<Box<[*mut crate::eval::specialized::PackedStorage]>>,
+    _per_rule_ctxs: Vec<Box<crate::eval::jit::packed_helpers::PackedJitContextV3>>,
+    _rule_ctx_ptrs: Box<[*mut crate::eval::jit::packed_helpers::PackedJitContextV3]>,
+    _all_rels: Box<[*mut crate::eval::specialized::PackedStorage]>,
     /// Per-rule dedup handle pointer arrays (one *mut JitDedupHandle per head relation per rule).
-    _per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>>,
+    _per_rule_dedup_handles: Vec<Box<[*mut crate::eval::jit_index::JitDedupHandle]>>,
     /// Inline hash-probe lookup handles; stage4_ctx.handles_buf points into this.
-    _handles_buf: Box<[crate::jit_index::JitLookupHandle]>,
+    _handles_buf: Box<[crate::eval::jit_index::JitLookupHandle]>,
     /// Lookup specs parallel to _handles_buf; stage4_ctx.lookup_specs points into this.
-    _lookup_specs: Box<[crate::jit::packed_helpers::LookupSpec]>,
+    _lookup_specs: Box<[crate::eval::jit::packed_helpers::LookupSpec]>,
     /// Optional native fast-path runtime (Step 3). `None` if any relation lacks `jit_native`.
-    stage4_native_runtime: Option<crate::jit::packed_helpers::StratumStage4NativeRuntime>,
+    stage4_native_runtime: Option<crate::eval::jit::packed_helpers::StratumStage4NativeRuntime>,
     /// Present when this runtime was built with pooling support (stage4_native_runtime is None).
     /// Used to repopulate pointer slots for a new engine without re-allocating.
     refresh_info: Option<StratumStage4RefreshInfo>,
@@ -325,7 +325,7 @@ pub struct Engine {
     /// JIT compiler for rule bodies (optional, feature-gated).
     /// Arc<Mutex> allows sharing a pre-compiled JIT across Engine instances.
     #[cfg(feature = "jit")]
-    jit: Option<Arc<Mutex<crate::jit::JitCompiler>>>,
+    jit: Option<Arc<Mutex<crate::eval::jit::JitCompiler>>>,
     /// Cache of Stage 4 stratum runtime contexts (inlined rule bodies).
     #[cfg(all(feature = "jit", feature = "specialized"))]
     stratum_stage4_cache: FxHashMap<usize, StratumStage4Runtime>,
@@ -341,7 +341,7 @@ pub struct Engine {
 /// [`Engine::set_jit_compiler`] to avoid recompilation across engine instances.
 #[cfg(feature = "jit")]
 #[derive(Clone)]
-pub struct SharedJitCompiler(Arc<Mutex<crate::jit::JitCompiler>>);
+pub struct SharedJitCompiler(Arc<Mutex<crate::eval::jit::JitCompiler>>);
 
 impl Engine {
     /// Create a new engine from a program.
@@ -355,8 +355,8 @@ impl Engine {
                 .column_types
                 .iter()
                 .map(|ty| match ty {
-                    ascent_ir::IrType::Named(name) => Some(name.clone()),
-                    ascent_ir::IrType::Complex(_) => None,
+                    crate::ir::IrType::Named(name) => Some(name.clone()),
+                    crate::ir::IrType::Complex(_) => None,
                 })
                 .collect();
             relations.insert(
@@ -393,12 +393,12 @@ impl Engine {
 
     /// Enable JIT compilation for eligible rules.
     #[cfg(feature = "jit")]
-    pub fn enable_jit(&mut self) -> Result<(), crate::error::EvalError> {
+    pub fn enable_jit(&mut self) -> Result<(), crate::eval::error::EvalError> {
         if self.jit.is_none() {
-            match crate::jit::JitCompiler::new() {
+            match crate::eval::jit::JitCompiler::new() {
                 Ok(compiler) => self.jit = Some(Arc::new(Mutex::new(compiler))),
                 Err(e) => {
-                    return Err(crate::error::EvalError::Jit(format!(
+                    return Err(crate::eval::error::EvalError::Jit(format!(
                         "JIT init failed: {e}"
                     )))
                 }
@@ -528,12 +528,12 @@ impl Engine {
         &mut self,
         relation: &str,
         tuple: Tuple,
-    ) -> Result<bool, crate::error::EvalError> {
+    ) -> Result<bool, crate::eval::error::EvalError> {
         if let Some(rel) = self.relations.get_mut(relation) {
             if let Some(col) = self.column_types.get(relation)
                 && col.len() != tuple.len()
             {
-                return Err(crate::error::EvalError::ArityMismatch {
+                return Err(crate::eval::error::EvalError::ArityMismatch {
                     relation: relation.to_string(),
                     expected: col.len(),
                     got: tuple.len(),
@@ -541,7 +541,7 @@ impl Engine {
             }
             Ok(rel.insert(tuple))
         } else {
-            Err(crate::error::EvalError::UnknownRelation(
+            Err(crate::eval::error::EvalError::UnknownRelation(
                 relation.to_string(),
             ))
         }
@@ -556,12 +556,12 @@ impl Engine {
         relation: &str,
         tuple: Tuple,
         source: SourceId,
-    ) -> Result<bool, crate::error::EvalError> {
+    ) -> Result<bool, crate::eval::error::EvalError> {
         if let Some(rel) = self.relations.get_mut(relation) {
             if let Some(col) = self.column_types.get(relation)
                 && col.len() != tuple.len()
             {
-                return Err(crate::error::EvalError::ArityMismatch {
+                return Err(crate::eval::error::EvalError::ArityMismatch {
                     relation: relation.to_string(),
                     expected: col.len(),
                     got: tuple.len(),
@@ -569,7 +569,7 @@ impl Engine {
             }
             Ok(rel.insert_with_source(tuple, source))
         } else {
-            Err(crate::error::EvalError::UnknownRelation(
+            Err(crate::eval::error::EvalError::UnknownRelation(
                 relation.to_string(),
             ))
         }
@@ -631,7 +631,7 @@ impl Engine {
     ///
     /// Rules are grouped into strongly connected components and processed in
     /// topological order. Each SCC runs to fixpoint before dependent SCCs begin.
-    pub fn run(&mut self) -> Result<(), crate::error::EvalError> {
+    pub fn run(&mut self) -> Result<(), crate::eval::error::EvalError> {
         self.materialized = false;
         self.ensure_stratification();
         let strat = self
@@ -674,7 +674,7 @@ impl Engine {
         &mut self,
         dirty: &[&str],
         retracted: &[&str],
-    ) -> Result<FxHashSet<String>, crate::error::EvalError> {
+    ) -> Result<FxHashSet<String>, crate::eval::error::EvalError> {
         if dirty.is_empty() {
             return Ok(FxHashSet::default());
         }
@@ -804,8 +804,8 @@ impl Engine {
                 .column_types
                 .iter()
                 .map(|ty| match ty {
-                    ascent_ir::IrType::Named(name) => Some(name.clone()),
-                    ascent_ir::IrType::Complex(_) => None,
+                    crate::ir::IrType::Named(name) => Some(name.clone()),
+                    crate::ir::IrType::Complex(_) => None,
                 })
                 .collect();
             self.relations
@@ -823,7 +823,7 @@ impl Engine {
         rules: &[&CRule],
         scc_key: usize,
         rule_indices: &[usize],
-    ) -> Result<(), crate::error::EvalError> {
+    ) -> Result<(), crate::eval::error::EvalError> {
         if rules.is_empty() {
             return Ok(());
         }
@@ -839,7 +839,7 @@ impl Engine {
         // reads those structures, so they must be synced before evaluation begins.
         #[cfg(feature = "specialized")]
         {
-            use crate::relation::Relation;
+            use crate::eval::relation::Relation;
             for rel in self.relations.values_mut() {
                 if let Relation::Packed(ps) = rel {
                     ps.ensure_interp_synced();
@@ -865,7 +865,7 @@ impl Engine {
         while changed {
             iterations += 1;
             if iterations > self.max_iterations {
-                return Err(crate::error::EvalError::IterationLimitExceeded {
+                return Err(crate::eval::error::EvalError::IterationLimitExceeded {
                     limit: self.max_iterations,
                 });
             }
@@ -901,8 +901,8 @@ impl Engine {
         // as a rule head. EDB relations are stable — their full JIT index can be built
         // contiguously once before the stratum runs and never rebuilt.
         {
-            use crate::compiled::CBodyItem;
-            use crate::relation::Relation;
+            use crate::eval::compiled::CBodyItem;
+            use crate::eval::relation::Relation;
 
             // Collect all relation names that appear in any head.
             let head_rels: rustc_hash::FxHashSet<&str> = rules
@@ -985,7 +985,7 @@ impl Engine {
 
         // Step 1b: also compile the native function (reads scan data directly from JitRelData).
         // This is compiled speculatively; it will only be used if stage4_native_runtime is Some.
-        let stage4_native_fn: Option<crate::jit::packed_helpers::StratumStage4Fn> =
+        let stage4_native_fn: Option<crate::eval::jit::packed_helpers::StratumStage4Fn> =
             self.jit.as_ref().and_then(|jit_cell| {
                 let mut jit = jit_cell.lock().unwrap_or_else(|e| e.into_inner());
                 jit.var_count = self.var_count;
@@ -1003,7 +1003,7 @@ impl Engine {
             let pool_runtime = if let Some(jit_cell) = self.jit.as_ref() {
                 let mut jit = jit_cell.lock().unwrap_or_else(|e| e.into_inner());
                 if !jit.tuple_count_hints.is_empty() {
-                    use crate::relation::Relation;
+                    use crate::eval::relation::Relation;
                     for rule in rules {
                         for head in &rule.heads {
                             if let Some(&count_hint) =
@@ -1053,7 +1053,7 @@ impl Engine {
             let jit = jit_cell.lock().unwrap_or_else(|e| e.into_inner());
             let has_hints = !jit.dedup_cap_hints.is_empty() || !jit.tuple_count_hints.is_empty();
             if has_hints {
-                use crate::relation::Relation;
+                use crate::eval::relation::Relation;
                 for rule in rules {
                     for head in &rule.heads {
                         if let Some(Relation::Packed(ps)) =
@@ -1098,7 +1098,7 @@ impl Engine {
             // The native fn takes *mut StratumStage4NativeCtx, but StratumStage4Fn
             // is typed as *mut StratumStage4Ctx. Both are opaque pointers at the ABI
             // level; transmute is safe here since we know which ctx the fn expects.
-            type NativeFn = unsafe extern "C" fn(*mut crate::jit::packed_helpers::StratumStage4NativeCtx);
+            type NativeFn = unsafe extern "C" fn(*mut crate::eval::jit::packed_helpers::StratumStage4NativeCtx);
             let native_fn_typed: NativeFn = unsafe { std::mem::transmute(native_fn) };
             unsafe { native_fn_typed(&raw mut *native_runtime.ctx) };
             // Update dedup capacity hints after the native path run.
@@ -1119,9 +1119,9 @@ impl Engine {
     /// After the final fixpoint advance, `jit_dedup.clear()` zeroes the count but
     /// preserves the capacity allocation — so `handle.cap` is the peak capacity.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    fn update_dedup_cap_hints(&self, rules: &[&crate::compiled::CRule]) {
+    fn update_dedup_cap_hints(&self, rules: &[&crate::eval::compiled::CRule]) {
         let Some(jit_cell) = self.jit.as_ref() else { return };
-        use crate::relation::Relation;
+        use crate::eval::relation::Relation;
         let mut hints: Vec<(String, u32, u32)> = Vec::new(); // (name, dedup_cap, tuple_count)
         for rule in rules {
             for head in &rule.heads {
@@ -1155,10 +1155,10 @@ impl Engine {
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized"))]
     fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule], native_fn_available: bool) -> Option<StratumStage4Runtime> {
-        use crate::jit::packed_helpers::{LookupSpec, PackedJitContextV3, StratumStage4Ctx};
-        use crate::jit_index::JitLookupHandle;
-        use crate::relation::Relation;
-        use crate::specialized::PackedStorage;
+        use crate::eval::jit::packed_helpers::{LookupSpec, PackedJitContextV3, StratumStage4Ctx};
+        use crate::eval::jit_index::JitLookupHandle;
+        use crate::eval::relation::Relation;
+        use crate::eval::specialized::PackedStorage;
 
         // Rebuild stale JIT indices before building handles: asm-native strata may have
         // skipped update_jit_indices(), leaving jit_indices/jit_recent_indices stale for IDB rels.
@@ -1176,7 +1176,7 @@ impl Engine {
 
         let mut per_rule_clause_rels: Vec<Box<[*const PackedStorage]>> = Vec::new();
         let mut per_rule_head_rels: Vec<Box<[*mut PackedStorage]>> = Vec::new();
-        let mut per_rule_dedup_handles: Vec<Box<[*mut crate::jit_index::JitDedupHandle]>> =
+        let mut per_rule_dedup_handles: Vec<Box<[*mut crate::eval::jit_index::JitDedupHandle]>> =
             Vec::new();
         let mut per_rule_ctxs: Vec<Box<PackedJitContextV3>> = Vec::new();
         let mut rule_ctx_ptrs_vec: Vec<*mut PackedJitContextV3> = Vec::new();
@@ -1280,7 +1280,7 @@ impl Engine {
             rule_handle_offsets.push(rule_handle_start);
 
             // Extract clause body items in order to find the primary bound column.
-            let rule_clauses: Vec<&crate::compiled::CClause> = rule
+            let rule_clauses: Vec<&crate::eval::compiled::CClause> = rule
                 .body
                 .iter()
                 .filter_map(|item| match item {
@@ -1332,7 +1332,7 @@ impl Engine {
             let head_rels_ptr: *const *mut PackedStorage = head_rels_box.as_ptr();
 
             // Build dedup handle pointers (one per head relation).
-            let dedup_handles: Box<[*mut crate::jit_index::JitDedupHandle]> = head_rels_box
+            let dedup_handles: Box<[*mut crate::eval::jit_index::JitDedupHandle]> = head_rels_box
                 .iter()
                 .map(|&ps| unsafe { &raw mut (*ps).jit_dedup.handle })
                 .collect();
@@ -1450,8 +1450,8 @@ impl Engine {
     /// built from the same program).
     #[cfg(all(feature = "jit", feature = "specialized"))]
     fn repopulate_runtime(&mut self, rt: &mut StratumStage4Runtime) -> bool {
-        use crate::jit_index::JitLookupHandle;
-        use crate::relation::Relation;
+        use crate::eval::jit_index::JitLookupHandle;
+        use crate::eval::relation::Relation;
 
         let Some(info) = rt.refresh_info.as_ref() else { return false; };
 
@@ -1517,7 +1517,7 @@ impl Engine {
                     if ps.jit_indices.is_empty() && ps.count > 0 && ps.arity > 0 {
                         ps.jit_indices = (0..ps.arity)
                             .map(|_| {
-                                let mut idx = crate::jit_index::JitHashIndex::empty();
+                                let mut idx = crate::eval::jit_index::JitHashIndex::empty();
                                 // Pre-reserve to avoid rehash cascade during update_jit_indices.
                                 // count+1 ensures enough capacity even before reserve hint is known.
                                 idx.reserve(ps.count + 1);
@@ -1566,13 +1566,13 @@ impl Engine {
     fn build_stratum_stage4_native_runtime(
         &mut self,
         rules: &[&CRule],
-    ) -> Option<crate::jit::packed_helpers::StratumStage4NativeRuntime> {
-        use crate::jit::packed_helpers::{
+    ) -> Option<crate::eval::jit::packed_helpers::StratumStage4NativeRuntime> {
+        use crate::eval::jit::packed_helpers::{
             NativeHeadSpec, NativeScanSpec, StratumStage4NativeCtx, StratumStage4NativeRuntime,
         };
-        use crate::jit::storage::JitRelData;
-        use crate::relation::Relation;
-        use crate::specialized::PackedStorage;
+        use crate::eval::jit::storage::JitRelData;
+        use crate::eval::relation::Relation;
+        use crate::eval::specialized::PackedStorage;
 
         // Eagerly advance any packed relation that hasn't yet had `advance_jit()` called.
         // This serves two purposes:
@@ -1638,7 +1638,7 @@ impl Engine {
                                         |(cached_count, cached_hash, cached_rel)| {
                                             if *cached_count == count && *cached_hash == data_hash {
                                                 Some(unsafe {
-                                                    crate::jit::storage::clone_jit_rel_data_with_indices(
+                                                    crate::eval::jit::storage::clone_jit_rel_data_with_indices(
                                                         cached_rel, arity, true,
                                                     )
                                                 })
@@ -1656,7 +1656,7 @@ impl Engine {
                                     let native = ps.build_native_projection();
                                     {
                                         let total_clone = unsafe {
-                                            crate::jit::storage::clone_jit_rel_data_with_indices(
+                                            crate::eval::jit::storage::clone_jit_rel_data_with_indices(
                                                 &native.total, arity, true,
                                             )
                                         };
@@ -1693,7 +1693,7 @@ impl Engine {
 
         for rule in rules {
             // Collect clause packed relations in order.
-            let rule_clauses: Vec<&crate::compiled::CClause> = rule
+            let rule_clauses: Vec<&crate::eval::compiled::CClause> = rule
                 .body
                 .iter()
                 .filter_map(|item| match item {
@@ -1802,7 +1802,7 @@ impl Engine {
         &mut self,
         rules: &[&CRule],
         owned: &FxHashSet<String>,
-    ) -> Result<(), crate::error::EvalError> {
+    ) -> Result<(), crate::eval::error::EvalError> {
         if rules.is_empty() {
             return Ok(());
         }
@@ -1810,7 +1810,7 @@ impl Engine {
         // Sync interpreter state before incremental evaluation.
         #[cfg(feature = "specialized")]
         {
-            use crate::relation::Relation;
+            use crate::eval::relation::Relation;
             for rel in self.relations.values_mut() {
                 if let Relation::Packed(ps) = rel {
                     ps.ensure_interp_synced();
@@ -1839,7 +1839,7 @@ impl Engine {
         loop {
             iterations += 1;
             if iterations > self.max_iterations {
-                return Err(crate::error::EvalError::IterationLimitExceeded {
+                return Err(crate::eval::error::EvalError::IterationLimitExceeded {
                     limit: self.max_iterations,
                 });
             }
@@ -2619,7 +2619,7 @@ impl Engine {
     ///
     /// This avoids per-match binding mutations and inner `Vec<Value>` allocations.
     fn collect_agg_flat_vars(&self, agg: &CAggregation, binding: &Bindings) -> Option<Vec<Value>> {
-        use crate::compiled::CAggArg;
+        use crate::eval::compiled::CAggArg;
 
         // Require all args to be plain Vars.
         if !agg.args.iter().all(|a| matches!(a, CAggArg::Var(_))) {
@@ -2909,7 +2909,7 @@ fn compute_rule_sccs(program: &Program) -> Vec<Vec<usize>> {
 ///
 /// Uses the undo log to track insertions for rollback on partial match failure.
 fn match_pattern(
-    pat: &ascent_ir::IrPattern,
+    pat: &crate::ir::IrPattern,
     value: &Value,
     bindings: &mut Bindings,
     registry: Option<&TypeRegistry>,
@@ -2918,10 +2918,10 @@ fn match_pattern(
 ) -> bool {
     match pat {
         // Wildcard: always matches, binds nothing
-        ascent_ir::IrPattern::Wild => true,
+        crate::ir::IrPattern::Wild => true,
 
         // Variable binding: `x` or `x @ subpat`
-        ascent_ir::IrPattern::Var(name, sub_pat) => {
+        crate::ir::IrPattern::Var(name, sub_pat) => {
             // Handle `_` identifiers as wildcards
             if name == "_" {
                 return true;
@@ -2939,13 +2939,13 @@ fn match_pattern(
         }
 
         // Literal pattern: `42`, `true`, `'a'`
-        ascent_ir::IrPattern::Lit(ir_lit) => {
-            let lit_val = crate::compiled::ir_lit_to_value(ir_lit);
+        crate::ir::IrPattern::Lit(ir_lit) => {
+            let lit_val = crate::eval::compiled::ir_lit_to_value(ir_lit);
             lit_val == *value
         }
 
         // Tuple pattern: `(a, b, c)`
-        ascent_ir::IrPattern::Tuple(pats) => {
+        crate::ir::IrPattern::Tuple(pats) => {
             if let Value::Tuple(vals) = value {
                 if vals.len() != pats.len() {
                     return false;
@@ -2964,7 +2964,7 @@ fn match_pattern(
         }
 
         // Tuple struct pattern: `Some(x)`, `Dual(x)`, or custom types
-        ascent_ir::IrPattern::TupleStruct(path_str, fields) => match path_str.as_str() {
+        crate::ir::IrPattern::TupleStruct(path_str, fields) => match path_str.as_str() {
             "Some" => {
                 if let Value::Option(Some(inner)) = value
                     && fields.len() == 1
@@ -3005,7 +3005,7 @@ fn match_pattern(
         },
 
         // Path pattern: `None`, `true`, `false`
-        ascent_ir::IrPattern::Path(path_str) => match path_str.as_str() {
+        crate::ir::IrPattern::Path(path_str) => match path_str.as_str() {
             "None" => matches!(value, Value::Option(None)),
             "true" => matches!(value, Value::Bool(true)),
             "false" => matches!(value, Value::Bool(false)),
@@ -3013,7 +3013,7 @@ fn match_pattern(
         },
 
         // Or pattern: `A | B`
-        ascent_ir::IrPattern::Or(cases) => {
+        crate::ir::IrPattern::Or(cases) => {
             let cp = undo.len();
             for case in cases {
                 if match_pattern(case, value, bindings, registry, interner, undo) {
@@ -3025,7 +3025,7 @@ fn match_pattern(
         }
 
         // Reference pattern: `&x` — in Datalog context, match the inner pattern
-        ascent_ir::IrPattern::Ref(inner) => {
+        crate::ir::IrPattern::Ref(inner) => {
             match_pattern(inner, value, bindings, registry, interner, undo)
         }
     }
@@ -3052,7 +3052,7 @@ impl Engine {
     where
         T: serde::Serialize + serde::de::DeserializeOwned + DynValue + 'static,
     {
-        use crate::serde_bridge::{from_values, to_values};
+        use crate::eval::serde_bridge::{from_values, to_values};
         self.register_type(
             name,
             |args| from_values::<T>(args).ok().map(Value::custom),
@@ -3062,10 +3062,11 @@ impl Engine {
 }
 
 #[cfg(test)]
+#[allow(unused_mut)]
 mod tests {
     use super::*;
-    use ascent_ir::Program;
-    use ascent_syntax::AscentProgram;
+    use crate::ir::Program;
+    use crate::syntax::AscentProgram;
 
     fn run_program(input: &str) -> Engine {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
@@ -4330,10 +4331,11 @@ mod tests {
 
 #[cfg(test)]
 #[cfg(all(feature = "jit", feature = "specialized"))]
+#[allow(unused_must_use)]
 mod jit_hot_tests {
     use super::*;
-    use ascent_syntax::AscentProgram;
-    use ascent_ir::Program;
+    use crate::syntax::AscentProgram;
+    use crate::ir::Program;
 
     fn run_shared_jit(source: &str) {
         let ast: AscentProgram = syn::parse_str(source).unwrap();

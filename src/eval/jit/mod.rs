@@ -9,13 +9,14 @@ pub(crate) mod packed_helpers;
 #[cfg(feature = "jit-asm")]
 mod asm_codegen;
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests;
 
 use rustc_hash::FxHashMap;
 
 #[cfg(feature = "specialized")]
-use crate::compiled::{CBinOp, CClauseArg, CExpr, CUnOp};
-use crate::compiled::{CAggArg, CAggregation, CBodyItem, CCondition, CRule};
+use crate::eval::compiled::{CBinOp, CClauseArg, CExpr, CUnOp};
+use crate::eval::compiled::{CAggArg, CAggregation, CBodyItem, CCondition, CRule};
 
 impl std::fmt::Debug for JitCompiler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -46,7 +47,7 @@ pub struct JitCompiler {
     /// Avoids the ~9 Box allocations in build_stratum_stage4_runtime on every fresh-engine
     /// hot-bench iteration; repopulate_runtime writes new engine pointers without allocating.
     #[cfg(feature = "specialized")]
-    pub(crate) stratum_runtime_pool: rustc_hash::FxHashMap<usize, crate::eval::StratumStage4Runtime>,
+    pub(crate) stratum_runtime_pool: rustc_hash::FxHashMap<usize, crate::eval::engine::StratumStage4Runtime>,
     /// Cache of pre-sorted EDB `total` JitRelData projections across Engine instances.
     ///
     /// Keyed by (relation_name). Value is (tuple_count, data_hash, Box<JitRelData>) where
@@ -225,10 +226,10 @@ impl JitCompiler {
         }
 
         #[allow(clippy::type_complexity)]
-        let rule_data: Vec<(Vec<crate::compiled::CClause>, Vec<crate::compiled::CHeadClause>, Vec<crate::compiled::CExpr>, Vec<CAggregation>, Vec<CAggregation>)> = rules
+        let rule_data: Vec<(Vec<crate::eval::compiled::CClause>, Vec<crate::eval::compiled::CHeadClause>, Vec<crate::eval::compiled::CExpr>, Vec<CAggregation>, Vec<CAggregation>)> = rules
             .iter()
             .map(|rule| {
-                let clauses: Vec<crate::compiled::CClause> = rule
+                let clauses: Vec<crate::eval::compiled::CClause> = rule
                     .body
                     .iter()
                     .filter_map(|item| match item {
@@ -236,7 +237,7 @@ impl JitCompiler {
                         _ => None,
                     })
                     .collect();
-                let conditions: Vec<crate::compiled::CExpr> = rule
+                let conditions: Vec<crate::eval::compiled::CExpr> = rule
                     .body
                     .iter()
                     .filter_map(|item| match item {
@@ -318,10 +319,10 @@ impl JitCompiler {
             return None;
         }
 
-        let rule_data: Vec<(Vec<crate::compiled::CClause>, Vec<crate::compiled::CHeadClause>, Vec<crate::compiled::CExpr>)> = rules
+        let rule_data: Vec<(Vec<crate::eval::compiled::CClause>, Vec<crate::eval::compiled::CHeadClause>, Vec<crate::eval::compiled::CExpr>)> = rules
             .iter()
             .map(|rule| {
-                let clauses: Vec<crate::compiled::CClause> = rule
+                let clauses: Vec<crate::eval::compiled::CClause> = rule
                     .body
                     .iter()
                     .filter_map(|item| match item {
@@ -329,7 +330,7 @@ impl JitCompiler {
                         _ => None,
                     })
                     .collect();
-                let conditions: Vec<crate::compiled::CExpr> = rule
+                let conditions: Vec<crate::eval::compiled::CExpr> = rule
                     .body
                     .iter()
                     .filter_map(|item| match item {
@@ -340,7 +341,7 @@ impl JitCompiler {
                 (clauses, rule.heads.clone(), conditions)
             })
             .collect();
-        let rules_refs: Vec<(&[crate::compiled::CClause], &[crate::compiled::CHeadClause], &[crate::compiled::CExpr])> = rule_data
+        let rules_refs: Vec<(&[crate::eval::compiled::CClause], &[crate::eval::compiled::CHeadClause], &[crate::eval::compiled::CExpr])> = rule_data
             .iter()
             .map(|(c, h, conds)| (c.as_slice(), h.as_slice(), conds.as_slice()))
             .collect();
@@ -372,12 +373,12 @@ impl JitCompiler {
 fn is_supported_packed_expr(expr: &CExpr) -> bool {
     match expr {
         CExpr::Var(_) | CExpr::DerefVar(_) => true,
-        CExpr::Literal(crate::value::Value::I32(_)) | CExpr::Literal(crate::value::Value::Bool(_)) => true,
+        CExpr::Literal(crate::eval::value::Value::I32(_)) | CExpr::Literal(crate::eval::value::Value::Bool(_)) => true,
         CExpr::VarBinVar(op, _, _) => is_supported_packed_binop(*op),
-        CExpr::VarBinLit(op, _, crate::value::Value::I32(_))
-        | CExpr::VarBinLit(op, _, crate::value::Value::Bool(_)) => is_supported_packed_binop(*op),
-        CExpr::LitBinVar(op, crate::value::Value::I32(_), _)
-        | CExpr::LitBinVar(op, crate::value::Value::Bool(_), _) => is_supported_packed_binop(*op),
+        CExpr::VarBinLit(op, _, crate::eval::value::Value::I32(_))
+        | CExpr::VarBinLit(op, _, crate::eval::value::Value::Bool(_)) => is_supported_packed_binop(*op),
+        CExpr::LitBinVar(op, crate::eval::value::Value::I32(_), _)
+        | CExpr::LitBinVar(op, crate::eval::value::Value::Bool(_), _) => is_supported_packed_binop(*op),
         CExpr::Binary(op, a, b) => {
             is_supported_packed_binop(*op)
                 && is_supported_packed_expr(a)

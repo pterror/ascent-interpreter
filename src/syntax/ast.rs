@@ -11,8 +11,8 @@ use syn::{
     Visibility, WhereClause, braced, parenthesized,
 };
 
-use crate::syn_utils::pattern_get_vars;
-use crate::utils::{expr_to_ident, join_spans};
+use crate::syntax::syn_utils::pattern_get_vars;
+use crate::syntax::utils::{expr_to_ident, join_spans};
 
 mod kw {
     syn::custom_keyword!(relation);

@@ -5,10 +5,10 @@
 
 use std::collections::HashSet;
 
-use ascent_eval::Engine;
-use ascent_eval::value::Value;
-use ascent_ir::Program;
-use ascent_syntax::AscentProgram;
+use ascent_interpreter::eval::Engine;
+use ascent_interpreter::eval::value::Value;
+use ascent_interpreter::ir::Program;
+use ascent_interpreter::syntax::AscentProgram;
 
 fn run(input: &str) -> Engine {
     let ast: AscentProgram = syn::parse_str(input).unwrap();

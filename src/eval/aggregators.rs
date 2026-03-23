@@ -3,7 +3,7 @@
 //! Aggregators consume an iterator of bound-variable slices and return
 //! zero or more result tuples. Streaming: no intermediate Vec is needed.
 
-use crate::value::Value;
+use crate::eval::value::Value;
 
 /// Result of an aggregation: zero or more result tuples.
 pub type AggResult = Vec<Vec<Value>>;
@@ -114,13 +114,13 @@ fn agg_mean<'a>(values: impl Iterator<Item = &'a [Value]>) -> AggResult {
     }
 
     if has_float {
-        vec![vec![Value::F64(crate::value::OrderedFloat(
+        vec![vec![Value::F64(crate::eval::value::OrderedFloat(
             float_sum / count as f64,
         ))]]
     } else if int_sum % count as i64 == 0 {
         vec![vec![Value::I64(int_sum / count as i64)]]
     } else {
-        vec![vec![Value::F64(crate::value::OrderedFloat(
+        vec![vec![Value::F64(crate::eval::value::OrderedFloat(
             float_sum / count as f64,
         ))]]
     }
@@ -216,7 +216,7 @@ mod tests {
         ];
         let result = agg_mean(values.iter().map(|v| v.as_slice()));
         assert_eq!(result.len(), 1);
-        if let Value::F64(crate::value::OrderedFloat(v)) = result[0][0] {
+        if let Value::F64(crate::eval::value::OrderedFloat(v)) = result[0][0] {
             assert!((v - 1.5).abs() < f64::EPSILON);
         } else {
             panic!("expected f64 for inexact integer mean");
@@ -227,12 +227,12 @@ mod tests {
     fn test_mean_with_floats() {
         let values: Vec<Vec<Value>> = vec![
             vec![Value::I32(2)],
-            vec![Value::F64(crate::value::OrderedFloat(4.0))],
+            vec![Value::F64(crate::eval::value::OrderedFloat(4.0))],
             vec![Value::I32(6)],
         ];
         let result = agg_mean(values.iter().map(|v| v.as_slice()));
         assert_eq!(result.len(), 1);
-        if let Value::F64(crate::value::OrderedFloat(v)) = result[0][0] {
+        if let Value::F64(crate::eval::value::OrderedFloat(v)) = result[0][0] {
             assert!((v - 4.0).abs() < f64::EPSILON);
         } else {
             panic!("expected f64 when floats are present");

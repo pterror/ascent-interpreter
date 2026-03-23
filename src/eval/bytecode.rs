@@ -8,9 +8,9 @@
 //! literals) are bytecoded. Complex expressions (Range, Tuple, Call, MethodCall,
 //! Cast, Array, Dynamic) fall back to the tree-walk evaluator.
 
-use crate::compiled::{CBinOp, CExpr, CUnOp, eval_binary_op};
-use crate::eval::{Bindings, VarId};
-use crate::value::Value;
+use crate::eval::compiled::{CBinOp, CExpr, CUnOp, eval_binary_op};
+use crate::eval::engine::{Bindings, VarId};
+use crate::eval::value::Value;
 
 // ─── Instruction set ────────────────────────────────────────────────
 
@@ -279,7 +279,7 @@ pub(crate) fn eval_bytecode(program: &BytecodeProgram, bindings: &Bindings) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::VarInterner;
+    use crate::eval::engine::VarInterner;
 
     fn make_bindings(interner: &VarInterner, vars: &[(&str, Value)]) -> Bindings {
         let mut bindings = Bindings::new(vars.len());

@@ -1,8 +1,8 @@
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 
-use ascent_syntax::desugar::desugar_program;
-use ascent_syntax::{AscentProgram, BodyClauseArg, BodyItemNode};
+use ascent_interpreter::syntax::desugar::desugar_program;
+use ascent_interpreter::syntax::{AscentProgram, BodyClauseArg, BodyItemNode};
 
 // --- String generation strategies ---
 
@@ -424,7 +424,7 @@ proptest! {
             for arg in cl.args.iter() {
                 if let BodyClauseArg::Expr(expr) = arg {
                     prop_assert!(
-                        !ascent_syntax::is_wildcard(expr),
+                        !ascent_interpreter::syntax::is_wildcard(expr),
                         "no wildcards should remain after desugaring"
                     );
                 }

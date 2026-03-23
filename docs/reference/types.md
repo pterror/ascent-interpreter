@@ -67,10 +67,10 @@ The interpreter supports user-defined types via the Rust embedding API. Custom t
 Register a type with explicit constructor and destructor:
 
 ```rust
-use ascent_eval::Engine;
-use ascent_eval::value::Value;
-use ascent_ir::Program;
-use ascent_syntax::AscentProgram;
+use ascent_interpreter::eval::Engine;
+use ascent_interpreter::eval::value::Value;
+use ascent_interpreter::ir::Program;
+use ascent_interpreter::syntax::AscentProgram;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Point { x: i32, y: i32 }
@@ -108,9 +108,9 @@ The **destructor** takes a `&Value` and returns `Option<Vec<Value>>` with the fi
 With the `serde` feature, types implementing `Serialize + Deserialize` can be registered automatically:
 
 ```rust
-use ascent_eval::Engine;
-use ascent_ir::Program;
-use ascent_syntax::AscentProgram;
+use ascent_interpreter::eval::Engine;
+use ascent_interpreter::ir::Program;
+use ascent_interpreter::syntax::AscentProgram;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord,
          serde::Serialize, serde::Deserialize)]

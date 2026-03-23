@@ -5,16 +5,16 @@
 //! - Literals pre-evaluated to Values (no repeated parsing)
 //! - Expressions flattened from syn::Expr to CExpr (simpler dispatch)
 
-use ascent_ir::{
+use crate::ir::{
     Aggregation, BodyItem, Clause, ClauseArg, Condition, Generator, IrBinOp, IrExpr, IrLit,
     IrPattern, IrUnOp, Rule,
 };
 use rustc_hash::FxHashSet;
 
-use crate::bytecode::{BytecodeProgram, eval_bytecode, try_compile_to_bytecode};
-use crate::eval::{Bindings, TypeRegistry, VarId, VarInterner};
-use crate::expr::{eval_expr, eval_expr_with_registry};
-use crate::value::Value;
+use crate::eval::bytecode::{BytecodeProgram, eval_bytecode, try_compile_to_bytecode};
+use crate::eval::engine::{Bindings, TypeRegistry, VarId, VarInterner};
+use crate::eval::expr::{eval_expr, eval_expr_with_registry};
+use crate::eval::value::Value;
 
 // ─── Compiled expression types ──────────────────────────────────────
 
@@ -703,7 +703,7 @@ pub(crate) fn ir_lit_to_value(lit: &IrLit) -> Value {
                 }
             }
         }
-        IrLit::Float(f) => Value::F64(crate::value::OrderedFloat(*f)),
+        IrLit::Float(f) => Value::F64(crate::eval::value::OrderedFloat(*f)),
         IrLit::Bool(b) => Value::Bool(*b),
         IrLit::Char(c) => Value::Char(*c),
         IrLit::String(s) => Value::string(s.clone()),

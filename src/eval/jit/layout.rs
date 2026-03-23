@@ -2,7 +2,7 @@
 
 use std::mem;
 
-use crate::value::Value;
+use crate::eval::value::Value;
 
 /// Size of a `Value` enum in bytes.
 pub const VALUE_SIZE: usize = mem::size_of::<Value>();

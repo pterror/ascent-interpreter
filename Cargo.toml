@@ -1,19 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
 exclude = ["fuzz"]
 
-[workspace.package]
+[package]
+name = "ascent-interpreter"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pterror/ascent-interpreter"
+description = "Interpreter and JIT for Ascent Datalog programs"
 
-[workspace.dependencies]
-ascent-syntax = { version = "0.1.0", path = "crates/ascent-syntax" }
-ascent-ir = { version = "0.1.0", path = "crates/ascent-ir" }
-ascent-eval = { version = "0.1.0", path = "crates/ascent-eval" }
-
+[dependencies]
 syn = { version = "2.0", features = ["full", "derive", "extra-traits", "visit-mut"] }
 proc-macro2 = "1.0"
 quote = "1.0"
@@ -22,30 +19,19 @@ itertools = "0.14"
 petgraph = "0.6"
 rustc-hash = "2"
 hashbrown = "0.16"
-serde = { version = "1", features = ["derive"] }
-
-[package]
-name = "ascent-interpreter"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-description = "Interpreter and JIT for Ascent Datalog programs"
-
-[dependencies]
-ascent-syntax.workspace = true
-ascent-ir.workspace = true
-ascent-eval.workspace = true
-syn.workspace = true
+serde = { version = "1", features = ["derive"], optional = true }
+dynasmrt = { version = "5", optional = true }
 
 [features]
-jit = ["ascent-eval/jit-asm"]
-jit-asm = ["ascent-eval/jit-asm"]
-specialized = ["ascent-eval/specialized"]
+serde = ["dep:serde"]
+specialized = []
+jit = []
+jit-asm = ["jit", "specialized", "dep:dynasmrt"]
 
 [dev-dependencies]
 ascent = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
 
 [[bench]]
 name = "interpreter"

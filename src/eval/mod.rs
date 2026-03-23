@@ -5,10 +5,10 @@
 //! # Example
 //!
 //! ```
-//! use ascent_eval::Engine;
-//! use ascent_ir::Program;
-//! use ascent_syntax::AscentProgram;
-//! use ascent_eval::value::Value;
+//! use ascent_interpreter::eval::Engine;
+//! use ascent_interpreter::ir::Program;
+//! use ascent_interpreter::syntax::AscentProgram;
+//! use ascent_interpreter::eval::value::Value;
 //!
 //! let input = r#"
 //!     relation edge(i32, i32);
@@ -37,7 +37,7 @@ pub mod aggregators;
 mod bytecode;
 mod compiled;
 pub mod error;
-mod eval;
+mod engine;
 pub mod expr;
 pub mod intern;
 #[cfg(feature = "jit")]
@@ -52,8 +52,8 @@ mod specialized;
 pub mod value;
 
 pub use error::EvalError;
-pub use eval::{Engine, TypeRegistry, ValueDestructor};
+pub use engine::{Engine, TypeRegistry, ValueDestructor};
 #[cfg(feature = "jit")]
-pub use eval::SharedJitCompiler;
+pub use engine::SharedJitCompiler;
 pub use relation::{Relation, SourceId};
 pub use value::{DynValue, OrderedFloat, Tuple, Value};

@@ -14,9 +14,9 @@ use std::rc::Rc;
 use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
-use crate::intern;
-use crate::relation::SourceId;
-use crate::value::{InternTable, Tuple, Value};
+use crate::eval::intern;
+use crate::eval::relation::SourceId;
+use crate::eval::value::{InternTable, Tuple, Value};
 
 /// General-purpose intern table for arbitrary `Value`s.
 ///
@@ -198,10 +198,10 @@ pub struct PackedStorage {
     pub(crate) interp_synced_count: usize,
     /// Per-column JIT hash index (full data). Updated incrementally.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) jit_indices: Vec<crate::jit_index::JitHashIndex>,
+    pub(crate) jit_indices: Vec<crate::eval::jit_index::JitHashIndex>,
     /// Per-column JIT hash index (recent data). Rebuilt from scratch each iteration.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) jit_recent_indices: Vec<crate::jit_index::JitHashIndex>,
+    pub(crate) jit_recent_indices: Vec<crate::eval::jit_index::JitHashIndex>,
     /// Number of tuples already indexed into jit_indices (for incremental update).
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) jit_full_indexed_count: usize,
@@ -226,9 +226,9 @@ pub struct PackedStorage {
     /// Native JIT storage projection: total, recent, and empty-new views.
     /// Rebuilt on every `advance_jit()` call.  `None` before the first advance.
     #[cfg(all(feature = "jit", feature = "specialized"))]
-    pub(crate) jit_native: Option<crate::jit::storage::JitNativeRelData>,
+    pub(crate) jit_native: Option<crate::eval::jit::storage::JitNativeRelData>,
     /// Authoritative dedup table (inline u32 hash table, also probed by JIT code directly).
-    pub(crate) jit_dedup: crate::jit_index::JitDedupTable,
+    pub(crate) jit_dedup: crate::eval::jit_index::JitDedupTable,
 }
 
 impl PackedStorage {
@@ -261,7 +261,7 @@ impl PackedStorage {
             jit_index_is_edb_fmt: false,
             #[cfg(all(feature = "jit", feature = "specialized"))]
             jit_native: None,
-            jit_dedup: crate::jit_index::JitDedupTable::new(arity),
+            jit_dedup: crate::eval::jit_index::JitDedupTable::new(arity),
         }
     }
 
@@ -274,8 +274,8 @@ impl PackedStorage {
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) fn build_native_projection(
         &self,
-    ) -> crate::jit::storage::JitNativeRelData {
-        use crate::jit::storage::{JitNativeRelData, JitRelData};
+    ) -> crate::eval::jit::storage::JitNativeRelData {
+        use crate::eval::jit::storage::{JitNativeRelData, JitRelData};
 
         let arity = self.arity;
         // JitColIndex is only used for inner scans in the asm native path.
@@ -340,9 +340,9 @@ impl PackedStorage {
     #[cfg(all(feature = "jit", feature = "specialized"))]
     pub(crate) fn build_native_projection_with_total(
         &self,
-        total: Box<crate::jit::storage::JitRelData>,
-    ) -> crate::jit::storage::JitNativeRelData {
-        use crate::jit::storage::{JitNativeRelData, JitRelData};
+        total: Box<crate::eval::jit::storage::JitRelData>,
+    ) -> crate::eval::jit::storage::JitNativeRelData {
+        use crate::eval::jit::storage::{JitNativeRelData, JitRelData};
         let arity = self.arity;
         let build_indices = self.jit_is_edb && !self.jit_is_sink;
         let recent = if self.jit_is_sink {
@@ -484,7 +484,7 @@ impl PackedStorage {
         };
 
         // Dedup via jit_dedup (also probed inline by JIT code)
-        let hash = crate::jit_index::jit_dedup_hash(&packed);
+        let hash = crate::eval::jit_index::jit_dedup_hash(&packed);
         if !self.jit_dedup.insert_if_new(hash, &packed) {
             return Ok(false);
         }
@@ -523,7 +523,7 @@ impl PackedStorage {
             return true;
         }
 
-        let hash = crate::jit_index::jit_dedup_hash(packed);
+        let hash = crate::eval::jit_index::jit_dedup_hash(packed);
         if !self.jit_dedup.insert_if_new(hash, packed) {
             return false;
         }
@@ -548,7 +548,7 @@ impl PackedStorage {
             return false;
         };
 
-        let hash = crate::jit_index::jit_dedup_hash(&packed);
+        let hash = crate::eval::jit_index::jit_dedup_hash(&packed);
         self.jit_dedup.probe(hash, &packed)
     }
 
@@ -558,7 +558,7 @@ impl PackedStorage {
         if self.arity == 0 {
             return self.count > 0;
         }
-        let hash = crate::jit_index::jit_dedup_hash(packed);
+        let hash = crate::eval::jit_index::jit_dedup_hash(packed);
         self.jit_dedup.probe(hash, packed)
     }
 
@@ -640,7 +640,7 @@ impl PackedStorage {
             // NLL: `native` is last used here; the borrow ends at this point, allowing
             // the `insert_packed_raw_native_flush` calls below to take `&mut self`.
             let data_ptr: *const u32 = native.new.data;
-            let new_buf_ptr: *mut crate::jit::storage::JitRelData =
+            let new_buf_ptr: *mut crate::eval::jit::storage::JitRelData =
                 std::ptr::addr_of_mut!(*native.new);
             if new_len > 0 {
                 if arity == 0 {
@@ -673,7 +673,7 @@ impl PackedStorage {
                     }
                     for i in 0..new_len {
                         let tuple = &data[i * arity..(i + 1) * arity];
-                        let hash = crate::jit_index::jit_dedup_hash(tuple);
+                        let hash = crate::eval::jit_index::jit_dedup_hash(tuple);
                         self.jit_dedup.insert(hash, tuple);
                     }
                 }
@@ -703,7 +703,7 @@ impl PackedStorage {
         // the first run. After that, this block keeps it fresh on every fixpoint iteration.
         // build_indices=false projections (recent buffers) never build JitColIndex.
         if rebuild_jit_native && self.jit_native.is_some() {
-            use crate::jit::storage::JitRelData;
+            use crate::eval::jit::storage::JitRelData;
             let arity = self.arity;
             // Use the build_indices flag stored in jit_native to preserve lean vs full mode.
             let build_indices = self.jit_native.as_ref().unwrap().build_indices;
@@ -884,14 +884,14 @@ impl PackedStorage {
                                 (key, val)
                             })
                             .collect();
-                        crate::jit_index::JitHashIndex::build_contiguous(&pairs)
+                        crate::eval::jit_index::JitHashIndex::build_contiguous(&pairs)
                     })
                     .collect();
                 self.jit_index_is_edb_fmt = true;
             } else {
                 if self.jit_indices.is_empty() {
                     self.jit_indices = (0..self.arity)
-                        .map(|_| crate::jit_index::JitHashIndex::empty())
+                        .map(|_| crate::eval::jit_index::JitHashIndex::empty())
                         .collect();
                 }
                 for idx in self.jit_full_indexed_count..self.count {
@@ -917,7 +917,7 @@ impl PackedStorage {
         let arity = self.arity;
         let is_edb = self.jit_is_edb;
         if self.jit_recent_indices.len() != arity {
-            self.jit_recent_indices.resize_with(arity, crate::jit_index::JitHashIndex::empty);
+            self.jit_recent_indices.resize_with(arity, crate::eval::jit_index::JitHashIndex::empty);
         }
         if is_edb {
             for col in 0..arity {
@@ -934,7 +934,7 @@ impl PackedStorage {
                     })
                     .collect();
                 self.jit_recent_indices[col] =
-                    crate::jit_index::JitHashIndex::build_contiguous(&pairs);
+                    crate::eval::jit_index::JitHashIndex::build_contiguous(&pairs);
             }
         } else {
             for col in 0..arity {
@@ -1054,7 +1054,7 @@ impl PackedStorage {
         let mut new_value_data = Vec::with_capacity(self.value_data.len());
         let mut new_packed_data = Vec::with_capacity(self.packed_data.len());
         let mut new_sources = Vec::with_capacity(self.source_tags.len());
-        let mut new_jit_dedup = crate::jit_index::JitDedupTable::new(arity);
+        let mut new_jit_dedup = crate::eval::jit_index::JitDedupTable::new(arity);
         let mut new_indices: Vec<FxHashMap<u32, Vec<usize>>> =
             (0..arity).map(|_| FxHashMap::default()).collect();
         let mut new_count = 0;
@@ -1075,7 +1075,7 @@ impl PackedStorage {
                 new_indices[col].entry(p).or_default().push(idx);
             }
 
-            let hash = crate::jit_index::jit_dedup_hash(packed_tuple);
+            let hash = crate::eval::jit_index::jit_dedup_hash(packed_tuple);
             new_jit_dedup.insert(hash, packed_tuple);
 
             new_count += 1;
@@ -1098,7 +1098,7 @@ impl PackedStorage {
     ///
     /// Called when a packed relation receives a value that can't be packed
     /// (type mismatch), requiring fallback to generic storage.
-    pub fn into_generic(self) -> crate::relation::RelationStorage {
+    pub fn into_generic(self) -> crate::eval::relation::RelationStorage {
         use std::hash::{Hash, Hasher};
 
         let arity = self.arity;
@@ -1141,7 +1141,7 @@ impl PackedStorage {
         // Build recent_set from recent for generic storage (PackedStorage no longer tracks it).
         let recent_set: FxHashSet<usize> = self.recent.iter().copied().collect();
 
-        crate::relation::RelationStorage {
+        crate::eval::relation::RelationStorage {
             data: self.value_data,
             count: self.count,
             dedup,

@@ -1,9 +1,9 @@
 //! Tests for persisting engine state across runs.
 
-use ascent_eval::value::Value;
-use ascent_eval::{Engine, SourceId};
-use ascent_ir::Program;
-use ascent_syntax::AscentProgram;
+use ascent_interpreter::eval::value::Value;
+use ascent_interpreter::eval::{Engine, SourceId};
+use ascent_interpreter::ir::Program;
+use ascent_interpreter::syntax::AscentProgram;
 
 fn parse(input: &str) -> Program {
     let ast: AscentProgram = syn::parse_str(input).unwrap();

@@ -1,33 +1,29 @@
 # Embedding ascent-interpreter as a Rust Library
 
-This guide shows how to use `ascent-eval` as a library to parse, evaluate, and query Datalog programs from Rust code.
+This guide shows how to use `ascent-interpreter` as a library to parse, evaluate, and query Datalog programs from Rust code.
 
 ## 1. Setup
 
-Add the three crates to your `Cargo.toml`:
+Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ascent-eval = { git = "https://github.com/user/ascent-interpreter" }
-ascent-ir = { git = "https://github.com/user/ascent-interpreter" }
-ascent-syntax = { git = "https://github.com/user/ascent-interpreter" }
+ascent-interpreter = { git = "https://github.com/user/ascent-interpreter" }
 syn = "2"
 ```
 
-For local development, use path dependencies instead:
+For local development, use a path dependency instead:
 
 ```toml
 [dependencies]
-ascent-eval = { path = "../ascent-interpreter/crates/ascent-eval" }
-ascent-ir = { path = "../ascent-interpreter/crates/ascent-ir" }
-ascent-syntax = { path = "../ascent-interpreter/crates/ascent-syntax" }
+ascent-interpreter = { path = "../ascent-interpreter" }
 syn = "2"
 ```
 
 To enable the JIT compiler, add the `jit-asm` feature:
 
 ```toml
-ascent-eval = { path = "...", features = ["jit-asm"] }
+ascent-interpreter = { path = "...", features = ["jit-asm"] }
 ```
 
 ## 2. Basic Usage
@@ -35,9 +31,9 @@ ascent-eval = { path = "...", features = ["jit-asm"] }
 The full flow is: parse the source into an AST, lower to IR, create an engine, insert facts, run to fixpoint, and query results.
 
 ```rust
-use ascent_eval::{Engine, value::Value};
-use ascent_ir::Program;
-use ascent_syntax::AscentProgram;
+use ascent_interpreter::eval::{Engine, value::Value};
+use ascent_interpreter::ir::Program;
+use ascent_interpreter::syntax::AscentProgram;
 
 fn main() {
     // 1. Parse the Datalog source
@@ -92,7 +88,7 @@ The `Value` enum represents all runtime values. Create values with constructors,
 ### Creating values
 
 ```rust
-use ascent_eval::value::Value;
+use ascent_interpreter::eval::value::Value;
 
 // Primitive types
 let i = Value::I32(42);
@@ -249,7 +245,7 @@ The JIT compiler generates native x86-64 machine code for eligible rules, provid
 Enable the `jit-asm` feature in your `Cargo.toml`:
 
 ```toml
-ascent-eval = { path = "...", features = ["jit-asm"] }
+ascent-interpreter = { path = "...", features = ["jit-asm"] }
 ```
 
 The `jit-asm` feature implies `jit` and `specialized`.

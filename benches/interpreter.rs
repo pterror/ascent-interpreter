@@ -7,10 +7,10 @@
 
 use ascent::aggregators::min;
 use ascent::ascent;
-use ascent_eval::Engine;
-use ascent_eval::value::Value;
-use ascent_ir::Program;
-use ascent_syntax::AscentProgram;
+use ascent_interpreter::eval::Engine;
+use ascent_interpreter::eval::value::Value;
+use ascent_interpreter::ir::Program;
+use ascent_interpreter::syntax::AscentProgram;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 fn run_interpreter(input: &str) -> Engine {
@@ -544,7 +544,7 @@ fn bench_engine_overhead(c: &mut Criterion) {
 
     // Engine::new() + run but with insert-only (no fixpoint, measure setup)
     group.bench_function("fib20_insert_2_facts", |b| {
-        use ascent_eval::value::Value;
+        use ascent_interpreter::eval::value::Value;
         b.iter(|| {
             let mut engine = Engine::new(fib20_program.clone());
             engine.insert("fib", vec![Value::I32(0), Value::I32(0)]).unwrap();

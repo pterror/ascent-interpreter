@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use rustc_hash::FxHashMap;
 
-use crate::value::{InternTable, Value};
+use crate::eval::value::{InternTable, Value};
 
 /// Thread-local intern table for strings.
 ///

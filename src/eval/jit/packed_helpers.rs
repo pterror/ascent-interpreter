@@ -6,9 +6,9 @@
 //! bypassing the Value enum entirely. All bindings are flat `u32` arrays.
 //! This eliminates Value cloning, Option<Value> overhead, and enum dispatch.
 
-use crate::jit::storage::{self, JitRelData};
-use crate::jit_index::{JitDedupHandle, JitLookupHandle};
-use crate::specialized::PackedStorage;
+use crate::eval::jit::storage::{self, JitRelData};
+use crate::eval::jit_index::{JitDedupHandle, JitLookupHandle};
+use crate::eval::specialized::PackedStorage;
 
 /// Result of a packed index lookup — pointer + length to a `&[usize]`.
 #[repr(C)]
@@ -829,7 +829,7 @@ unsafe fn jit_stratum_advance_s4_inner(ctx: *mut StratumStage4Ctx) -> u8 {
     for i in 0..ctx.total_handles as usize {
         let spec = unsafe { &*ctx.lookup_specs.add(i) };
         let ps = unsafe { &*spec.rel };
-        let idx: &crate::jit_index::JitHashIndex = if spec.use_recent != 0 {
+        let idx: &crate::eval::jit_index::JitHashIndex = if spec.use_recent != 0 {
             &ps.jit_recent_indices[spec.col as usize]
         } else {
             &ps.jit_indices[spec.col as usize]

@@ -6,8 +6,8 @@
 //! # Example
 //!
 //! ```no_run
-//! use ascent_syntax::AscentProgram;
-//! use ascent_ir::Program;
+//! use ascent_interpreter::syntax::AscentProgram;
+//! use ascent_interpreter::ir::Program;
 //!
 //! let src = "relation edge(i32, i32); relation path(i32, i32); path(x,y) <-- edge(x,y);";
 //! let ast: AscentProgram = syn::parse_str(src).unwrap();
@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use ascent_syntax::{
+use crate::syntax::{
     AggClauseNode, AscentProgram, BodyClauseArg, BodyItemNode, CondClause, GeneratorNode,
     HeadClauseNode, HeadItemNode, RuleNode, desugar::desugar_program,
 };
@@ -545,7 +545,7 @@ impl BodyItem {
 }
 
 impl Clause {
-    fn from_ast(cl: ascent_syntax::BodyClauseNode) -> Result<Self, String> {
+    fn from_ast(cl: crate::syntax::BodyClauseNode) -> Result<Self, String> {
         let args = cl
             .args
             .into_iter()
@@ -579,7 +579,7 @@ impl Clause {
 
 impl Generator {
     fn from_ast(generator: GeneratorNode) -> Self {
-        let vars = ascent_syntax::pattern_get_vars(&generator.pattern)
+        let vars = crate::syntax::pattern_get_vars(&generator.pattern)
             .into_iter()
             .map(|i| i.to_string())
             .collect();
@@ -610,7 +610,7 @@ impl Condition {
 
 impl Aggregation {
     fn from_ast(agg: AggClauseNode) -> Self {
-        let result_vars = ascent_syntax::pattern_get_vars(&agg.pat)
+        let result_vars = crate::syntax::pattern_get_vars(&agg.pat)
             .into_iter()
             .map(|i| i.to_string())
             .collect();
@@ -618,12 +618,12 @@ impl Aggregation {
         let bound_vars = agg.bound_args.into_iter().map(|i| i.to_string()).collect();
 
         let aggregator = match agg.aggregator {
-            ascent_syntax::AggregatorNode::Path(p) => {
+            crate::syntax::AggregatorNode::Path(p) => {
                 let expr: syn::Expr = syn::parse2(quote::quote! { #p })
                     .expect("internal: aggregator path must parse as expression");
                 lower_expr(expr)
             }
-            ascent_syntax::AggregatorNode::Expr(e) => lower_expr(e),
+            crate::syntax::AggregatorNode::Expr(e) => lower_expr(e),
         };
 
         Aggregation {

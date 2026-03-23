@@ -2,22 +2,22 @@
 
 This page describes how the interpreter is organized and how data flows from source text to evaluated results.
 
-## Crate Structure
+## Module Structure
 
-| Crate | Purpose |
-|-------|---------|
-| `ascent-syntax` | Parser (syn-based) and desugaring passes |
-| `ascent-ir` | Intermediate representation, lowered from AST |
-| `ascent-eval` | Semi-naive evaluation engine with expression evaluator |
-| `ascent-interpreter` | CLI binary (REPL and file execution) |
+| Module | Purpose |
+|--------|---------|
+| `syntax` | Parser (syn-based) and desugaring passes |
+| `ir` | Intermediate representation, lowered from AST |
+| `eval` | Semi-naive evaluation engine with expression evaluator |
+| `main` | CLI binary (REPL and file execution) |
 
 ### Dependencies
 
 ```mermaid
 graph LR
-    interpreter["ascent-interpreter"] --> syntax["ascent-syntax"]
-    interpreter --> ir["ascent-ir"]
-    interpreter --> eval["ascent-eval"]
+    main --> syntax
+    main --> ir
+    main --> eval
     ir --> syntax
     eval --> ir
     eval --> syntax

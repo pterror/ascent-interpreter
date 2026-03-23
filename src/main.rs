@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::{env, fs};
 
-use ascent_eval::value::Value;
-use ascent_eval::{Engine, Relation};
-use ascent_ir::Program;
-use ascent_syntax::AscentProgram;
+use ascent_interpreter::eval::value::Value;
+use ascent_interpreter::eval::{Engine, Relation};
+use ascent_interpreter::ir::Program;
+use ascent_interpreter::syntax::AscentProgram;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -47,10 +47,10 @@ fn run_file(path: &str) {
     }
 }
 
-fn eval_source(source: &str) -> Result<Engine, ascent_eval::EvalError> {
+fn eval_source(source: &str) -> Result<Engine, ascent_interpreter::eval::EvalError> {
     let ast: AscentProgram =
-        syn::parse_str(source).map_err(|e| ascent_eval::EvalError::Parse(e.to_string()))?;
-    let program = Program::from_ast(ast).map_err(ascent_eval::EvalError::Lowering)?;
+        syn::parse_str(source).map_err(|e| ascent_interpreter::eval::EvalError::Parse(e.to_string()))?;
+    let program = Program::from_ast(ast).map_err(ascent_interpreter::eval::EvalError::Lowering)?;
     let mut engine = Engine::new(program);
     engine.run()?;
     Ok(engine)

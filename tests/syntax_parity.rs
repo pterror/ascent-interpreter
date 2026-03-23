@@ -9,7 +9,7 @@
 use ascent::Dual;
 use ascent::aggregators::{count, max, min, sum};
 use ascent::ascent;
-use ascent_syntax::AscentProgram;
+use ascent_interpreter::syntax::AscentProgram;
 
 /// Parse with our parser — panics with the input if it fails.
 fn must_parse(input: &str) -> AscentProgram {

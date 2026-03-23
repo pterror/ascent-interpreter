@@ -6,7 +6,7 @@ use std::hash::Hash;
 use proc_macro2::{Ident, Span};
 use syn::{Expr, Pat};
 
-use crate::syn_utils::path_get_ident_mut;
+use crate::syntax::syn_utils::path_get_ident_mut;
 
 /// Convert an iterator into a HashSet.
 pub fn into_set<T: Eq + Hash>(iter: impl IntoIterator<Item = T>) -> HashSet<T> {

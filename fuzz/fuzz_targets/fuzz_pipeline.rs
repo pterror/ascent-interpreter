@@ -7,8 +7,8 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use ascent_ir::Program;
-use ascent_syntax::AscentProgram;
+use ascent_interpreter::ir::Program;
+use ascent_interpreter::syntax::AscentProgram;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(input) = std::str::from_utf8(data) {

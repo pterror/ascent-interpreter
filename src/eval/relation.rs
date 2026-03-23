@@ -13,8 +13,8 @@ use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 #[cfg(feature = "specialized")]
-use crate::specialized::{PackedStorage, try_packed_col_types};
-use crate::value::{Tuple, Value};
+use crate::eval::specialized::{PackedStorage, try_packed_col_types};
+use crate::eval::value::{Tuple, Value};
 
 /// Opaque identifier for a fact source (file, REPL input, module, etc.).
 ///
@@ -785,7 +785,7 @@ impl Relation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::Value;
+    use crate::eval::value::Value;
 
     #[test]
     fn test_insert_and_contains() {

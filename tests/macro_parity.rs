@@ -3,10 +3,10 @@
 
 #![cfg(feature = "jit")]
 
-use ascent_eval::value::Value;
-use ascent_eval::Engine;
-use ascent_ir::Program;
-use ascent_syntax::AscentProgram as AstProgram;
+use ascent_interpreter::eval::value::Value;
+use ascent_interpreter::eval::Engine;
+use ascent_interpreter::ir::Program;
+use ascent_interpreter::syntax::AscentProgram as AstProgram;
 
 fn jit_run(src: &str, facts: &[(&str, Vec<Vec<Value>>)], rel: &str) -> Vec<Vec<Value>> {
     let ast: AstProgram = syn::parse_str(src).expect("parse");

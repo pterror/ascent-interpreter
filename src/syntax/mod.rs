@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```
-//! use ascent_syntax::AscentProgram;
+//! use ascent_interpreter::syntax::AscentProgram;
 //!
 //! let input = r#"
 //!     relation edge(i32, i32);
@@ -23,9 +23,9 @@
 
 pub mod desugar;
 mod syn_utils;
-mod syntax;
+mod ast;
 mod utils;
 
 pub use syn_utils::*;
-pub use syntax::*;
+pub use ast::*;
 pub use utils::{expr_to_ident, is_wildcard, pat_to_ident};

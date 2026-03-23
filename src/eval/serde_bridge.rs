@@ -11,7 +11,7 @@ use serde::de::{self, DeserializeSeed, SeqAccess, Visitor};
 use serde::ser::{self, SerializeStruct, SerializeTupleStruct};
 use serde::{Deserialize, Serialize};
 
-use crate::value::{InternTable, OrderedFloat, Value};
+use crate::eval::value::{InternTable, OrderedFloat, Value};
 
 /// Adapter that implements `Display` for an interned value, for use in serde.
 struct DisplayInterned<'a>(&'a dyn InternTable, u32);

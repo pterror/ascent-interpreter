@@ -6,8 +6,8 @@
 
 use proptest::prelude::*;
 
-use ascent_ir::{BodyItem, Program};
-use ascent_syntax::AscentProgram;
+use ascent_interpreter::ir::{BodyItem, Program};
+use ascent_interpreter::syntax::AscentProgram;
 
 // --- String generators (shared vocabulary with ascent-syntax proptest) ---
 
@@ -480,7 +480,7 @@ proptest! {
             prop_assert_eq!(cl.args.len(), num_wildcards);
             for (i, arg) in cl.args.iter().enumerate() {
                 prop_assert!(
-                    matches!(arg, ascent_ir::ClauseArg::Var(_)),
+                    matches!(arg, ascent_interpreter::ir::ClauseArg::Var(_)),
                     "wildcard at position {} should become a Var in IR, got {:?}",
                     i,
                     arg,

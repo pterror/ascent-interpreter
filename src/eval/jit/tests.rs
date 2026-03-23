@@ -1,9 +1,9 @@
 //! Tests for the JIT compiler.
 
-use crate::Engine;
-use crate::value::Value;
-use ascent_ir::Program;
-use ascent_syntax::AscentProgram;
+use crate::eval::Engine;
+use crate::eval::value::Value;
+use crate::ir::Program;
+use crate::syntax::AscentProgram;
 
 /// Run a program with JIT and without, assert same results.
 fn assert_jit_equivalence(input: &str, facts: &[(&str, Vec<Vec<Value>>)], query_rel: &str) {

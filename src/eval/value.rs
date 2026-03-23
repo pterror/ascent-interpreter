@@ -5,7 +5,7 @@
 //! Creating values:
 //!
 //! ```
-//! use ascent_eval::value::Value;
+//! use ascent_interpreter::eval::value::Value;
 //!
 //! let i = Value::I32(42);
 //! let b = Value::Bool(true);
@@ -15,7 +15,7 @@
 //! Arithmetic (wrapping):
 //!
 //! ```
-//! use ascent_eval::value::Value;
+//! use ascent_interpreter::eval::value::Value;
 //!
 //! let result = Value::I32(10).add(&Value::I32(20));
 //! assert_eq!(result, Some(Value::I32(30)));
@@ -24,7 +24,7 @@
 //! Comparison:
 //!
 //! ```
-//! use ascent_eval::value::Value;
+//! use ascent_interpreter::eval::value::Value;
 //! use std::cmp::Ordering;
 //!
 //! let ord = Value::I32(1).try_cmp(&Value::I32(2));
@@ -39,8 +39,8 @@ use std::rc::Rc;
 
 /// Intern table for packing/unpacking values to/from u32 identifiers.
 ///
-/// Implemented by [`crate::intern::StringTable`] for strings and by
-/// [`crate::specialized::HashInternTable`] for arbitrary `Hash + Eq` types.
+/// Implemented by [`crate::eval::intern::StringTable`] for strings and by
+/// [`crate::eval::specialized::HashInternTable`] for arbitrary `Hash + Eq` types.
 /// Values that carry their own intern id (i.e. `Value::Interned`) use the
 /// table for display, comparison, and packed-storage round-trips.
 pub trait InternTable {
@@ -452,7 +452,7 @@ impl Value {
 
     /// Create a string value (interns the string in the thread-local string table).
     pub fn string(s: impl AsRef<str>) -> Self {
-        crate::intern::string_value(s.as_ref())
+        crate::eval::intern::string_value(s.as_ref())
     }
 
     /// Try to get as i32.

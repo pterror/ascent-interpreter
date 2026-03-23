@@ -62,9 +62,9 @@ triangle (4 tuples):
 ## Embedding as a Library
 
 ```rust
-use ascent_eval::{Engine, value::Value};
-use ascent_ir::Program;
-use ascent_syntax::AscentProgram;
+use ascent_interpreter::eval::{Engine, value::Value};
+use ascent_interpreter::ir::Program;
+use ascent_interpreter::syntax::AscentProgram;
 
 let input = r#"
     relation edge(i32, i32);
@@ -119,14 +119,14 @@ cargo bench --features jit
 
 ## Architecture
 
-The project is split into four crates:
+The project is organized into modules:
 
-| Crate | Role |
-|-------|------|
-| `ascent-syntax` | Parser (syn-based) and desugaring of Ascent Datalog syntax |
-| `ascent-ir` | Intermediate representation lowered from the AST |
-| `ascent-eval` | Semi-naive evaluation engine, expression evaluator, and JIT compiler |
-| `ascent-interpreter` | CLI binary (REPL + file execution) |
+| Module | Role |
+|--------|------|
+| `syntax` | Parser (syn-based) and desugaring of Ascent Datalog syntax |
+| `ir` | Intermediate representation lowered from the AST |
+| `eval` | Semi-naive evaluation engine, expression evaluator, and JIT compiler |
+| `main` | CLI binary (REPL + file execution) |
 
 ## Development
 
