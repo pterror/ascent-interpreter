@@ -10,9 +10,9 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/pterror/ascent-interpreter"
 
 [workspace.dependencies]
-ascent-syntax = { path = "crates/ascent-syntax" }
-ascent-ir = { path = "crates/ascent-ir" }
-ascent-eval = { path = "crates/ascent-eval" }
+ascent-syntax = { version = "0.1.0", path = "crates/ascent-syntax" }
+ascent-ir = { version = "0.1.0", path = "crates/ascent-ir" }
+ascent-eval = { version = "0.1.0", path = "crates/ascent-eval" }
 
 syn = { version = "2.0", features = ["full", "derive", "extra-traits", "visit-mut"] }
 proc-macro2 = "1.0"
