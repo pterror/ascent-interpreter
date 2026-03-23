@@ -77,6 +77,10 @@ impl InternTable for StringTable {
     fn resolve_str(&self, id: u32) -> Option<&str> {
         Some(self.resolve(id))
     }
+
+    fn type_name(&self) -> &str {
+        "String"
+    }
 }
 
 thread_local! {

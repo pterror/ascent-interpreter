@@ -152,24 +152,17 @@ pub fn lower_expr(expr: syn::Expr) -> IrExpr {
         syn::Expr::Paren(p) => lower_expr(*p.expr),
         syn::Expr::Reference(r) => lower_expr(*r.expr),
         syn::Expr::Range(r) => {
-            let start = r.start.map(|e| Box::new(lower_expr(*e)));
-            let end = r.end.map(|e| Box::new(lower_expr(*e)));
-            match (start, end) {
-                (Some(s), Some(e)) => IrExpr::Range {
-                    start: s,
-                    end: e,
+            if r.start.is_some() && r.end.is_some() {
+                let start = Box::new(lower_expr(*r.start.unwrap()));
+                let end = Box::new(lower_expr(*r.end.unwrap()));
+                IrExpr::Range {
+                    start,
+                    end,
                     inclusive: matches!(r.limits, syn::RangeLimits::Closed(_)),
-                },
-                _ => IrExpr::Raw(
-                    syn::Expr::Range(syn::ExprRange {
-                        attrs: r.attrs,
-                        start: None,
-                        limits: r.limits,
-                        end: None,
-                    })
-                    .to_token_stream()
-                    .to_string(),
-                ),
+                }
+            } else {
+                // Half-open ranges (..5, 3.., ..): preserve the original expression
+                IrExpr::Raw(syn::Expr::Range(r).to_token_stream().to_string())
             }
         }
         syn::Expr::Tuple(t) => IrExpr::Tuple(t.elems.into_iter().map(lower_expr).collect()),

@@ -56,4 +56,4 @@ pub use eval::{Engine, TypeRegistry, ValueDestructor};
 #[cfg(feature = "jit")]
 pub use eval::SharedJitCompiler;
 pub use relation::{Relation, SourceId};
-pub use value::{DynValue, Tuple, Value};
+pub use value::{DynValue, OrderedFloat, Tuple, Value};

@@ -448,7 +448,7 @@ impl Engine {
     ///         Some(Value::custom(MyPoint { x, y }))
     ///     },
     ///     |val| {
-    ///         let p = Engine::downcast_custom::<MyPoint>(val)?;
+    ///         let p = val.downcast_custom::<MyPoint>()?;
     ///         Some(vec![Value::I32(p.x), Value::I32(p.y)])
     ///     },
     /// );
@@ -3056,7 +3056,7 @@ impl Engine {
         self.register_type(
             name,
             |args| from_values::<T>(args).ok().map(Value::custom),
-            |val| Engine::downcast_custom::<T>(val).and_then(|t| to_values(t).ok()),
+            |val| val.downcast_custom::<T>().and_then(|t| to_values(t).ok()),
         );
     }
 }
@@ -3828,7 +3828,7 @@ mod tests {
                 Some(Value::custom(Point { x, y }))
             },
             |val| {
-                let p = Engine::downcast_custom::<Point>(val)?;
+                let p = val.downcast_custom::<Point>()?;
                 Some(vec![Value::I32(p.x), Value::I32(p.y)])
             },
         );
@@ -3844,7 +3844,7 @@ mod tests {
     #[test]
     fn test_downcast_custom() {
         let v = Value::custom(Point { x: 5, y: 10 });
-        let point = Engine::downcast_custom::<Point>(&v).unwrap();
+        let point = v.downcast_custom::<Point>().unwrap();
         assert_eq!(point.x, 5);
         assert_eq!(point.y, 10);
     }
@@ -3860,7 +3860,7 @@ mod tests {
                 Some(Value::custom(Point { x, y }))
             },
             |val| {
-                let p = Engine::downcast_custom::<Point>(val)?;
+                let p = val.downcast_custom::<Point>()?;
                 Some(vec![Value::I32(p.x), Value::I32(p.y)])
             },
         );

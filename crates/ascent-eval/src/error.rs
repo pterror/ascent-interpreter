@@ -4,6 +4,7 @@ use std::fmt;
 
 /// Errors that can occur during Datalog program evaluation.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum EvalError {
     /// A variable was referenced but not bound in the current scope.
     UndefinedVariable(String),

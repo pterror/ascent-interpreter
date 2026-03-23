@@ -364,8 +364,8 @@ pub fn expand_range(range: &Value) -> Option<Vec<Value>> {
         } => {
             let s = start.as_i64()?;
             let e = end.as_i64()?;
-            let size = if *inclusive { e - s + 1 } else { e - s };
-            if size > MAX_RANGE_SIZE {
+            let size = (e as i128) - (s as i128) + if *inclusive { 1 } else { 0 };
+            if size < 0 || size > MAX_RANGE_SIZE as i128 {
                 eprintln!(
                     "Warning: range {s}..{e} has {size} elements (limit {MAX_RANGE_SIZE}). \
                      Skipping expansion to prevent OOM."
