@@ -320,7 +320,12 @@ impl PackedStorage {
                     &recent_buf
                 }
             };
-            JitRelData::build_from_packed_no_tupleset(recent_data, arity, false)
+            // Build col_indices for recent when the relation needs them.  When the
+            // same EDB relation appears as both outer scan (level 0) and inner scan
+            // (level >= 1) in different rules/variants, the "recent" variant at the
+            // inner level probes col_indices.  For EDB, recent is typically empty
+            // after the first advance, so the index build is O(1).
+            JitRelData::build_from_packed_no_tupleset(recent_data, arity, build_indices)
         };
 
         JitNativeRelData {
@@ -370,7 +375,7 @@ impl PackedStorage {
                     &recent_buf
                 }
             };
-            JitRelData::build_from_packed_no_tupleset(recent_data, arity, false)
+            JitRelData::build_from_packed_no_tupleset(recent_data, arity, build_indices)
         };
         JitNativeRelData {
             total,
@@ -778,8 +783,9 @@ impl PackedStorage {
                 // `recent` JitRelData is never scanned by the JIT. Skip the rebuild
                 // entirely for them (keep existing data; it is never accessed).
                 if !self.jit_is_sink {
-                    // `recent` is only sequentially iterated (outer scan), never key-probed.
-                    // Skip JitColIndex (build_indices=false) to avoid O(n log n) sort cost.
+                    // `recent` may be key-probed when the same EDB relation appears as
+                    // both outer and inner scan in the recent variant.  Build col_indices
+                    // when the relation needs them (build_indices=true).
                     //
                     // Fast path: contiguous recent indices (always true after batch native
                     // flush) → direct slice into packed_data, no gather Vec needed.
@@ -807,7 +813,7 @@ impl PackedStorage {
                         }
                     };
                     native.recent =
-                        JitRelData::build_from_packed_no_tupleset(recent_data, arity, false);
+                        JitRelData::build_from_packed_no_tupleset(recent_data, arity, build_indices);
                 }
             }
         }

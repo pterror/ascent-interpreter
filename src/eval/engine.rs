@@ -1673,12 +1673,22 @@ impl Engine {
                             ps.build_native_projection()
                         };
                         ps.jit_native = Some(native);
-                    } else if !ps.delta.is_empty() {
-                        // jit_native was deep-cloned (PackedStorage::clone) and new facts were
-                        // inserted into delta since the clone.  advance_jit_skip_hash_indices
-                        // moves delta→recent and refreshes jit_native without rebuilding the
-                        // unused JitHashIndex.
-                        ps.advance_jit_skip_hash_indices();
+                    } else {
+                        // jit_native already exists.  Two cases:
+                        // 1. Delta is non-empty: deep-cloned (PackedStorage::clone) and new facts
+                        //    were inserted since the clone.  Advance to move delta→recent and
+                        //    refresh jit_native.
+                        // 2. build_indices mismatch: jit_native was built in an earlier stratum
+                        //    where jit_is_edb was false (e.g. fact stratum where the relation was
+                        //    a head), but this stratum uses the relation as an EDB body clause.
+                        //    Rebuild jit_native with col_indices so inner-clause probes work.
+                        if !ps.delta.is_empty() {
+                            ps.advance_jit_skip_hash_indices();
+                        }
+                        let needs_indices = ps.jit_is_edb && !ps.jit_is_sink;
+                        if needs_indices && !ps.jit_native.as_ref().unwrap().build_indices {
+                            ps.jit_native = Some(ps.build_native_projection());
+                        }
                     }
                 }
             }
@@ -1739,16 +1749,23 @@ impl Engine {
             }
         }
 
-        // All unique PackedStorage relations for advance.
+        // Unique PackedStorage relations involved in this stratum (scan + head).
+        // Only these relations need advancing during the fixpoint loop.
+        // Including ALL relations is incorrect: jit_advance_native builds jit_native
+        // for any relation with jit_native=None, but jit_is_edb may not be set correctly
+        // for relations outside the current stratum, causing col_indices to be missing.
         let mut advance_set: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         let mut advance_rels_vec: Vec<*mut PackedStorage> = Vec::new();
-        for (_, rel) in self.relations.iter() {
-            if let Relation::Packed(ps) = rel {
-                let ptr = ps as *const PackedStorage as *mut PackedStorage;
-                let addr = ptr as usize;
-                if advance_set.insert(addr) {
-                    advance_rels_vec.push(ptr);
-                }
+        for spec in &scan_specs_vec {
+            let addr = spec.rel as usize;
+            if advance_set.insert(addr) {
+                advance_rels_vec.push(spec.rel);
+            }
+        }
+        for spec in &head_specs_vec {
+            let addr = spec.rel as usize;
+            if advance_set.insert(addr) {
+                advance_rels_vec.push(spec.rel);
             }
         }
 

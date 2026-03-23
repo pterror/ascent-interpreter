@@ -2704,21 +2704,11 @@ fn emit_rule_variant(
         .map(|c| heads.iter().any(|h| h.relation == c.relation))
         .collect();
 
-    if clauses.is_empty() {
-        for expr in rule_conds {
-            emit_expr(asm, expr, &var_locs)?;
-            dynasm!(asm; test eax, eax; jz =>variant_exit);
-        }
-        emit_not_probes(asm, negations, 0, rule_i, &var_locs, variant_exit)?;
-        emit_aggregations(asm, aggs, 0, negations.len(), rule_i, variant_exit)?;
-        emit_heads(asm, heads, rule_i, var_count, max_head_arity, max_depth, pti, &var_locs, use_jit_native, rule_head_base, jit_rel_data_grow_addr, jit_tuple_set_grow_addr)?;
-        dynasm!(asm; =>variant_exit);
-        return Ok(());
-    }
-
     // Precompute NativeCtx array pointer cache for native path.
     // Caches total_rels, head_rels, head_total_rels from NativeCtx into stack slots
     // so inner loops use 1 load per pointer chain instead of 3 (ctx → array → rel).
+    // Must be done BEFORE the clauses.is_empty() early return, because emit_heads
+    // reads hr_slot / htr_slot for inline JitRelData writes.
     if use_jit_native {
         let tr_slot  = native_total_rels_slot(var_count, max_head_arity, max_depth);
         let hr_slot  = native_head_rels_slot(var_count, max_head_arity, max_depth);
@@ -2732,6 +2722,18 @@ fn emit_rule_variant(
             ; mov rax, [r8 + 56]   // NativeCtx.head_total_rels (offset 56)
             ; mov [rbp + htr_slot], rax
         );
+    }
+
+    if clauses.is_empty() {
+        for expr in rule_conds {
+            emit_expr(asm, expr, &var_locs)?;
+            dynasm!(asm; test eax, eax; jz =>variant_exit);
+        }
+        emit_not_probes(asm, negations, 0, rule_i, &var_locs, variant_exit)?;
+        emit_aggregations(asm, aggs, 0, negations.len(), rule_i, variant_exit)?;
+        emit_heads(asm, heads, rule_i, var_count, max_head_arity, max_depth, pti, &var_locs, use_jit_native, rule_head_base, jit_rel_data_grow_addr, jit_tuple_set_grow_addr)?;
+        dynasm!(asm; =>variant_exit);
+        return Ok(());
     }
 
     let p = EmitParams {
