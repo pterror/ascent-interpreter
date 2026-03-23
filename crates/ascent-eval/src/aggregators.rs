@@ -9,6 +9,11 @@ use crate::value::Value;
 pub type AggResult = Vec<Vec<Value>>;
 
 /// Apply a named aggregator to a stream of bound-variable tuples.
+///
+/// Unknown aggregator names produce an empty result (no tuples) and emit a
+/// warning to stderr. The return type is `AggResult` (not `Result`) so callers
+/// cannot distinguish "unknown aggregator" from "aggregator matched zero tuples"
+/// at the type level.
 pub fn apply_aggregator<'a>(name: &str, values: impl Iterator<Item = &'a [Value]>) -> AggResult {
     match name {
         "min" => agg_min(values),
@@ -78,19 +83,29 @@ fn agg_sum<'a>(values: impl Iterator<Item = &'a [Value]>) -> AggResult {
 
 /// `count()` - returns the number of tuples.
 fn agg_count(values: impl Iterator<Item = impl Sized>) -> AggResult {
-    vec![vec![Value::I32(values.count() as i32)]]
+    vec![vec![Value::I64(values.count() as i64)]]
 }
 
-/// `mean(x)` - returns the average as f64.
+/// `mean(x)` - returns the average of numeric values.
+///
+/// Returns `Value::I64` when all inputs are integers and the mean is exact,
+/// `Value::F64` when any input is a float or the integer mean has a remainder.
+/// Non-numeric values are counted but contribute zero to the sum.
 fn agg_mean<'a>(values: impl Iterator<Item = &'a [Value]>) -> AggResult {
     let mut count = 0usize;
-    let mut sum = 0.0f64;
+    let mut int_sum = 0i64;
+    let mut has_float = false;
+    let mut float_sum = 0.0f64;
     for tuple in values {
         count += 1;
-        if let Some(val) = tuple.first()
-            && let Some(n) = val.as_i64()
-        {
-            sum += n as f64;
+        if let Some(val) = tuple.first() {
+            if let Some(n) = val.as_i64() {
+                int_sum += n;
+                float_sum += n as f64;
+            } else if let Some(f) = val.as_f64() {
+                has_float = true;
+                float_sum += f;
+            }
         }
     }
 
@@ -98,9 +113,17 @@ fn agg_mean<'a>(values: impl Iterator<Item = &'a [Value]>) -> AggResult {
         return vec![];
     }
 
-    vec![vec![Value::F64(crate::value::OrderedFloat(
-        sum / count as f64,
-    ))]]
+    if has_float {
+        vec![vec![Value::F64(crate::value::OrderedFloat(
+            float_sum / count as f64,
+        ))]]
+    } else if int_sum % count as i64 == 0 {
+        vec![vec![Value::I64(int_sum / count as i64)]]
+    } else {
+        vec![vec![Value::F64(crate::value::OrderedFloat(
+            float_sum / count as f64,
+        ))]]
+    }
 }
 
 /// `not()` - negation aggregator. Returns `()` if no matching tuples.
@@ -164,21 +187,47 @@ mod tests {
             vec![Value::I32(30)],
         ];
         let result = agg_count(values.iter().map(|v| v.as_slice()));
-        assert_eq!(result, vec![vec![Value::I32(3)]]);
+        assert_eq!(result, vec![vec![Value::I64(3)]]);
     }
 
     #[test]
     fn test_count_empty() {
         let values: Vec<Vec<Value>> = vec![];
         let result = agg_count(values.iter().map(|v| v.as_slice()));
-        assert_eq!(result, vec![vec![Value::I32(0)]]);
+        assert_eq!(result, vec![vec![Value::I64(0)]]);
     }
 
     #[test]
-    fn test_mean() {
+    fn test_mean_exact_int() {
         let values: Vec<Vec<Value>> = vec![
             vec![Value::I32(2)],
             vec![Value::I32(4)],
+            vec![Value::I32(6)],
+        ];
+        let result = agg_mean(values.iter().map(|v| v.as_slice()));
+        assert_eq!(result, vec![vec![Value::I64(4)]]);
+    }
+
+    #[test]
+    fn test_mean_inexact_int() {
+        let values: Vec<Vec<Value>> = vec![
+            vec![Value::I32(1)],
+            vec![Value::I32(2)],
+        ];
+        let result = agg_mean(values.iter().map(|v| v.as_slice()));
+        assert_eq!(result.len(), 1);
+        if let Value::F64(crate::value::OrderedFloat(v)) = result[0][0] {
+            assert!((v - 1.5).abs() < f64::EPSILON);
+        } else {
+            panic!("expected f64 for inexact integer mean");
+        }
+    }
+
+    #[test]
+    fn test_mean_with_floats() {
+        let values: Vec<Vec<Value>> = vec![
+            vec![Value::I32(2)],
+            vec![Value::F64(crate::value::OrderedFloat(4.0))],
             vec![Value::I32(6)],
         ];
         let result = agg_mean(values.iter().map(|v| v.as_slice()));
@@ -186,7 +235,7 @@ mod tests {
         if let Value::F64(crate::value::OrderedFloat(v)) = result[0][0] {
             assert!((v - 4.0).abs() < f64::EPSILON);
         } else {
-            panic!("expected f64");
+            panic!("expected f64 when floats are present");
         }
     }
 

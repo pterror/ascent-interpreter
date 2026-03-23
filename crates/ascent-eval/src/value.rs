@@ -477,6 +477,7 @@ impl Value {
             Value::U8(v) => Some(*v as i64),
             Value::U16(v) => Some(*v as i64),
             Value::U32(v) => Some(*v as i64),
+            Value::Isize(v) => Some(*v as i64),
             _ => None,
         }
     }
@@ -757,22 +758,56 @@ impl Value {
         }
     }
 
+    /// Try to get as f64.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::F64(OrderedFloat(v)) => Some(*v),
+            Value::F32(OrderedFloat(v)) => Some(*v as f64),
+            _ => self.as_i64().map(|v| v as f64),
+        }
+    }
+
     /// Cast to a target type by name.
+    ///
+    /// Supports integer-to-integer, float-to-integer, and integer-to-float casts.
     pub fn cast_to(&self, target: &str) -> Option<Value> {
-        let v = self.as_i64()?;
+        // Try integer path first, then float-to-int fallback.
+        if let Some(v) = self.as_i64() {
+            return match target {
+                "i8" => Some(Value::I8(v as i8)),
+                "i16" => Some(Value::I16(v as i16)),
+                "i32" => Some(Value::I32(v as i32)),
+                "i64" => Some(Value::I64(v)),
+                "i128" => Some(Value::I128(v as i128)),
+                "isize" => Some(Value::Isize(v as isize)),
+                "u8" => Some(Value::U8(v as u8)),
+                "u16" => Some(Value::U16(v as u16)),
+                "u32" => Some(Value::U32(v as u32)),
+                "u64" => Some(Value::U64(v as u64)),
+                "u128" => Some(Value::U128(v as u128)),
+                "usize" => Some(Value::Usize(v as usize)),
+                "f32" => Some(Value::F32(OrderedFloat(v as f32))),
+                "f64" => Some(Value::F64(OrderedFloat(v as f64))),
+                _ => None,
+            };
+        }
+        // Float-to-integer fallback.
+        let f = self.as_f64()?;
         match target {
-            "i8" => Some(Value::I8(v as i8)),
-            "i16" => Some(Value::I16(v as i16)),
-            "i32" => Some(Value::I32(v as i32)),
-            "i64" => Some(Value::I64(v)),
-            "i128" => Some(Value::I128(v as i128)),
-            "isize" => Some(Value::Isize(v as isize)),
-            "u8" => Some(Value::U8(v as u8)),
-            "u16" => Some(Value::U16(v as u16)),
-            "u32" => Some(Value::U32(v as u32)),
-            "u64" => Some(Value::U64(v as u64)),
-            "u128" => Some(Value::U128(v as u128)),
-            "usize" => Some(Value::Usize(v as usize)),
+            "i8" => Some(Value::I8(f as i8)),
+            "i16" => Some(Value::I16(f as i16)),
+            "i32" => Some(Value::I32(f as i32)),
+            "i64" => Some(Value::I64(f as i64)),
+            "i128" => Some(Value::I128(f as i128)),
+            "isize" => Some(Value::Isize(f as isize)),
+            "u8" => Some(Value::U8(f as u8)),
+            "u16" => Some(Value::U16(f as u16)),
+            "u32" => Some(Value::U32(f as u32)),
+            "u64" => Some(Value::U64(f as u64)),
+            "u128" => Some(Value::U128(f as u128)),
+            "usize" => Some(Value::Usize(f as usize)),
+            "f32" => Some(Value::F32(OrderedFloat(f as f32))),
+            "f64" => Some(Value::F64(OrderedFloat(f))),
             _ => None,
         }
     }
