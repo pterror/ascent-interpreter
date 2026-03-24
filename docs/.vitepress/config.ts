@@ -15,6 +15,8 @@ export default withMermaid(
           text: "Guide",
           items: [
             { text: "Getting Started", link: "/guide/getting-started" },
+            { text: "Writing Programs", link: "/guide/writing-programs" },
+            { text: "Embedding", link: "/guide/embedding" },
           ],
         },
         {

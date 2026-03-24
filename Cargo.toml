@@ -29,6 +29,10 @@ specialized = []
 jit = []
 jit-asm = ["jit", "specialized", "dep:dynasmrt"]
 
+[package.metadata.docs.rs]
+all-features = false
+features = ["jit-asm", "serde"]
+
 [dev-dependencies]
 ascent = "0.8"
 criterion = { version = "0.5", features = ["html_reports"] }

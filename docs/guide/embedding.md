@@ -8,7 +8,7 @@ Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ascent-interpreter = { git = "https://github.com/user/ascent-interpreter" }
+ascent-interpreter = { git = "https://github.com/pterror/ascent-interpreter" }
 syn = "2"
 ```
 
