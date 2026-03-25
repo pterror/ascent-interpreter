@@ -240,6 +240,10 @@ points(Point(3, 4));
 
 The JIT compiler generates native x86-64 machine code for eligible rules, providing significant speedups for compute-heavy programs.
 
+::: warning Platform support
+The JIT backend requires **x86-64** (Intel/AMD 64-bit). On other architectures (e.g., Apple Silicon / aarch64), the `jit-asm` feature is automatically disabled at compile time and all rules fall back to the interpreter. No code changes are needed — `enable_jit()` is simply unavailable.
+:::
+
 ### Feature flags
 
 Enable the `jit-asm` feature in your `Cargo.toml`:
