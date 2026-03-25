@@ -12,12 +12,15 @@ pub(crate) mod asm_codegen;
 #[allow(unused_must_use)]
 mod tests;
 
+#[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 use rustc_hash::FxHashMap;
 
-#[cfg(feature = "specialized")]
+#[cfg(all(feature = "specialized", target_arch = "x86_64"))]
 use crate::eval::compiled::{CBinOp, CClauseArg, CExpr, CUnOp};
+#[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 use crate::eval::compiled::{CAggArg, CAggregation, CBodyItem, CCondition, CRule};
 
+#[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 impl std::fmt::Debug for JitCompiler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JitCompiler")
@@ -373,7 +376,7 @@ impl JitCompiler {
 }
 
 /// Check whether a CExpr can be compiled by the packed JIT condition emitter.
-#[cfg(feature = "specialized")]
+#[cfg(all(feature = "specialized", target_arch = "x86_64"))]
 fn is_supported_packed_expr(expr: &CExpr) -> bool {
     match expr {
         CExpr::Var(_) | CExpr::DerefVar(_) => true,
@@ -395,7 +398,7 @@ fn is_supported_packed_expr(expr: &CExpr) -> bool {
     }
 }
 
-#[cfg(feature = "specialized")]
+#[cfg(all(feature = "specialized", target_arch = "x86_64"))]
 fn is_supported_packed_binop(op: CBinOp) -> bool {
     matches!(
         op,
