@@ -629,6 +629,88 @@ fn bench_triangle_large(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── String Triangle (interned ordering comparison) ─────────────────
+
+fn string_triangle_source_no_facts() -> String {
+    String::from(
+        "relation edge(String, String);\n\
+         relation triangle(String, String, String);\n\
+         triangle(a, b, c) <-- edge(a, b), edge(b, c), edge(a, c), if a < b, if b < c;\n",
+    )
+}
+
+fn bench_string_triangle(c: &mut Criterion) {
+    let mut group = c.benchmark_group("string_triangle");
+
+    // Generate string node names: "n001", "n002", ..., "n{n}" (sorted order = ID order)
+    let make_names = |n: i32| -> Vec<String> {
+        (1..=n).map(|i| format!("n{i:03}")).collect()
+    };
+
+    for &n in &[10, 20] {
+        let names = make_names(n);
+
+        group.bench_with_input(BenchmarkId::new("interp_run_only", n), &n, |b, &n| {
+            let source = string_triangle_source_no_facts();
+            let program = prepare_program(&source);
+            let names = make_names(n);
+            b.iter(|| {
+                let mut engine = Engine::new(program.clone());
+                for i in 0..names.len() {
+                    for j in (i + 1)..names.len() {
+                        engine
+                            .insert(
+                                "edge",
+                                vec![Value::string(&names[i]), Value::string(&names[j])],
+                            )
+                            .unwrap();
+                    }
+                }
+                engine.run().unwrap();
+                engine
+            });
+        });
+
+        #[cfg(feature = "jit")]
+        group.bench_with_input(BenchmarkId::new("jit_hot", n), &n, |b, &_n| {
+            let source = string_triangle_source_no_facts();
+            let program = prepare_program(&source);
+            // Warmup: compile JIT once
+            let mut warmup = Engine::new(program.clone());
+            warmup.enable_jit().expect("JIT init should succeed");
+            for i in 0..names.len() {
+                for j in (i + 1)..names.len() {
+                    warmup
+                        .insert(
+                            "edge",
+                            vec![Value::string(&names[i]), Value::string(&names[j])],
+                        )
+                        .unwrap();
+                }
+            }
+            warmup.run().unwrap();
+            let compiled = warmup.share_jit_compiler().unwrap();
+            b.iter(|| {
+                let mut engine = Engine::new(program.clone());
+                engine.set_jit_compiler(compiled.clone());
+                for i in 0..names.len() {
+                    for j in (i + 1)..names.len() {
+                        engine
+                            .insert(
+                                "edge",
+                                vec![Value::string(&names[i]), Value::string(&names[j])],
+                            )
+                            .unwrap();
+                    }
+                }
+                engine.run().unwrap();
+                engine
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_transitive_closure,
@@ -636,6 +718,7 @@ criterion_group!(
     bench_triangle_large,
     bench_connected_components,
     bench_fibonacci,
-    bench_engine_overhead
+    bench_engine_overhead,
+    bench_string_triangle
 );
 criterion_main!(benches);

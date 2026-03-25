@@ -7,7 +7,7 @@ pub mod storage;
 #[cfg(feature = "specialized")]
 pub(crate) mod packed_helpers;
 #[cfg(feature = "jit-asm")]
-mod asm_codegen;
+pub(crate) mod asm_codegen;
 #[cfg(test)]
 #[allow(unused_must_use)]
 mod tests;
@@ -210,6 +210,7 @@ impl JitCompiler {
         &mut self,
         stratum_key: usize,
         rules: &[&CRule],
+        intern_cmps: &[asm_codegen::InternCmp],
     ) -> Option<packed_helpers::StratumStage4Fn> {
         if let Some(cached) = self.stratum_stage4_fn_cache.get(&stratum_key) {
             return *cached;
@@ -281,6 +282,7 @@ impl JitCompiler {
             packed_helpers::packed_count as usize,
             packed_helpers::packed_data_ptr as usize,
             packed_helpers::packed_recent_ptr as usize,
+            intern_cmps,
         ) {
             Ok(asm_stratum) => {
                 let fn_ptr = asm_stratum.fn_ptr;
@@ -305,6 +307,7 @@ impl JitCompiler {
         &mut self,
         stratum_key: usize,
         rules: &[&CRule],
+        intern_cmps: &[asm_codegen::InternCmp],
     ) -> Option<packed_helpers::StratumStage4Fn> {
         if let Some(cached) = self.stratum_stage4_native_fn_cache.get(&stratum_key) {
             return *cached;
@@ -350,6 +353,7 @@ impl JitCompiler {
             &rules_refs,
             self.var_count,
             packed_helpers::jit_advance_native as usize,
+            intern_cmps,
         ) {
             Ok(asm_stratum) => {
                 let fn_ptr = asm_stratum.fn_ptr;

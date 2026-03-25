@@ -54,6 +54,30 @@ const _: () = {
 
 // ─── Helpers called by JIT-generated code ───────────────────────────
 
+/// Compare two interned values by their semantic ordering (not raw ID order).
+///
+/// Reconstructs the `&dyn InternTable` from its fat pointer components and calls
+/// `cmp_ids(id_a, id_b)`. Returns -1 (Less), 0 (Equal), or 1 (Greater).
+///
+/// # Safety
+/// `data_ptr` and `vtable_ptr` must be the components of a valid `*const dyn InternTable`
+/// fat pointer that remains alive for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_cmp_interned(
+    id_a: u32,
+    id_b: u32,
+    data_ptr: usize,
+    vtable_ptr: usize,
+) -> i32 {
+    let table: &dyn crate::eval::value::InternTable =
+        unsafe { &*std::mem::transmute::<(usize, usize), *const dyn crate::eval::value::InternTable>((data_ptr, vtable_ptr)) };
+    match table.cmp_ids(id_a, id_b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
 /// Return the number of tuples (full count or recent count).
 ///
 /// # Safety

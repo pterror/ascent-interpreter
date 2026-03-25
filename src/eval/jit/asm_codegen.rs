@@ -55,10 +55,33 @@
 use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi, DynamicLabel};
 use dynasmrt::x64::Assembler;
 
+use rustc_hash::FxHashMap;
+
 use crate::eval::compiled::{CAggArg, CAggregation, CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CUnOp};
 use crate::eval::jit::packed_helpers::StratumStage4Fn;
 use crate::eval::jit::storage;
 use crate::eval::value::Value;
+
+/// Interned-type comparison context for JIT expression codegen.
+///
+/// When a VarId maps to an interned column, ordering comparisons (Lt/Le/Gt/Ge)
+/// must call `InternTable::cmp_ids` via the trampoline instead of raw `cmp eax, ecx`.
+pub(crate) struct InternCmp {
+    /// VarId → (data_ptr, vtable_ptr) for the intern table fat pointer.
+    pub vars: FxHashMap<u32, (usize, usize)>,
+    /// Address of `jit_cmp_interned` trampoline.
+    pub addr: usize,
+}
+
+impl InternCmp {
+    pub(crate) fn empty() -> Self {
+        InternCmp { vars: FxHashMap::default(), addr: 0 }
+    }
+}
+
+/// Default empty intern comparison context (no interned vars).
+static EMPTY_INTERN_CMP: std::sync::LazyLock<InternCmp> =
+    std::sync::LazyLock::new(InternCmp::empty);
 
 /// 5-tuple representing one rule for asm codegen:
 /// `(clauses, heads, conditions, not_clauses, agg_clauses)`.
@@ -924,7 +947,7 @@ fn emit_merge_scan_exist(
     // Clause L conditions
     for cond in &scan_clause.conditions {
         if let CCondition::If(expr) = cond {
-            emit_expr(asm, expr, p.var_locs)?;
+            emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
             dynasm!(asm; test eax, eax; jz =>merge_cont);
         }
     }
@@ -932,7 +955,7 @@ fn emit_merge_scan_exist(
     let exist_clause = &p.clauses[mp.exist_level];
     for cond in &exist_clause.conditions {
         if let CCondition::If(expr) = cond {
-            emit_expr(asm, expr, p.var_locs)?;
+            emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
             dynasm!(asm; test eax, eax; jz =>merge_cont);
         }
     }
@@ -940,7 +963,7 @@ fn emit_merge_scan_exist(
     if mp.exist_level + 1 == p.clauses.len() {
         // Terminal: emit rule-level conditions, anti-joins, and heads.
         for expr in p.rule_conds {
-            emit_expr(asm, expr, p.var_locs)?;
+            emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
             dynasm!(asm; test eax, eax; jz =>merge_cont);
         }
         emit_not_probes(
@@ -949,7 +972,7 @@ fn emit_merge_scan_exist(
         emit_heads(
             asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth,
             p.pti, p.var_locs, p.use_jit_native, p.rule_head_base,
-            p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr,
+            p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp,
         )?;
     } else {
         // Non-terminal: recurse into deeper level (exist_level+1).
@@ -1013,17 +1036,75 @@ fn head_col_slot(var_count: usize, max_head_arity: usize, col: usize) -> i32 {
     base + (col as i32) * 4
 }
 
+/// Emit an interned ordering comparison via the `jit_cmp_interned` trampoline.
+///
+/// Precondition: eax = id_a, ecx = id_b (the two intern IDs to compare).
+/// Emits a call to the trampoline and converts the result (-1/0/1) to a bool
+/// based on the ordering operator.
+fn emit_interned_cmp(
+    asm: &mut Assembler,
+    op: CBinOp,
+    data_ptr: usize,
+    vtable_ptr: usize,
+    cmp_addr: usize,
+) {
+    // Move IDs to arg registers before loading 64-bit table pointers.
+    // edi/esi must be set BEFORE rdx/rcx (rcx aliases ecx).
+    dynasm!(asm
+        ; mov edi, eax
+        ; mov esi, ecx
+        ; mov rdx, QWORD data_ptr as i64
+        ; mov rcx, QWORD vtable_ptr as i64
+    );
+    call_abs!(asm, cmp_addr);
+    // eax = -1 (Less), 0 (Equal), 1 (Greater)
+    match op {
+        CBinOp::Lt => dynasm!(asm; test eax, eax; setl al; movzx eax, al),
+        CBinOp::Le => dynasm!(asm; test eax, eax; setle al; movzx eax, al),
+        CBinOp::Gt => dynasm!(asm; test eax, eax; setg al; movzx eax, al),
+        CBinOp::Ge => dynasm!(asm; test eax, eax; setge al; movzx eax, al),
+        _ => unreachable!("emit_interned_cmp called with non-ordering op"),
+    }
+}
+
+/// For an ordering op on two operands, find the intern table fat pointer
+/// if either operand is an interned variable.
+fn find_interned_table_for_ordering(
+    op: CBinOp,
+    lhs_var: Option<u32>,
+    rhs_var: Option<u32>,
+    icmp: &InternCmp,
+) -> Option<(usize, usize)> {
+    if !matches!(op, CBinOp::Lt | CBinOp::Le | CBinOp::Gt | CBinOp::Ge) {
+        return None;
+    }
+    lhs_var
+        .and_then(|id| icmp.vars.get(&id))
+        .or_else(|| rhs_var.and_then(|id| icmp.vars.get(&id)))
+        .copied()
+}
+
 /// Emit expression → eax (i32). Clobbers rcx, rdx (not across calls).
+///
+/// For ordering comparisons on interned variables, emits a callback to
+/// `jit_cmp_interned` instead of raw `cmp eax, ecx` (which would compare
+/// intern IDs rather than semantic values).
 #[allow(clippy::only_used_in_recursion)]
-fn emit_expr(asm: &mut Assembler, expr: &CExpr, var_locs: &[VarLoc]) -> Result<(), String> {
+fn emit_expr(asm: &mut Assembler, expr: &CExpr, var_locs: &[VarLoc], icmp: &InternCmp) -> Result<(), String> {
     match expr {
         CExpr::Var(id) => emit_load_var(asm, var_locs, *id),
         CExpr::Literal(Value::I32(n)) => dynasm!(asm; mov eax, *n),
         CExpr::Literal(Value::Bool(b)) => dynasm!(asm; mov eax, if *b { 1i32 } else { 0i32 }),
         CExpr::VarBinVar(op, a, b) => {
-            emit_load_var(asm, var_locs, *a);
-            emit_load_var_ecx(asm, var_locs, *b);
-            emit_binop(asm, *op)?;
+            if let Some((data, vtable)) = find_interned_table_for_ordering(*op, Some(*a), Some(*b), icmp) {
+                emit_load_var(asm, var_locs, *a);
+                emit_load_var_ecx(asm, var_locs, *b);
+                emit_interned_cmp(asm, *op, data, vtable, icmp.addr);
+            } else {
+                emit_load_var(asm, var_locs, *a);
+                emit_load_var_ecx(asm, var_locs, *b);
+                emit_binop(asm, *op)?;
+            }
         }
         CExpr::VarBinLit(op, a, lit) => {
             emit_load_var(asm, var_locs, *a);
@@ -1044,22 +1125,29 @@ fn emit_expr(asm: &mut Assembler, expr: &CExpr, var_locs: &[VarLoc]) -> Result<(
             emit_binop(asm, *op)?;
         }
         CExpr::Binary(op, a, b) => {
-            emit_expr(asm, b, var_locs)?;
+            emit_expr(asm, b, var_locs, icmp)?;
             dynasm!(asm; push rax);
-            emit_expr(asm, a, var_locs)?;
+            emit_expr(asm, a, var_locs, icmp)?;
             dynasm!(asm; pop rcx);
-            emit_binop(asm, *op)?;
+            // For Binary with ordering ops, check if sub-exprs reference interned vars.
+            let lhs_var = match a.as_ref() { CExpr::Var(id) | CExpr::DerefVar(id) => Some(*id), _ => None };
+            let rhs_var = match b.as_ref() { CExpr::Var(id) | CExpr::DerefVar(id) => Some(*id), _ => None };
+            if let Some((data, vtable)) = find_interned_table_for_ordering(*op, lhs_var, rhs_var, icmp) {
+                emit_interned_cmp(asm, *op, data, vtable, icmp.addr);
+            } else {
+                emit_binop(asm, *op)?;
+            }
         }
         CExpr::DerefVar(id) => emit_load_var(asm, var_locs, *id),
         CExpr::Unary(CUnOp::Not, i) => {
-            emit_expr(asm, i, var_locs)?;
+            emit_expr(asm, i, var_locs, icmp)?;
             dynasm!(asm; xor eax, 1i8);
         }
         CExpr::Unary(CUnOp::Neg, i) => {
-            emit_expr(asm, i, var_locs)?;
+            emit_expr(asm, i, var_locs, icmp)?;
             dynasm!(asm; neg eax);
         }
-        CExpr::Unary(CUnOp::Deref, i) => emit_expr(asm, i, var_locs)?,
+        CExpr::Unary(CUnOp::Deref, i) => emit_expr(asm, i, var_locs, icmp)?,
         _ => return Err(format!("asm: unsupported expr: {expr:?}")),
     }
     Ok(())
@@ -1194,6 +1282,7 @@ fn emit_heads(
     rule_head_base: usize,
     jit_rel_data_grow_addr: usize,
     jit_tuple_set_grow_addr: usize,
+    icmp: &InternCmp,
 ) -> Result<(), String> {
     // Precompute native ctx array-ptr cache slots (used throughout native write path).
     let hr_slot  = if use_jit_native { native_head_rels_slot(var_count, max_head_arity, max_depth) } else { 0 };
@@ -1205,7 +1294,7 @@ fn emit_heads(
         let t0_off = head_col_slot(var_count, max_head_arity, 0);
 
         for (col, arg) in head.args.iter().enumerate() {
-            emit_expr(asm, arg, var_locs)?;
+            emit_expr(asm, arg, var_locs, icmp)?;
             dynasm!(asm; mov [rbp + head_col_slot(var_count, max_head_arity, col)], eax);
         }
 
@@ -1599,6 +1688,8 @@ struct EmitParams<'a> {
     /// Negation (anti-join) clauses for this rule.
     /// `rels[clauses.len() + i]` points to the i-th negated relation.
     negations: &'a [CAggregation],
+    /// Interned-type comparison context for ordering ops on interned columns.
+    intern_cmp: &'a InternCmp,
 }
 
 /// Emit anti-join probes for all negation clauses of a rule.
@@ -1840,7 +1931,7 @@ fn emit_col_value_simd_prefix(
     for (idx, cond) in clause.conditions.iter().enumerate() {
         if idx == filter.skip_cond { continue; }
         if let CCondition::If(expr) = cond {
-            emit_expr(asm, expr, p.var_locs)?;
+            emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
             dynasm!(asm; test eax, eax; jz =>simd_elem_continue);
         }
     }
@@ -1848,11 +1939,11 @@ fn emit_col_value_simd_prefix(
     // Emit level+1 body or (if last clause) rule conditions and heads.
     if level + 1 == p.clauses.len() {
         for expr in p.rule_conds {
-            emit_expr(asm, expr, p.var_locs)?;
+            emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
             dynasm!(asm; test eax, eax; jz =>simd_elem_continue);
         }
         emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, simd_elem_continue)?;
-        emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
+        emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
     } else {
         let simd_sub_exhausted = asm.new_dynamic_label();
         emit_clause_level(asm, p, level + 1, outer_exit, simd_sub_exhausted)?;
@@ -1980,18 +2071,18 @@ fn emit_clause_level(
             // Clause0 conditions
             for cond in &clause.conditions {
                 if let CCondition::If(expr) = cond {
-                    emit_expr(asm, expr, p.var_locs)?;
+                    emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                     dynasm!(asm; test eax, eax; jz =>outer_continue);
                 }
             }
 
             if p.clauses.len() == 1 {
                 for expr in p.rule_conds {
-                    emit_expr(asm, expr, p.var_locs)?;
+                    emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                     dynasm!(asm; test eax, eax; jz =>outer_continue);
                 }
                 emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, outer_continue)?;
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
             } else {
                 emit_clause_level(asm, p, 1, outer_exit, outer_continue)?;
             }
@@ -2049,7 +2140,7 @@ fn emit_clause_level(
         // Clause0 conditions
         for cond in &clause.conditions {
             if let CCondition::If(expr) = cond {
-                emit_expr(asm, expr, p.var_locs)?;
+                emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                 dynasm!(asm; test eax, eax; jz =>outer_continue);
             }
         }
@@ -2057,11 +2148,11 @@ fn emit_clause_level(
         if p.clauses.len() == 1 {
             // 1-clause rule: emit rule conditions and heads here
             for expr in p.rule_conds {
-                emit_expr(asm, expr, p.var_locs)?;
+                emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                 dynasm!(asm; test eax, eax; jz =>outer_continue);
             }
             emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, outer_continue)?;
-            emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
+            emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
         } else {
             // Multi-clause: recurse into level 1.
             // The level-1 code is emitted inline here; it ends by jumping to
@@ -2135,13 +2226,19 @@ fn emit_clause_level(
                 && !clause.bound_cols.is_empty();
             if use_col_scan {
                 emit_native_edb_full_probe(asm, p, level, clause, when_exhausted)?;
+                for cond in &clause.conditions {
+                    if let CCondition::If(expr) = cond {
+                        emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
+                        dynasm!(asm; test eax, eax; jz =>when_exhausted);
+                    }
+                }
                 if level + 1 == p.clauses.len() {
                     for expr in p.rule_conds {
-                        emit_expr(asm, expr, p.var_locs)?;
+                        emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                         dynasm!(asm; test eax, eax; jz =>when_exhausted);
                     }
                     emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, when_exhausted)?;
-                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
+                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
                     dynasm!(asm; jmp =>when_exhausted);
                 } else {
                     emit_clause_level(asm, p, level + 1, outer_exit, when_exhausted)?;
@@ -2155,13 +2252,19 @@ fn emit_clause_level(
             } else { None };
             if emit_tuple_set_probe(asm, clause, handle_idx_in_buf, when_exhausted, p.var_locs, native_total_for_probe).is_ok() {
                 // Probe succeeded (emitted inline code). Fall through means found.
+                for cond in &clause.conditions {
+                    if let CCondition::If(expr) = cond {
+                        emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
+                        dynasm!(asm; test eax, eax; jz =>when_exhausted);
+                    }
+                }
                 if level + 1 == p.clauses.len() {
                     for expr in p.rule_conds {
-                        emit_expr(asm, expr, p.var_locs)?;
+                        emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                         dynasm!(asm; test eax, eax; jz =>when_exhausted);
                     }
                     emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, when_exhausted)?;
-                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
+                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
                     dynasm!(asm; jmp =>when_exhausted);
                 } else {
                     emit_clause_level(asm, p, level + 1, outer_exit, when_exhausted)?;
@@ -2196,7 +2299,7 @@ fn emit_clause_level(
                 dynasm!(asm; mov ecx, *n);
             }
             CClauseArg::Expr(expr) => {
-                emit_expr(asm, expr, p.var_locs)?;
+                emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                 dynasm!(asm; mov ecx, eax);
             }
         }
@@ -2466,18 +2569,18 @@ fn emit_clause_level(
 
             for cond in &clause.conditions {
                 if let CCondition::If(expr) = cond {
-                    emit_expr(asm, expr, p.var_locs)?;
+                    emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
             }
 
             if level + 1 == p.clauses.len() {
                 for expr in p.rule_conds {
-                    emit_expr(asm, expr, p.var_locs)?;
+                    emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
                 emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, inner_continue)?;
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
                 if is_col_value && clause.fresh_cols.is_empty() {
                     dynasm!(asm; jmp =>when_exhausted);
                 }
@@ -2570,18 +2673,18 @@ fn emit_clause_level(
 
             for cond in &clause.conditions {
                 if let CCondition::If(expr) = cond {
-                    emit_expr(asm, expr, p.var_locs)?;
+                    emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
             }
 
             if level + 1 == p.clauses.len() {
                 for expr in p.rule_conds {
-                    emit_expr(asm, expr, p.var_locs)?;
+                    emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
                 emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, inner_continue)?;
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr)?;
+                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
             } else {
                 let sub_exhausted = asm.new_dynamic_label();
                 emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
@@ -2682,6 +2785,7 @@ fn emit_rule_variant(
     use_jit_native: bool,
     jit_rel_data_grow_addr: usize,
     jit_tuple_set_grow_addr: usize,
+    intern_cmp: &InternCmp,
 ) -> Result<(), String> {
     let variant_exit = asm.new_dynamic_label();
 
@@ -2726,12 +2830,12 @@ fn emit_rule_variant(
 
     if clauses.is_empty() {
         for expr in rule_conds {
-            emit_expr(asm, expr, &var_locs)?;
+            emit_expr(asm, expr, &var_locs, intern_cmp)?;
             dynasm!(asm; test eax, eax; jz =>variant_exit);
         }
         emit_not_probes(asm, negations, 0, rule_i, &var_locs, variant_exit)?;
         emit_aggregations(asm, aggs, 0, negations.len(), rule_i, variant_exit)?;
-        emit_heads(asm, heads, rule_i, var_count, max_head_arity, max_depth, pti, &var_locs, use_jit_native, rule_head_base, jit_rel_data_grow_addr, jit_tuple_set_grow_addr)?;
+        emit_heads(asm, heads, rule_i, var_count, max_head_arity, max_depth, pti, &var_locs, use_jit_native, rule_head_base, jit_rel_data_grow_addr, jit_tuple_set_grow_addr, intern_cmp)?;
         dynasm!(asm; =>variant_exit);
         return Ok(());
     }
@@ -2757,6 +2861,7 @@ fn emit_rule_variant(
         jit_rel_data_grow_addr,
         jit_tuple_set_grow_addr,
         negations,
+        intern_cmp,
     };
 
     emit_clause_level(asm, &p, 0, variant_exit, variant_exit)?;
@@ -2790,6 +2895,7 @@ fn codegen_stratum_asm_inner(
     use_jit_native: bool,
     jit_rel_data_grow_addr: usize,
     jit_tuple_set_grow_addr: usize,
+    intern_cmps: &[InternCmp],
 ) -> Result<AsmStratum, String> {
     // ── Eligibility ──────────────────────────────────────────────────────────
     if var_count > 10_000 {
@@ -2902,6 +3008,7 @@ fn codegen_stratum_asm_inner(
 
     // Full variants
     for (rule_i, (clauses, heads, conds, nots, aggs)) in rules.iter().enumerate() {
+        let icmp = intern_cmps.get(rule_i).unwrap_or(&EMPTY_INTERN_CMP);
         emit_rule_variant(
             &mut asm, rule_i, clauses, heads, conds, nots, aggs, None,
             var_count, max_head_arity, max_depth,
@@ -2912,6 +3019,7 @@ fn codegen_stratum_asm_inner(
             use_jit_native,
             jit_rel_data_grow_addr,
             jit_tuple_set_grow_addr,
+            icmp,
         )?;
     }
 
@@ -2925,6 +3033,7 @@ fn codegen_stratum_asm_inner(
     dynasm!(asm; =>inner_hdr);
 
     for (rule_i, (clauses, heads, conds, nots, aggs)) in rules.iter().enumerate() {
+        let icmp = intern_cmps.get(rule_i).unwrap_or(&EMPTY_INTERN_CMP);
         for clause_seq in 0..clauses.len() {
             emit_rule_variant(
                 &mut asm, rule_i, clauses, heads, conds, nots, aggs, Some(clause_seq),
@@ -2936,6 +3045,7 @@ fn codegen_stratum_asm_inner(
                 use_jit_native,
                 jit_rel_data_grow_addr,
                 jit_tuple_set_grow_addr,
+                icmp,
             )?;
         }
     }
@@ -2967,6 +3077,7 @@ fn codegen_stratum_asm_inner(
 ///
 /// `rules` is a 4-tuple per rule: `(clauses, heads, conditions, not_clauses)`.
 /// Not-clauses are anti-join checks emitted before head insertion.
+#[allow(clippy::too_many_arguments)]
 pub fn codegen_stratum_asm(
     rules: &[AsmRuleRef<'_>],
     var_count: usize,
@@ -2975,6 +3086,7 @@ pub fn codegen_stratum_asm(
     packed_count_addr: usize,
     packed_data_ptr_addr: usize,
     packed_recent_ptr_addr: usize,
+    intern_cmps: &[InternCmp],
 ) -> Result<AsmStratum, String> {
     codegen_stratum_asm_inner(
         rules, var_count,
@@ -2986,6 +3098,7 @@ pub fn codegen_stratum_asm(
         false,
         0, // jit_rel_data_grow_addr unused in non-native path
         0, // jit_tuple_set_grow_addr unused in non-native path
+        intern_cmps,
     )
 }
 
@@ -3003,6 +3116,7 @@ pub fn codegen_stratum_asm_native(
     rules: &[(&[CClause], &[CHeadClause], &[CExpr])],
     var_count: usize,
     advance_native_addr: usize,
+    intern_cmps: &[InternCmp],
 ) -> Result<AsmStratum, String> {
     // Native path has no negation support; wrap 3-tuples with empty not-slices.
     let rules_with_nots: Vec<AsmRuleRef<'_>> = rules
@@ -3019,5 +3133,6 @@ pub fn codegen_stratum_asm_native(
         true,
         storage::jit_rel_data_grow as usize,
         storage::jit_tuple_set_grow as usize,
+        intern_cmps,
     )
 }
