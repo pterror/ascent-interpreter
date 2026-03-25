@@ -13,8 +13,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::eval::aggregators::apply_aggregator;
 use crate::eval::compiled::{
-    CAggArg, CAggregation, CBodyItem, CClause, CClauseArg, CCondition, CHeadClause, CRule,
-    compile_rule, eval_cexpr,
+    CAggArg, CAggregation, CBinOp, CBodyItem, CClause, CClauseArg, CCondition, CExpr,
+    CHeadClause, CRule, compile_rule, eval_cexpr,
 };
 use crate::eval::expr::expand_range;
 use crate::eval::relation::{Relation, SourceId};
@@ -884,6 +884,92 @@ impl Engine {
         Ok(())
     }
 
+    /// Check whether any rule uses ordering comparisons (Lt/Le/Gt/Ge) on variables
+    /// bound to interned columns. The JIT compares raw packed u32 intern IDs, which
+    /// gives wrong results for interned types where ID order != semantic order (e.g.
+    /// strings: intern ID depends on insertion order, not lexicographic order).
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    fn has_interned_ordering_cmp(rules: &[&CRule], relations: &FxHashMap<String, Relation>) -> bool {
+        use crate::eval::specialized::PackedType;
+
+        for rule in rules {
+            let mut interned_vars = FxHashSet::default();
+            for item in &rule.body {
+                if let CBodyItem::Clause(clause) = item
+                    && let Some(Relation::Packed(ps)) = relations.get(&clause.relation)
+                {
+                    for &(col, var_id) in &clause.fresh_cols {
+                        if col < ps.col_types.len()
+                            && matches!(ps.col_types[col], PackedType::Interned(_))
+                        {
+                            interned_vars.insert(var_id);
+                        }
+                    }
+                }
+            }
+            if interned_vars.is_empty() {
+                continue;
+            }
+            // Check all conditions (rule-level and clause-level)
+            for item in &rule.body {
+                match item {
+                    CBodyItem::Condition(CCondition::If(expr)) => {
+                        if Self::expr_has_interned_ordering(expr, &interned_vars) {
+                            return true;
+                        }
+                    }
+                    CBodyItem::Clause(clause) => {
+                        for cond in &clause.conditions {
+                            if let CCondition::If(expr) = cond
+                                && Self::expr_has_interned_ordering(expr, &interned_vars)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// Returns true if the expression contains an ordering comparison (Lt/Le/Gt/Ge)
+    /// where at least one operand is or references an interned variable.
+    #[cfg(all(feature = "jit", feature = "specialized"))]
+    fn expr_has_interned_ordering(expr: &CExpr, interned_vars: &FxHashSet<VarId>) -> bool {
+        fn is_ordering(op: CBinOp) -> bool {
+            matches!(op, CBinOp::Lt | CBinOp::Le | CBinOp::Gt | CBinOp::Ge)
+        }
+        fn uses_interned(expr: &CExpr, vars: &FxHashSet<VarId>) -> bool {
+            match expr {
+                CExpr::Var(id) | CExpr::DerefVar(id) => vars.contains(id),
+                CExpr::VarBinVar(_, a, b) => vars.contains(a) || vars.contains(b),
+                CExpr::VarBinLit(_, a, _) => vars.contains(a),
+                CExpr::LitBinVar(_, _, b) => vars.contains(b),
+                CExpr::Binary(_, a, b) => uses_interned(a, vars) || uses_interned(b, vars),
+                CExpr::Unary(_, inner) => uses_interned(inner, vars),
+                _ => false,
+            }
+        }
+        match expr {
+            CExpr::VarBinVar(op, a, b) if is_ordering(*op) => {
+                interned_vars.contains(a) || interned_vars.contains(b)
+            }
+            CExpr::VarBinLit(op, a, _) if is_ordering(*op) => interned_vars.contains(a),
+            CExpr::LitBinVar(op, _, b) if is_ordering(*op) => interned_vars.contains(b),
+            CExpr::Binary(op, a, b) if is_ordering(*op) => {
+                uses_interned(a, interned_vars) || uses_interned(b, interned_vars)
+            }
+            CExpr::Binary(_, a, b) => {
+                Self::expr_has_interned_ordering(a, interned_vars)
+                    || Self::expr_has_interned_ordering(b, interned_vars)
+            }
+            CExpr::Unary(_, inner) => Self::expr_has_interned_ordering(inner, interned_vars),
+            _ => false,
+        }
+    }
+
     /// Try to run the stratum via the Stage 4 compiled function (inlined rule bodies).
     ///
     /// Returns `true` if successful, `false` to fall back to interpreted.
@@ -968,6 +1054,16 @@ impl Engine {
                     ps.update_jit_indices();
                 }
             }
+        }
+
+        // Step 0b: reject rules with ordering comparisons on interned columns.
+        // The JIT compares raw u32 intern IDs, which gives wrong results when
+        // ID order != semantic order (e.g. string lexicographic comparison).
+        if Self::has_interned_ordering_cmp(rules, &self.relations) {
+            if std::env::var("ASCENT_DUMP_JIT").is_ok() {
+                eprintln!("JIT: stratum {stratum_key} skipped: ordering comparison on interned column");
+            }
+            return false;
         }
 
         // Step 1: compile the Stage 4 stratum function (eligibility checked inside)

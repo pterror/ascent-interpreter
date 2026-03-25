@@ -967,3 +967,35 @@ fn test_packed_jit_agg_min() {
         "result",
     );
 }
+
+/// Regression test: ordering comparisons on interned string columns must compare
+/// string content (lexicographic), not raw intern IDs (insertion order).
+#[cfg(feature = "specialized")]
+#[test]
+fn test_packed_jit_string_ordering_comparison() {
+    // Insert strings in non-alphabetical order so intern IDs don't match
+    // lexicographic order: "cherry"=0, "apple"=1, "banana"=2.
+    // If the JIT compared intern IDs, `a < b` would give wrong results.
+    let cherry = Value::string("cherry");
+    let apple = Value::string("apple");
+    let banana = Value::string("banana");
+    assert_packed_jit_equivalence(
+        r#"
+            relation edge(String, String);
+            relation sorted(String, String);
+            sorted(a, b) <-- edge(a, b), edge(b, a), if a < b;
+        "#,
+        &[(
+            "edge",
+            vec![
+                vec![cherry.clone(), apple.clone()],
+                vec![apple.clone(), cherry.clone()],
+                vec![banana.clone(), apple.clone()],
+                vec![apple.clone(), banana.clone()],
+                vec![cherry.clone(), banana.clone()],
+                vec![banana.clone(), cherry.clone()],
+            ],
+        )],
+        "sorted",
+    );
+}
