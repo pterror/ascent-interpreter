@@ -197,35 +197,35 @@ pub struct PackedStorage {
     /// called before interpreter stratum evaluation and before result access.
     pub(crate) interp_synced_count: usize,
     /// Per-column JIT hash index (full data). Updated incrementally.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) jit_indices: Vec<crate::eval::jit_index::JitHashIndex>,
     /// Per-column JIT hash index (recent data). Rebuilt from scratch each iteration.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) jit_recent_indices: Vec<crate::eval::jit_index::JitHashIndex>,
     /// Number of tuples already indexed into jit_indices (for incremental update).
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) jit_full_indexed_count: usize,
     /// True if this relation is EDB in the current stratum (never written by any rule head).
     ///
     /// When true, `update_jit_indices` builds the full index contiguously ONCE and then
     /// skips all subsequent rebuilds (the relation is stable). The recent index is also
     /// built contiguously each iteration. Set by `eval.rs` before running a stratum.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) jit_is_edb: bool,
     /// True if this relation is a sink in the current stratum (appears only in rule heads,
     /// never in any body clause). When true, `update_jit_indices` skips all index building
     /// since the indices are never probed. Set by `eval.rs` before running a stratum.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) jit_is_sink: bool,
     /// True if `jit_indices` was last built with `jit_is_edb = true` (col-value format).
     /// False if built with `jit_is_edb = false` (tuple-index format) or not yet built.
     /// Used by `eval.rs` to detect stale non-EDB indices that must be rebuilt when
     /// `jit_is_edb` transitions from false to true.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) jit_index_is_edb_fmt: bool,
     /// Native JIT storage projection: total, recent, and empty-new views.
     /// Rebuilt on every `advance_jit()` call.  `None` before the first advance.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) jit_native: Option<crate::eval::jit::storage::JitNativeRelData>,
     /// Authoritative dedup table (inline u32 hash table, also probed by JIT code directly).
     pub(crate) jit_dedup: crate::eval::jit_index::JitDedupTable,
@@ -247,19 +247,19 @@ impl PackedStorage {
             recent_col_indices: (0..arity).map(|_| FxHashMap::default()).collect(),
             source_tags: Vec::new(),
             interp_synced_count: 0,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_indices: Vec::new(),
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_recent_indices: Vec::new(),
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_full_indexed_count: 0,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_is_edb: false,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_is_sink: false,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_index_is_edb_fmt: false,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_native: None,
             jit_dedup: crate::eval::jit_index::JitDedupTable::new(arity),
         }
@@ -271,7 +271,7 @@ impl PackedStorage {
     ///   (skipped for sink relations since they are never probed as body clauses).
     /// - `recent`: covers only the recent tuples (gathered from `self.recent` index list).
     /// - `new`:    empty write buffer with initial capacity 64 tuples.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) fn build_native_projection(
         &self,
     ) -> crate::eval::jit::storage::JitNativeRelData {
@@ -342,7 +342,7 @@ impl PackedStorage {
 
     /// Like `build_native_projection` but uses a pre-built (cached) `total` JitRelData
     /// instead of re-sorting and rebuilding JitColIndex. O(n) memcpy for total vs O(n log n).
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) fn build_native_projection_with_total(
         &self,
         total: Box<crate::eval::jit::storage::JitRelData>,
@@ -620,7 +620,7 @@ impl PackedStorage {
                 self.recent_col_indices[col].entry(p).or_default().push(idx);
             }
         }
-        #[cfg(all(feature = "jit", feature = "specialized"))]
+        #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
         self.update_jit_indices();
         had_delta
     }
@@ -633,7 +633,7 @@ impl PackedStorage {
     /// When `update_hash_indices` is false, the `update_jit_indices()` call is skipped.
     /// Use this on the asm native path, which reads `JitColIndex` directly and never
     /// touches `jit_indices` / `jit_recent_indices`.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) fn advance_jit_inner(&mut self, update_hash_indices: bool, rebuild_jit_native: bool) -> bool {
         // Flush any tuples the JIT wrote to jit_native.new into this relation's delta.
         // Takes only the `new` buffer from jit_native so we can update jit_native in-place
@@ -827,7 +827,7 @@ impl PackedStorage {
     /// packed_data_ptr + JitHashIndex — it never reads `jit_native.total/recent`. Rebuilding
     /// JitColIndex inside `jit_native` on every fixpoint step would be O(total_tuples) per call
     /// (O(n³) for TC), wasted work since the non-native asm never uses it.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) fn advance_jit_no_native_rebuild(&mut self) -> bool {
         self.advance_jit_inner(true, false)
     }
@@ -836,7 +836,7 @@ impl PackedStorage {
     ///
     /// The asm native path reads `JitColIndex` directly via `jit_native` and never
     /// consults `jit_indices` / `jit_recent_indices`; always skip hash index rebuilds.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) fn advance_jit_skip_hash_indices(&mut self) -> bool {
         self.advance_jit_inner(false, true)
     }
@@ -854,7 +854,7 @@ impl PackedStorage {
                 self.recent_col_indices[col].entry(p).or_default().push(idx);
             }
         }
-        #[cfg(all(feature = "jit", feature = "specialized"))]
+        #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
         self.update_jit_indices();
         had_delta
     }
@@ -866,7 +866,7 @@ impl PackedStorage {
     /// have been added since the last build.
     ///
     /// Must be called after `advance()` / `advance_peek()` to keep JIT handles fresh.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) fn update_jit_indices(&mut self) {
         if self.jit_is_sink {
             return;
@@ -1182,21 +1182,21 @@ impl Clone for PackedStorage {
             recent_col_indices: self.recent_col_indices.clone(),
             source_tags: self.source_tags.clone(),
             interp_synced_count: self.interp_synced_count,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_indices: self.jit_indices.clone(),
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_recent_indices: self.jit_recent_indices.clone(),
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_full_indexed_count: self.jit_full_indexed_count,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_is_edb: self.jit_is_edb,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_is_sink: self.jit_is_sink,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_index_is_edb_fmt: self.jit_index_is_edb_fmt,
             // Deep-clone jit_native so the cloned engine does not pay the full
             // build_native_projection rebuild cost on its first jit_advance_native call.
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             jit_native: self.jit_native.as_ref().map(|n| n.deep_clone()),
             jit_dedup: self.jit_dedup.clone(),
         }

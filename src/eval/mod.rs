@@ -40,9 +40,9 @@ pub mod error;
 mod engine;
 pub mod expr;
 pub mod intern;
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod jit;
-#[cfg(all(feature = "jit", feature = "specialized"))]
+#[cfg(feature = "specialized")]
 mod jit_index;
 mod relation;
 #[cfg(feature = "serde")]
@@ -53,7 +53,7 @@ pub mod value;
 
 pub use error::EvalError;
 pub use engine::{Engine, TypeRegistry, ValueDestructor};
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub use engine::SharedJitCompiler;
 pub use relation::{Relation, SourceId};
 pub use value::{DynValue, OrderedFloat, Tuple, Value};

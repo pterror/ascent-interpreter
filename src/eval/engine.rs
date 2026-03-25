@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::fmt;
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 use std::sync::{Arc, Mutex};
 
 
@@ -256,7 +256,7 @@ impl Stratification {
 
 /// Relation-name metadata for repopulating a pooled `StratumStage4Runtime`.
 /// Parallel arrays match indices of the corresponding pointer arrays in the runtime.
-#[cfg(all(feature = "jit", feature = "specialized"))]
+#[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
 pub(crate) struct StratumStage4RefreshInfo {
     /// Relation name for each slot in `_all_rels`.
     all_rel_names: Box<[String]>,
@@ -270,7 +270,7 @@ pub(crate) struct StratumStage4RefreshInfo {
 
 /// Pinned runtime data for a Stage 4 stratum function (inlined rule bodies).
 /// All raw pointers in `stage4_ctx` point into the boxes below.
-#[cfg(all(feature = "jit", feature = "specialized"))]
+#[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
 #[allow(dead_code, clippy::vec_box)]
 pub(crate) struct StratumStage4Runtime {
     stage4_ctx: Box<crate::eval::jit::packed_helpers::StratumStage4Ctx>,
@@ -292,7 +292,7 @@ pub(crate) struct StratumStage4Runtime {
     refresh_info: Option<StratumStage4RefreshInfo>,
 }
 
-#[cfg(all(feature = "jit", feature = "specialized"))]
+#[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
 impl std::fmt::Debug for StratumStage4Runtime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StratumStage4Runtime").finish_non_exhaustive()
@@ -324,10 +324,10 @@ pub struct Engine {
     stratification: Option<Stratification>,
     /// JIT compiler for rule bodies (optional, feature-gated).
     /// Arc<Mutex> allows sharing a pre-compiled JIT across Engine instances.
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit: Option<Arc<Mutex<crate::eval::jit::JitCompiler>>>,
     /// Cache of Stage 4 stratum runtime contexts (inlined rule bodies).
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     stratum_stage4_cache: FxHashMap<usize, StratumStage4Runtime>,
     /// Maximum number of fixpoint iterations before stopping evaluation.
     max_iterations: usize,
@@ -339,7 +339,7 @@ pub struct Engine {
 ///
 /// Obtained from [`Engine::share_jit_compiler`] and passed to
 /// [`Engine::set_jit_compiler`] to avoid recompilation across engine instances.
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[derive(Clone)]
 pub struct SharedJitCompiler(Arc<Mutex<crate::eval::jit::JitCompiler>>);
 
@@ -377,9 +377,9 @@ impl Engine {
             next_source_id: 1,
             current_source: SourceId::ANONYMOUS,
             stratification: None,
-            #[cfg(feature = "jit")]
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: None,
-            #[cfg(all(feature = "jit", feature = "specialized"))]
+            #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
             stratum_stage4_cache: FxHashMap::default(),
             max_iterations: 10_000,
             materialized: true,
@@ -392,7 +392,7 @@ impl Engine {
     }
 
     /// Enable JIT compilation for eligible rules.
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub fn enable_jit(&mut self) -> Result<(), crate::eval::error::EvalError> {
         if self.jit.is_none() {
             match crate::eval::jit::JitCompiler::new() {
@@ -409,14 +409,14 @@ impl Engine {
 
     /// Return a shared handle to the compiled JIT state.
     /// Multiple engines can share one handle to avoid recompilation.
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub fn share_jit_compiler(&self) -> Option<SharedJitCompiler> {
         self.jit.clone().map(SharedJitCompiler)
     }
 
     /// Inject a pre-compiled JIT compiler from another engine.
     /// The injected compiler is shared; compilation results are visible to all sharers.
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub fn set_jit_compiler(&mut self, jit: SharedJitCompiler) {
         self.jit = Some(jit.0);
     }
@@ -829,7 +829,7 @@ impl Engine {
         }
 
         // Fast path: Stage 4 stratum (inlined rule bodies, no call_indirect)
-        #[cfg(all(feature = "jit", feature = "specialized"))]
+        #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
         if self.try_run_stratum_stage4(rules, scc_key, rule_indices) {
             return Ok(());
         }
@@ -887,7 +887,7 @@ impl Engine {
     /// Try to run the stratum via the Stage 4 compiled function (inlined rule bodies).
     ///
     /// Returns `true` if successful, `false` to fall back to interpreted.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     fn try_run_stratum_stage4(&mut self, rules: &[&CRule], scc_key: usize, _rule_indices: &[usize]) -> bool {
         if rules.is_empty() {
             return false;
@@ -1152,7 +1152,7 @@ impl Engine {
     /// relation into `JitCompiler`.  Called after each stratum run completes.
     /// After the final fixpoint advance, `jit_dedup.clear()` zeroes the count but
     /// preserves the capacity allocation — so `handle.cap` is the peak capacity.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     fn update_dedup_cap_hints(&self, rules: &[&crate::eval::compiled::CRule]) {
         let Some(jit_cell) = self.jit.as_ref() else { return };
         use crate::eval::relation::Relation;
@@ -1187,7 +1187,7 @@ impl Engine {
     /// Build the runtime context for Stage 4 stratum execution.
     ///
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule], native_fn_available: bool) -> Option<StratumStage4Runtime> {
         use crate::eval::jit::packed_helpers::{LookupSpec, PackedJitContextV3, StratumStage4Ctx};
         use crate::eval::jit_index::JitLookupHandle;
@@ -1482,7 +1482,7 @@ impl Engine {
     ///
     /// Returns `false` if any required relation is missing (shouldn't happen for pooled runtimes
     /// built from the same program).
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     fn repopulate_runtime(&mut self, rt: &mut StratumStage4Runtime) -> bool {
         use crate::eval::jit_index::JitLookupHandle;
         use crate::eval::relation::Relation;
@@ -1596,7 +1596,7 @@ impl Engine {
     /// after each `advance_jit()` call.
     ///
     /// TODO: compile native JIT function (Step 4)
-    #[cfg(all(feature = "jit", feature = "specialized"))]
+    #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     fn build_stratum_stage4_native_runtime(
         &mut self,
         rules: &[&CRule],
@@ -4381,7 +4381,7 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "jit", feature = "specialized"))]
+#[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
 #[allow(unused_must_use)]
 mod jit_hot_tests {
     use super::*;
@@ -4449,7 +4449,7 @@ mod jit_hot_tests {
 /// Return Stage 4 runtimes to the JIT pool when an engine is dropped.
 /// On the next hot-bench iteration, `repopulate_runtime` rewrites engine-specific pointers
 /// into the already-allocated boxes (zero allocations vs the ~9 Box allocs in a fresh build).
-#[cfg(all(feature = "jit", feature = "specialized"))]
+#[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
 impl Drop for Engine {
     fn drop(&mut self) {
         if let Some(jit_cell) = self.jit.as_ref()

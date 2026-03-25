@@ -6,7 +6,7 @@ pub(crate) mod layout;
 pub mod storage;
 #[cfg(feature = "specialized")]
 pub(crate) mod packed_helpers;
-#[cfg(feature = "jit-asm")]
+#[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 pub(crate) mod asm_codegen;
 #[cfg(test)]
 #[allow(unused_must_use)]
@@ -28,7 +28,7 @@ impl std::fmt::Debug for JitCompiler {
 }
 
 /// The JIT compiler (asm backend only).
-#[cfg(feature = "jit-asm")]
+#[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 pub struct JitCompiler {
     /// Cache of Stage 4 stratum functions (non-native asm).
     pub(crate) stratum_stage4_fn_cache: FxHashMap<usize, Option<packed_helpers::StratumStage4Fn>>,
@@ -57,18 +57,18 @@ pub struct JitCompiler {
     ///
     /// Shared across Engine instances via Arc<Mutex<JitCompiler>>, so the cache survives
     /// Engine::new() calls in hot-bench iterations that reuse a compiled JitCompiler.
-    #[cfg(all(feature = "jit-asm", feature = "specialized"))]
+    #[cfg(all(feature = "jit-asm", feature = "specialized", target_arch = "x86_64"))]
     pub(crate) edb_native_total_cache:
         FxHashMap<String, (usize, u64, Box<storage::JitRelData>)>,
 }
 
 // Safety: JitCompiler is only accessed from one thread at a time (guarded by Mutex).
-#[cfg(feature = "jit-asm")]
+#[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 unsafe impl Send for JitCompiler {}
-#[cfg(feature = "jit-asm")]
+#[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 unsafe impl Sync for JitCompiler {}
 
-#[cfg(feature = "jit-asm")]
+#[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 impl JitCompiler {
     /// Create a new JIT compiler.
     pub fn new() -> Result<Self, String> {
@@ -81,7 +81,7 @@ impl JitCompiler {
             tuple_count_hints: FxHashMap::default(),
             #[cfg(feature = "specialized")]
             stratum_runtime_pool: FxHashMap::default(),
-            #[cfg(all(feature = "jit-asm", feature = "specialized"))]
+            #[cfg(all(feature = "jit-asm", feature = "specialized", target_arch = "x86_64"))]
             edb_native_total_cache: FxHashMap::default(),
         })
     }
