@@ -4,12 +4,26 @@ This page describes how the interpreter is organized and how data flows from sou
 
 ## Module Structure
 
+The codebase is a single Rust crate with modules (previously separate sub-crates, merged into the root crate):
+
 | Module | Purpose |
 |--------|---------|
 | `syntax` | Parser (syn-based) and desugaring passes |
 | `ir` | Intermediate representation, lowered from AST |
 | `eval` | Semi-naive evaluation engine with expression evaluator |
+| `eval::jit` | x86-64 asm JIT compiler (behind the `jit-asm` feature) |
 | `main` | CLI binary (REPL and file execution) |
+
+### Feature Flags
+
+| Feature | Description |
+|---------|-------------|
+| `jit-asm` | x86-64 asm JIT compiler via `dynasmrt` (implies `jit` and `specialized`). **Default.** |
+| `specialized` | Packed u32 storage for arity-specialized relations |
+| `jit` | Low-level JIT plumbing (not useful on its own) |
+| `serde` | Serde-based custom type registration |
+
+The `jit-asm` feature is gated at compile time to `target_arch = "x86_64"`. On other architectures (e.g., aarch64 / Apple Silicon) the feature compiles but JIT code is excluded — `enable_jit()` is not available, and all rules run through the interpreter.
 
 ### Dependencies
 
@@ -126,7 +140,6 @@ A `GenSym` helper generates unique identifiers across all passes.
 
 **What stays the same:**
 
-- Expressions remain as `syn::Expr` — there is no custom expression IR. The tree-walking evaluator interprets them directly at runtime.
 - Relation metadata (types, lattice flag, attributes) passes through unchanged.
 
 **Key IR types:**
@@ -139,6 +152,9 @@ A `GenSym` helper generates unique identifiers across all passes.
 | `BodyItem` | Clause, Generator, Condition, or Aggregation |
 | `Clause` | Relation lookup with typed args and conditions |
 | `Aggregation` | Aggregator call with bound/result vars |
+| `IrExpr` | IR-native expression tree (replaces `syn::Expr` in the public API) |
+
+Expressions are lowered from `syn::Expr` into `IrExpr` during lowering, providing a stable public type that does not expose the `syn` AST. Common forms (literals, variables, binary ops, calls) are lowered to native nodes; less common forms fall back to an `IrExpr::Raw` token-string that is re-parsed at eval time.
 
 ## Evaluation
 
@@ -181,7 +197,7 @@ Lattice relations use merge-by-key instead of set deduplication. The key is all 
 
 ## Expression Evaluation
 
-Expressions (`syn::Expr`) are evaluated by a tree-walking interpreter at runtime. There is no compilation step — the `syn` AST is traversed directly.
+Expressions (`IrExpr`) are evaluated by a tree-walking interpreter at runtime. Common forms are handled directly; `IrExpr::Raw` strings are re-parsed via `syn` on first use.
 
 **Supported expression forms:**
 
@@ -202,7 +218,7 @@ Integer literals without a suffix default to `i32`, matching Rust convention.
 
 ## Key Design Decisions
 
-- **No custom expression IR.** Expressions stay as `syn::Expr` all the way through the pipeline. The tree-walking evaluator interprets them directly, avoiding the complexity of a second AST.
+- **IR-native expression type.** Expressions are lowered from `syn::Expr` to `IrExpr` during IR lowering. The public API does not expose `syn` types. Common forms are represented natively; unusual forms fall back to an opaque token string.
 
 - **Negation lowered to aggregation.** `!rel(x)` becomes `agg () = not() in rel(x)` during IR lowering, so the evaluator only needs one code path for both aggregation and negation.
 
@@ -211,3 +227,40 @@ Integer literals without a suffix default to `i32`, matching Rust convention.
 - **SCC-based stratification.** Rules are grouped into strongly connected components and topologically sorted. Each component runs to fixpoint before dependent components begin, ensuring aggregation and negation see complete inputs.
 
 - **Full re-evaluation on retract/undo.** The REPL accumulates source statements. On `:retract` or `:undo`, the engine discards all derived data and re-evaluates from scratch. This keeps the implementation simple at the cost of performance on large programs.
+
+## JIT Compilation
+
+The `jit-asm` feature enables a native x86-64 JIT compiler that generates machine code for eligible stratum functions using [dynasmrt](https://docs.rs/dynasmrt).
+
+### Architecture
+
+The JIT operates at the **stratum** level. For each stratum that passes eligibility checks, the compiler emits a native function via a custom asm backend (Stage 4). Rules that the JIT cannot handle fall back to the interpreter transparently.
+
+Key components:
+
+| Component | Role |
+|-----------|------|
+| `eval::jit::asm_codegen` | x86-64 code emitter via dynasmrt |
+| `eval::jit::storage` | `JitRelData` — packed tuple storage with incremental indices |
+| `eval::jit::rel_index` | `RelIndex` — incrementally-insertable FxHash column index |
+| `eval::jit::layout` | `PackedStorage` — arity-specialized flat tuple layout |
+| `eval::jit::packed_helpers` | Runtime callbacks from generated code back into Rust |
+
+### What the JIT compiles
+
+The asm backend handles:
+- Multi-clause rules (via recursive `emit_clause_level`)
+- Conditions and head expressions
+- Arithmetic operators: `+`, `-`, `*`, `/`, `%`, bit ops, `Div`, `Rem`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, boolean literals
+- Aggregation: `count`, `sum`, `min`, `max`
+- Negation (anti-join)
+
+Rules that involve features the asm backend does not yet support fall back to the interpreter. The fallback is automatic — no code changes are needed.
+
+### Cranelift removal
+
+Cranelift was the first JIT backend and has been fully removed. The asm backend (Stage 4) is the sole JIT execution path. All Cranelift references in comments are historical.
+
+### Performance
+
+At small working-set sizes (n=20), eval-only time is within ~1.2–1.3× of `ascent_macro` (LLVM-compiled). The gap is primarily cache-miss overhead in the JIT's data structures vs LLVM's optimized layout. For larger working sets, the JIT still wins over the interpreter but the ratio vs `ascent_macro` widens.

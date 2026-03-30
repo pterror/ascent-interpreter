@@ -22,14 +22,17 @@ Ascent is a Datalog DSL embedded in Rust that compiles rules at `rustc` time via
 ## Quick Start
 
 ```bash
-# Build (with JIT enabled)
-cargo build --release --features jit
+# Build (JIT enabled by default)
+cargo build --release
 
 # Run a Datalog program from a file
-cargo run --features jit -- program.dl
+cargo run -- program.dl
 
 # Start the interactive REPL
-cargo run --features jit
+cargo run
+
+# Build without JIT (interpreter-only, any platform)
+cargo build --release --no-default-features
 ```
 
 ## Example
@@ -109,32 +112,35 @@ Enter Ascent statements ending with `;`. Multi-line input continues until `;`. A
 
 ## Performance
 
-The JIT backend targets wall-clock parity with `ascent_macro` (LLVM-compiled Datalog). At small working-set sizes (n=20), eval-only time is within 1.2--1.3x of `ascent_macro`. The JIT uses a custom x86-64 assembler (via `dynasm-rs`) with specialized data structures including Swiss tables and sorted merge intersection.
+The JIT backend targets wall-clock parity with `ascent_macro` (LLVM-compiled Datalog). At small working-set sizes (n=20), eval-only time is within 1.2--1.3× of `ascent_macro`. The JIT uses a custom x86-64 assembler (`dynasmrt`) with specialized data structures including sorted-merge intersection and `RelIndex` incremental hash column indices.
+
+The JIT is x86-64 only. On other architectures (aarch64, etc.) the interpreter is used automatically.
 
 Run benchmarks with:
 
 ```bash
-cargo bench --features jit
+cargo bench
 ```
 
 ## Architecture
 
-The project is organized into modules:
+The project is a single Rust crate organized into modules:
 
 | Module | Role |
 |--------|------|
 | `syntax` | Parser (syn-based) and desugaring of Ascent Datalog syntax |
 | `ir` | Intermediate representation lowered from the AST |
 | `eval` | Semi-naive evaluation engine, expression evaluator, and JIT compiler |
+| `eval::jit` | x86-64 asm backend (Stage 4 stratum functions via `dynasmrt`) |
 | `main` | CLI binary (REPL + file execution) |
 
 ## Development
 
 ```bash
 nix develop          # Enter dev shell (provides Rust toolchain)
-cargo test           # Run tests
+cargo test           # Run tests (JIT parity tests included)
 cargo clippy         # Lint
-cargo bench          # Run benchmarks
+cargo bench          # Run benchmarks (triangle, fibonacci, transitive closure)
 cd docs && bun dev   # Local documentation site
 ```
 

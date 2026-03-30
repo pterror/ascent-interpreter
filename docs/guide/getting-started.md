@@ -2,6 +2,8 @@
 
 ## Running Programs
 
+The JIT compiler (`jit-asm` feature) is enabled by default. To run with JIT:
+
 **REPL mode** — start an interactive session:
 
 ```bash
@@ -12,6 +14,12 @@ cargo run
 
 ```bash
 cargo run -- path/to/program.dl
+```
+
+**Interpreter-only** (disable JIT):
+
+```bash
+cargo run --no-default-features -- path/to/program.dl
 ```
 
 **Help:**

@@ -20,10 +20,10 @@ ascent-interpreter = { path = "../ascent-interpreter" }
 syn = "2"
 ```
 
-To enable the JIT compiler, add the `jit-asm` feature:
+The `jit-asm` feature is on by default. To disable it (interpreter-only, no platform restriction):
 
 ```toml
-ascent-interpreter = { path = "...", features = ["jit-asm"] }
+ascent-interpreter = { path = "...", default-features = false }
 ```
 
 ## 2. Basic Usage
@@ -53,12 +53,12 @@ fn main() {
     let mut engine = Engine::new(program);
 
     // 4. Insert ground facts
-    engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-    engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
-    engine.insert("edge", vec![Value::I32(3), Value::I32(4)]);
+    engine.insert("edge", vec![Value::I32(1), Value::I32(2)]).unwrap();
+    engine.insert("edge", vec![Value::I32(2), Value::I32(3)]).unwrap();
+    engine.insert("edge", vec![Value::I32(3), Value::I32(4)]).unwrap();
 
     // 5. Run to fixpoint (semi-naive evaluation)
-    engine.run();
+    engine.run().unwrap();
 
     // 6. Query results
     let path = engine.relation("path").unwrap();
@@ -156,15 +156,15 @@ let program = Program::from_ast(ast).unwrap();
 let mut engine = Engine::new(program);
 
 // Initial facts and evaluation
-engine.insert("edge", vec![Value::I32(1), Value::I32(2)]);
-engine.insert("edge", vec![Value::I32(2), Value::I32(3)]);
-engine.run();
+engine.insert("edge", vec![Value::I32(1), Value::I32(2)]).unwrap();
+engine.insert("edge", vec![Value::I32(2), Value::I32(3)]).unwrap();
+engine.run().unwrap();
 assert_eq!(engine.relation("path").unwrap().len(), 3);
 
 // Add a new edge and re-evaluate incrementally
-engine.insert("edge", vec![Value::I32(3), Value::I32(4)]);
+engine.insert("edge", vec![Value::I32(3), Value::I32(4)]).unwrap();
 
-let rederived = engine.run_incremental(&["edge"], &[]);
+let rederived = engine.run_incremental(&["edge"], &[]).unwrap();
 // rederived contains the names of relations that were updated
 assert_eq!(engine.relation("path").unwrap().len(), 6);
 ```
@@ -178,16 +178,16 @@ You can tag facts with a source ID so you can retract them later:
 let src = engine.intern_source("file_a.rs");
 
 // Insert facts tagged with a source
-engine.insert_with_source("edge", vec![Value::I32(10), Value::I32(20)], src);
-engine.insert_with_source("edge", vec![Value::I32(20), Value::I32(30)], src);
-engine.run();
+engine.insert_with_source("edge", vec![Value::I32(10), Value::I32(20)], src).unwrap();
+engine.insert_with_source("edge", vec![Value::I32(20), Value::I32(30)], src).unwrap();
+engine.run().unwrap();
 
 // Later: retract all facts from that source
 let removed = engine.retract_source(src);
 println!("removed {removed} tuples");
 
 // Re-derive without those facts
-engine.run_incremental(&["edge"], &["edge"]);
+engine.run_incremental(&["edge"], &["edge"]).unwrap();
 ```
 
 ## 5. Custom Types
@@ -238,21 +238,27 @@ points(Point(3, 4));
 
 ## 6. JIT Compilation
 
-The JIT compiler generates native x86-64 machine code for eligible rules, providing significant speedups for compute-heavy programs.
+The JIT compiler generates native x86-64 machine code for eligible stratum functions, providing significant speedups for compute-heavy programs.
 
 ::: warning Platform support
-The JIT backend requires **x86-64** (Intel/AMD 64-bit). On other architectures (e.g., Apple Silicon / aarch64), the `jit-asm` feature is automatically disabled at compile time and all rules fall back to the interpreter. No code changes are needed — `enable_jit()` is simply unavailable.
+The JIT backend is gated at compile time to `target_arch = "x86_64"`. On other architectures (e.g., Apple Silicon / aarch64), the `jit-asm` feature compiles but JIT code is excluded — `enable_jit()` is not available and all rules run through the interpreter. No code changes are needed.
 :::
 
 ### Feature flags
 
-Enable the `jit-asm` feature in your `Cargo.toml`:
+`jit-asm` is the default feature. To opt out:
+
+```toml
+ascent-interpreter = { path = "...", default-features = false }
+```
+
+To explicitly enable (no-op if already default, useful in transitive dependencies):
 
 ```toml
 ascent-interpreter = { path = "...", features = ["jit-asm"] }
 ```
 
-The `jit-asm` feature implies `jit` and `specialized`.
+`jit-asm` implies `jit` and `specialized`.
 
 ### Enabling JIT at runtime
 
@@ -325,21 +331,23 @@ if let Err(e) = engine.enable_jit() {
 }
 ```
 
-### Insert warnings
+### Insert errors
 
-`insert()` returns `false` and prints a warning to stderr in two cases:
+`insert()` returns `Result<bool, EvalError>`. It returns `Ok(false)` if the tuple was a duplicate (already present). It returns `Err` in two cases:
 
 - **Arity mismatch**: the tuple length does not match the relation's declared arity.
 - **Unknown relation**: the relation name was not declared in the program.
 
 ```rust
-// Returns false — relation "foo" was never declared
-let ok = engine.insert("foo", vec![Value::I32(1)]);
-assert!(!ok);
+use ascent_interpreter::eval::error::EvalError;
 
-// Returns false — edge is arity 2 but we gave 3 values
-let ok = engine.insert("edge", vec![Value::I32(1), Value::I32(2), Value::I32(3)]);
-assert!(!ok);
+// Err — relation "foo" was never declared
+let result = engine.insert("foo", vec![Value::I32(1)]);
+assert!(matches!(result, Err(EvalError { .. })));
+
+// Err — edge is arity 2 but we gave 3 values
+let result = engine.insert("edge", vec![Value::I32(1), Value::I32(2), Value::I32(3)]);
+assert!(matches!(result, Err(EvalError { .. })));
 ```
 
 ### Iteration limit
