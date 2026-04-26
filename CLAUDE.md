@@ -142,10 +142,18 @@ Types:
 
 Scope is optional but recommended for multi-crate repos.
 
+## Publishing
+
+**Never `cargo publish` without explicit user instruction.** Publishing is irreversible.
+
+**Never promote a pre-release version to stable.** If the crate is at `x.y.z-alpha.N`, any fix goes out as `x.y.z-alpha.N+1`. Only the user decides when something graduates to stable.
+
+**Verify the fix works in the actual consuming project before the user publishes.** Running `cargo test` in this repo is not sufficient. The fix must be tested against the real failure case in the project that depends on this crate.
+
 ## Negative Constraints
 
 Do not:
-- Use Claude Code's auto-memory system (`~/.claude/projects/.*./memory/`) — it is unversioned, invisible to the user, and can't be diffed or backed up. Write behavioral changes directly to CLAUDE.md instead
+- Use Claude Code's auto-memory system (`~/.claude/projects/.*./memory/`) — it is unversioned, invisible to the user, and can't be diffed or backed up. Write behavioral changes directly to CLAUDE.md instead. If memory files exist, delete them.
 - Announce actions ("I will now...") - just do them
 - Leave work uncommitted
 - Use interactive git commands (`git add -p`, `git add -i`, `git rebase -i`) — these block on stdin and hang in non-interactive shells; stage files by name instead
