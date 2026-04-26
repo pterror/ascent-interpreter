@@ -59,7 +59,7 @@ impl StringTable {
     /// Resolve a u32 id back to its `&'static str`. Panics on invalid id.
     pub fn resolve(&self, id: u32) -> &'static str {
         let g = self.inner.lock().unwrap();
-        *g.to_val.get(id as usize).unwrap_or_else(|| {
+        g.to_val.get(id as usize).copied().unwrap_or_else(|| {
             panic!(
                 "invalid intern id {id}: StringTable contains {} entries",
                 g.to_val.len()

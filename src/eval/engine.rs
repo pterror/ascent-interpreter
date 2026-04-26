@@ -272,6 +272,9 @@ pub(crate) struct StratumStage4RefreshInfo {
 #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
 #[allow(dead_code, clippy::vec_box)]
 pub(crate) struct StratumStage4Runtime {
+    /// Key under which this runtime is stored in `stratum_runtime_pool`.
+    /// Includes the stratum fingerprint so pool lookups match only structurally identical strata.
+    pool_key: (usize, u64),
     stage4_ctx: Box<crate::eval::jit::packed_helpers::StratumStage4Ctx>,
     _per_rule_clause_rels: Vec<Box<[*const crate::eval::specialized::PackedStorage]>>,
     _per_rule_head_rels: Vec<Box<[*mut crate::eval::specialized::PackedStorage]>>,
@@ -1046,6 +1049,13 @@ impl Engine {
 
         let native_fn_available = stage4_native_fn.is_some();
 
+        // Fingerprint used for pool keying: ensures pooled runtimes are only reused for
+        // structurally identical strata (same rule count, head arities, relation names).
+        let pool_key = (
+            stratum_key,
+            crate::eval::jit::stratum_fingerprint(rules),
+        );
+
         // Step 2: build or repopulate the runtime context if not yet cached.
         if !self.stratum_stage4_cache.contains_key(&stratum_key) {
             // Pre-size jit_indices BEFORE building or repopulating the runtime so that
@@ -1072,7 +1082,9 @@ impl Engine {
                 }
                 // Also try the pool: if a prior engine returned its runtime, we can
                 // repopulate in-place (pointer writes only, zero allocations).
-                jit.stratum_runtime_pool.remove(&stratum_key)
+                // Use pool_key (includes fingerprint) so we never recycle a runtime from
+                // a structurally different stratum of another program.
+                jit.stratum_runtime_pool.remove(&pool_key)
             } else {
                 None
             };
@@ -1084,7 +1096,7 @@ impl Engine {
                 rt
             } else {
                 // Pool miss or non-repopulatable (native path): build fresh.
-                match self.build_stratum_stage4_runtime(rules, native_fn_available) {
+                match self.build_stratum_stage4_runtime(rules, native_fn_available, pool_key) {
                     Some(r) => r,
                     None => return false,
                 }
@@ -1211,6 +1223,7 @@ impl Engine {
         &mut self,
         rules: &[&CRule],
         native_fn_available: bool,
+        pool_key: (usize, u64),
     ) -> Option<StratumStage4Runtime> {
         use crate::eval::jit::packed_helpers::{LookupSpec, PackedJitContextV3, StratumStage4Ctx};
         use crate::eval::jit_index::JitLookupHandle;
@@ -1497,6 +1510,7 @@ impl Engine {
         };
 
         Some(StratumStage4Runtime {
+            pool_key,
             stage4_ctx,
             _per_rule_clause_rels: per_rule_clause_rels,
             _per_rule_head_rels: per_rule_head_rels,
@@ -3012,8 +3026,21 @@ fn compute_rule_sccs(program: &Program) -> Vec<Vec<usize>> {
     // Topological sort of the condensation DAG
     let order = toposort(&condensed, None).expect("condensation is always a DAG");
 
-    // Extract rule indices for each SCC in topological order
-    order.iter().map(|&idx| condensed[idx].clone()).collect()
+    // Extract rule indices for each SCC in topological order.
+    // Sort each SCC's rule indices so the order is canonical across Engine instances.
+    // Without sorting, FxHashMap iteration non-determinism in edge construction can
+    // produce different intra-SCC orderings across runs, causing the JIT function
+    // (cached by stratum_key in JitCompiler) to use a rule_i encoding that does not
+    // match the runtime's rule_ctxs array order — leading to arity mismatches when
+    // packed_try_insert is called with the wrong PackedStorage pointer.
+    order
+        .iter()
+        .map(|&idx| {
+            let mut scc = condensed[idx].clone();
+            scc.sort_unstable();
+            scc
+        })
+        .collect()
 }
 
 /// Match a pattern against a value, extending bindings on success.
@@ -4540,9 +4567,11 @@ impl Drop for Engine {
             && !self.stratum_stage4_cache.is_empty()
             && let Ok(mut jit) = jit_cell.lock()
         {
-            for (key, runtime) in self.stratum_stage4_cache.drain() {
-                // Keep at most one runtime per stratum in the pool.
-                jit.stratum_runtime_pool.entry(key).or_insert(runtime);
+            for (_stratum_key, runtime) in self.stratum_stage4_cache.drain() {
+                // Use the runtime's pool_key (includes fingerprint) so the pool never
+                // hands a runtime to an engine with a different program's stratum structure.
+                let pool_key = runtime.pool_key;
+                jit.stratum_runtime_pool.entry(pool_key).or_insert(runtime);
             }
         }
     }

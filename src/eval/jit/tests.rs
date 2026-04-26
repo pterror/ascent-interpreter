@@ -741,6 +741,94 @@ fn test_stage4_tuple_set_probe_arity3() {
     );
 }
 
+/// Regression test for packed-tuple arity mismatch when a JIT compiler is shared across
+/// engines with structurally different programs.
+///
+/// Before the fix, sharing a `JitCompiler` between engines A and B caused the JIT function
+/// compiled for A's stratum N (with head arity=2) to be reused for B's stratum N (with
+/// head arity=5 at rule_ctxs[0]). The JIT passed `arity=2` to `packed_try_insert` but the
+/// PackedStorage had `arity=5` → `debug_assert_eq!` panic in `insert_packed_raw`.
+///
+/// The fix: include a structural fingerprint (rule count, head relation names, arities) in
+/// the JIT function cache key so functions are never reused across programs with different
+/// stratum structures.
+#[cfg(feature = "specialized")]
+#[test]
+fn test_shared_jit_different_arity_heads() {
+    // Program A: rule with arity-2 head
+    let src_a = r#"
+        relation edge(i32, i32);
+        relation pair(i32, i32);
+        pair(x, y) <-- edge(x, y);
+    "#;
+
+    // Program B: rule with arity-5 head (different structure, same stratum index 0)
+    let src_b = r#"
+        relation edge(i32, i32);
+        relation quint(i32, i32, i32, i32, i32);
+        quint(x, y, x, y, x) <-- edge(x, y);
+    "#;
+
+    let ast_a: AscentProgram = syn::parse_str(src_a).expect("parse A");
+    let program_a = Program::from_ast(ast_a).expect("lower A");
+    let ast_b: AscentProgram = syn::parse_str(src_b).expect("parse B");
+    let program_b = Program::from_ast(ast_b).expect("lower B");
+
+    let edges = [
+        vec![Value::I32(1), Value::I32(2)],
+        vec![Value::I32(2), Value::I32(3)],
+    ];
+
+    // Run A with JIT, compile the stratum function into the cache.
+    let mut engine_a = Engine::new(program_a);
+    engine_a.enable_jit().expect("JIT init");
+    engine_a.insert("edge", edges[0].clone());
+    engine_a.insert("edge", edges[1].clone());
+    engine_a.run();
+    engine_a.materialize();
+
+    let pair_results: Vec<Vec<Value>> = engine_a
+        .relation("pair")
+        .unwrap()
+        .iter()
+        .map(|t| t.to_vec())
+        .collect();
+    assert_eq!(pair_results.len(), 2, "A: expected 2 pair tuples");
+
+    // Share JIT with engine B. Before the fix, B would hit the cache for stratum 0
+    // but its runtime has rule_ctxs[0] pointing to `quint` (arity=5), while the cached
+    // JIT function was compiled to insert tuples of arity=2 → arity mismatch panic.
+    #[cfg(all(target_arch = "x86_64", feature = "jit"))]
+    let shared = engine_a.share_jit_compiler().expect("share JIT");
+
+    let mut engine_b = Engine::new(program_b);
+    #[cfg(all(target_arch = "x86_64", feature = "jit"))]
+    engine_b.set_jit_compiler(shared);
+    #[cfg(not(all(target_arch = "x86_64", feature = "jit")))]
+    engine_b.enable_jit().expect("JIT init");
+
+    engine_b.insert("edge", edges[0].clone());
+    engine_b.insert("edge", edges[1].clone());
+    // This run would have panicked before the fix.
+    engine_b.run();
+    engine_b.materialize();
+
+    let quint_results: Vec<Vec<Value>> = engine_b
+        .relation("quint")
+        .unwrap()
+        .iter()
+        .map(|t| t.to_vec())
+        .collect();
+    assert_eq!(quint_results.len(), 2, "B: expected 2 quint tuples");
+    // Verify structure: quint(x, y, x, y, x)
+    for t in &quint_results {
+        assert_eq!(t.len(), 5, "quint tuple must have arity 5");
+        assert_eq!(t[0], t[2], "quint[0] == quint[2]");
+        assert_eq!(t[0], t[4], "quint[0] == quint[4]");
+        assert_eq!(t[1], t[3], "quint[1] == quint[3]");
+    }
+}
+
 #[cfg(feature = "specialized")]
 #[test]
 fn test_stage4_conditional_recursive() {

@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## [0.2.1-alpha.1] - 2026-04-26
+
+### Fixed
+
+- **JIT: packed tuple arity mismatch** — `packed_try_insert` was called with the wrong
+  arity when a `JitCompiler` was shared across engines running structurally different
+  programs (e.g. `run_rules_batch` in normalize). The JIT function cache used a bare
+  stratum index as its key, allowing a function compiled for program A's stratum N (with
+  head arity=2) to be reused for program B's stratum N (where `rule_ctxs[0]` pointed to
+  an arity=5 relation). The fix includes a structural fingerprint (rule count, head
+  relation names, head arities) in the cache key so functions are never reused across
+  programs with different stratum shapes.
+
+- **JIT: non-deterministic intra-SCC rule ordering** — `compute_rule_sccs` used
+  `FxHashMap` to build the dependency graph, causing the rule order within each SCC to
+  vary across `Engine` instances for the same program. Each SCC's rule indices are now
+  sorted before use, ensuring the JIT-compiled rule_i encoding matches every engine's
+  runtime `rule_ctxs` layout.
+
 ## [0.2.1] - 2026-04-26
 
 ### Fixed

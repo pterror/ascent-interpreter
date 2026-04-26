@@ -37,10 +37,17 @@ impl std::fmt::Debug for JitCompiler {
 #[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 pub struct JitCompiler {
     /// Cache of Stage 4 stratum functions (non-native asm).
-    pub(crate) stratum_stage4_fn_cache: FxHashMap<usize, Option<packed_helpers::StratumStage4Fn>>,
+    ///
+    /// Key is `(stratum_idx, stratum_fingerprint)` — the fingerprint encodes the structure
+    /// of the stratum (rule count, per-rule clause/head counts, relation names, and head arities).
+    /// Including the fingerprint in the key prevents functions compiled for one program's stratum N
+    /// from being reused for a structurally different stratum N in a different program, which
+    /// would cause arity mismatches when `packed_try_insert` receives the wrong relation pointer.
+    pub(crate) stratum_stage4_fn_cache:
+        FxHashMap<(usize, u64), Option<packed_helpers::StratumStage4Fn>>,
     /// Cache of Stage 4 native stratum functions (JitRelData direct read path).
     pub(crate) stratum_stage4_native_fn_cache:
-        FxHashMap<usize, Option<packed_helpers::StratumStage4Fn>>,
+        FxHashMap<(usize, u64), Option<packed_helpers::StratumStage4Fn>>,
     /// Asm-backend stratum buffers: kept alive so the fn_ptr remains valid.
     pub(crate) asm_buffers: Vec<asm_codegen::AsmStratum>,
     /// Total number of interned variables (set by Engine before each compilation batch).
@@ -49,12 +56,12 @@ pub struct JitCompiler {
     pub(crate) dedup_cap_hints: rustc_hash::FxHashMap<String, u32>,
     /// Peak tuple count observed per IDB head relation (relation name → count).
     pub(crate) tuple_count_hints: rustc_hash::FxHashMap<String, u32>,
-    /// Pool of reusable Stage 4 runtimes (one per stratum key, non-native path only).
+    /// Pool of reusable Stage 4 runtimes (one per (stratum_idx, fingerprint), non-native only).
     /// Avoids the ~9 Box allocations in build_stratum_stage4_runtime on every fresh-engine
     /// hot-bench iteration; repopulate_runtime writes new engine pointers without allocating.
     #[cfg(feature = "specialized")]
     pub(crate) stratum_runtime_pool:
-        rustc_hash::FxHashMap<usize, crate::eval::engine::StratumStage4Runtime>,
+        rustc_hash::FxHashMap<(usize, u64), crate::eval::engine::StratumStage4Runtime>,
     /// Cache of pre-sorted EDB `total` JitRelData projections across Engine instances.
     ///
     /// Keyed by (relation_name). Value is (tuple_count, data_hash, Box<JitRelData>) where
@@ -73,6 +80,39 @@ pub struct JitCompiler {
 unsafe impl Send for JitCompiler {}
 #[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 unsafe impl Sync for JitCompiler {}
+
+/// Compute a stable fingerprint for a stratum's rule structure.
+///
+/// The fingerprint encodes the number of rules and, for each rule: the clause count,
+/// head count, head relation names, and head arities in declaration order. This ensures
+/// that JIT-compiled functions (cached by `(stratum_idx, fingerprint)`) are never
+/// reused across structurally different strata — even when two programs happen to have
+/// the same stratum index.
+///
+/// Without this, sharing a `JitCompiler` across engines with different programs can
+/// cause the JIT function compiled for program A's stratum N to run with program B's
+/// stratum N runtime, yielding arity mismatches in `packed_try_insert`.
+///
+/// Also used by `engine.rs` for `stratum_runtime_pool` keying.
+pub(crate) fn stratum_fingerprint(rules: &[&crate::eval::compiled::CRule]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    rules.len().hash(&mut h);
+    for rule in rules {
+        let clause_count = rule
+            .body
+            .iter()
+            .filter(|i| matches!(i, crate::eval::compiled::CBodyItem::Clause(_)))
+            .count();
+        clause_count.hash(&mut h);
+        rule.heads.len().hash(&mut h);
+        for head in &rule.heads {
+            head.relation.hash(&mut h);
+            head.args.len().hash(&mut h);
+        }
+    }
+    h.finish()
+}
 
 #[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 impl JitCompiler {
@@ -216,7 +256,8 @@ impl JitCompiler {
         rules: &[&CRule],
         intern_cmps: &[asm_codegen::InternCmp],
     ) -> Option<packed_helpers::StratumStage4Fn> {
-        if let Some(cached) = self.stratum_stage4_fn_cache.get(&stratum_key) {
+        let cache_key = (stratum_key, stratum_fingerprint(rules));
+        if let Some(cached) = self.stratum_stage4_fn_cache.get(&cache_key) {
             return *cached;
         }
 
@@ -227,7 +268,7 @@ impl JitCompiler {
                         "JIT: stratum {stratum_key} rule {i} not eligible for stage4: {reason}"
                     );
                 }
-                self.stratum_stage4_fn_cache.insert(stratum_key, None);
+                self.stratum_stage4_fn_cache.insert(cache_key, None);
                 return None;
             }
         }
@@ -310,14 +351,14 @@ impl JitCompiler {
                 let fn_ptr = asm_stratum.fn_ptr;
                 self.asm_buffers.push(asm_stratum);
                 self.stratum_stage4_fn_cache
-                    .insert(stratum_key, Some(fn_ptr));
+                    .insert(cache_key, Some(fn_ptr));
                 Some(fn_ptr)
             }
             Err(reason) => {
                 if std::env::var("ASCENT_DUMP_JIT").is_ok() {
                     eprintln!("asm backend skipped stratum {stratum_key}: {reason}");
                 }
-                self.stratum_stage4_fn_cache.insert(stratum_key, None);
+                self.stratum_stage4_fn_cache.insert(cache_key, None);
                 None
             }
         }
@@ -332,7 +373,8 @@ impl JitCompiler {
         rules: &[&CRule],
         intern_cmps: &[asm_codegen::InternCmp],
     ) -> Option<packed_helpers::StratumStage4Fn> {
-        if let Some(cached) = self.stratum_stage4_native_fn_cache.get(&stratum_key) {
+        let cache_key = (stratum_key, stratum_fingerprint(rules));
+        if let Some(cached) = self.stratum_stage4_native_fn_cache.get(&cache_key) {
             return *cached;
         }
 
@@ -344,7 +386,7 @@ impl JitCompiler {
         });
         if has_negation_or_agg {
             self.stratum_stage4_native_fn_cache
-                .insert(stratum_key, None);
+                .insert(cache_key, None);
             return None;
         }
 
@@ -393,7 +435,7 @@ impl JitCompiler {
                 let fn_ptr = asm_stratum.fn_ptr;
                 self.asm_buffers.push(asm_stratum);
                 self.stratum_stage4_native_fn_cache
-                    .insert(stratum_key, Some(fn_ptr));
+                    .insert(cache_key, Some(fn_ptr));
                 Some(fn_ptr)
             }
             Err(reason) => {
@@ -401,7 +443,7 @@ impl JitCompiler {
                     eprintln!("asm native backend skipped stratum {stratum_key}: {reason}");
                 }
                 self.stratum_stage4_native_fn_cache
-                    .insert(stratum_key, None);
+                    .insert(cache_key, None);
                 None
             }
         }
