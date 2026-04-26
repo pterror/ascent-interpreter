@@ -745,13 +745,15 @@ fn run_jit(input: &str) -> Engine {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_transitive_closure() {
-    let engine = run_jit("
+    let engine = run_jit(
+        "
         relation edge(i32, i32);
         relation path(i32, i32);
         edge(1, 2); edge(2, 3); edge(3, 4);
         path(x, y) <-- edge(x, y);
         path(x, z) <-- edge(x, y), path(y, z);
-    ");
+    ",
+    );
 
     ascent! {
         relation edge(i32, i32);
@@ -769,7 +771,8 @@ fn compare_jit_transitive_closure() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_self_join() {
-    let engine = run_jit("
+    let engine = run_jit(
+        "
         relation edge(i32, i32);
         relation triangle(i32, i32, i32);
 
@@ -777,7 +780,8 @@ fn compare_jit_self_join() {
         edge(4, 5); edge(5, 6);
 
         triangle(a, b, c) <-- edge(a, b), edge(b, c), edge(c, a);
-    ");
+    ",
+    );
 
     ascent! {
         relation edge(i32, i32);
@@ -800,14 +804,16 @@ fn compare_jit_self_join() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_mutual_recursion() {
-    let engine = run_jit("
+    let engine = run_jit(
+        "
         relation even(i32);
         relation odd(i32);
 
         even(0);
         odd(y + 1) <-- even(y), if *y < 9;
         even(y + 1) <-- odd(y), if *y < 9;
-    ");
+    ",
+    );
 
     ascent! {
         relation even(i32);
@@ -827,11 +833,13 @@ fn compare_jit_mutual_recursion() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_factorial() {
-    let engine = run_jit("
+    let engine = run_jit(
+        "
         relation fac(i32, i32);
         fac(0, 1);
         fac(n + 1, (n + 1) * f) <-- fac(n, f), if *n < 5;
-    ");
+    ",
+    );
 
     ascent! {
         relation fac(i32, i32);
@@ -847,7 +855,8 @@ fn compare_jit_factorial() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_arithmetic() {
-    let engine = run_jit("
+    let engine = run_jit(
+        "
         relation n(i32);
         relation square(i32, i32);
         relation big_square(i32, i32);
@@ -855,7 +864,8 @@ fn compare_jit_arithmetic() {
         n(x) <-- for x in 1..11;
         square(x, x * x) <-- n(x);
         big_square(x, s) <-- square(x, s), if *s > 50;
-    ");
+    ",
+    );
 
     ascent! {
         relation n(i32);
@@ -876,13 +886,15 @@ fn compare_jit_arithmetic() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_constant_in_clause() {
-    let engine = run_jit("
+    let engine = run_jit(
+        "
         relation data(i32, i32);
         relation filtered(i32);
 
         data(1, 100); data(2, 200); data(3, 100); data(4, 300);
         filtered(x) <-- data(x, 100);
-    ");
+    ",
+    );
 
     ascent! {
         relation data(i32, i32);
@@ -900,7 +912,8 @@ fn compare_jit_constant_in_clause() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_rule_chaining() {
-    let engine = run_jit("
+    let engine = run_jit(
+        "
         relation base(i32);
         relation step1(i32);
         relation step2(i32);
@@ -910,7 +923,8 @@ fn compare_jit_rule_chaining() {
         step1(x * 2) <-- base(x);
         step2(x + 1) <-- step1(x);
         step3(x) <-- step2(x), if *x > 5;
-    ");
+    ",
+    );
 
     ascent! {
         relation base(i32);
@@ -934,12 +948,14 @@ fn compare_jit_rule_chaining() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_generators() {
-    let engine = run_jit("
+    let engine = run_jit(
+        "
         relation nums(i32);
         relation pairs(i32, i32);
         nums(x) <-- for x in 0..5;
         pairs(x, y) <-- nums(x), nums(y), if x < y;
-    ");
+    ",
+    );
 
     ascent! {
         relation nums(i32);
@@ -957,7 +973,8 @@ fn compare_jit_generators() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_three_way_join() {
-    let engine = run_jit("
+    let engine = run_jit(
+        "
         relation a(i32, i32);
         relation b(i32, i32);
         relation c(i32, i32);
@@ -968,7 +985,8 @@ fn compare_jit_three_way_join() {
         c(10, 100); c(20, 200);
 
         result(x, y, z, w) <-- a(x, y), b(y, z), c(z, w);
-    ");
+    ",
+    );
 
     ascent! {
         relation a(i32, i32);
@@ -1002,13 +1020,15 @@ fn compare_jit_three_way_join() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_duplicate_elimination() {
-    let engine = run_jit("
+    let engine = run_jit(
+        "
         relation input(i32, i32);
         relation unique_first(i32);
 
         input(1, 10); input(1, 20); input(2, 30); input(2, 40); input(3, 50);
         unique_first(x) <-- input(x, _);
-    ");
+    ",
+    );
 
     ascent! {
         relation input(i32, i32);
@@ -1026,7 +1046,8 @@ fn compare_jit_duplicate_elimination() {
 #[cfg(feature = "jit")]
 #[test]
 fn compare_jit_recursive_with_aggregation() {
-    let engine = run_jit("
+    let engine = run_jit(
+        "
         relation edge(i32, i32);
         relation path(i32, i32);
         relation path_count(i32);
@@ -1036,7 +1057,8 @@ fn compare_jit_recursive_with_aggregation() {
         path(x, z) <-- edge(x, y), path(y, z);
 
         path_count(c) <-- agg c = count() in path(_, _);
-    ");
+    ",
+    );
 
     // ascent count() returns usize
     ascent! {

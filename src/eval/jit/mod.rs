@@ -2,12 +2,12 @@
 //!
 //! Cranelift has been removed. Stage 4 (asm backend) is the sole JIT execution path.
 
-pub(crate) mod layout;
-pub mod storage;
-#[cfg(feature = "specialized")]
-pub(crate) mod packed_helpers;
 #[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 pub(crate) mod asm_codegen;
+pub(crate) mod layout;
+#[cfg(feature = "specialized")]
+pub(crate) mod packed_helpers;
+pub mod storage;
 #[cfg(test)]
 #[allow(unused_must_use)]
 mod tests;
@@ -15,17 +15,20 @@ mod tests;
 #[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 use rustc_hash::FxHashMap;
 
-#[cfg(all(feature = "specialized", target_arch = "x86_64"))]
-use crate::eval::compiled::{CBinOp, CClauseArg, CExpr, CUnOp};
 #[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 use crate::eval::compiled::{CAggArg, CAggregation, CBodyItem, CCondition, CRule};
+#[cfg(all(feature = "specialized", target_arch = "x86_64"))]
+use crate::eval::compiled::{CBinOp, CClauseArg, CExpr, CUnOp};
 
 #[cfg(all(feature = "jit-asm", target_arch = "x86_64"))]
 impl std::fmt::Debug for JitCompiler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JitCompiler")
             .field("asm_buffers", &self.asm_buffers.len())
-            .field("stratum_stage4_fn_cache", &self.stratum_stage4_fn_cache.len())
+            .field(
+                "stratum_stage4_fn_cache",
+                &self.stratum_stage4_fn_cache.len(),
+            )
             .finish()
     }
 }
@@ -50,7 +53,8 @@ pub struct JitCompiler {
     /// Avoids the ~9 Box allocations in build_stratum_stage4_runtime on every fresh-engine
     /// hot-bench iteration; repopulate_runtime writes new engine pointers without allocating.
     #[cfg(feature = "specialized")]
-    pub(crate) stratum_runtime_pool: rustc_hash::FxHashMap<usize, crate::eval::engine::StratumStage4Runtime>,
+    pub(crate) stratum_runtime_pool:
+        rustc_hash::FxHashMap<usize, crate::eval::engine::StratumStage4Runtime>,
     /// Cache of pre-sorted EDB `total` JitRelData projections across Engine instances.
     ///
     /// Keyed by (relation_name). Value is (tuple_count, data_hash, Box<JitRelData>) where
@@ -61,8 +65,7 @@ pub struct JitCompiler {
     /// Shared across Engine instances via Arc<Mutex<JitCompiler>>, so the cache survives
     /// Engine::new() calls in hot-bench iterations that reuse a compiled JitCompiler.
     #[cfg(all(feature = "jit-asm", feature = "specialized", target_arch = "x86_64"))]
-    pub(crate) edb_native_total_cache:
-        FxHashMap<String, (usize, u64, Box<storage::JitRelData>)>,
+    pub(crate) edb_native_total_cache: FxHashMap<String, (usize, u64, Box<storage::JitRelData>)>,
 }
 
 // Safety: JitCompiler is only accessed from one thread at a time (guarded by Mutex).
@@ -115,29 +118,27 @@ impl JitCompiler {
             }
             for item in &rule.body {
                 match item {
-                    CBodyItem::Aggregation(a) => {
-                        match a.aggregator_name.as_str() {
-                            "count" => {
-                                if a.result_vars.len() != 1 {
-                                    return Err("count aggregation must have exactly 1 result var");
-                                }
+                    CBodyItem::Aggregation(a) => match a.aggregator_name.as_str() {
+                        "count" => {
+                            if a.result_vars.len() != 1 {
+                                return Err("count aggregation must have exactly 1 result var");
                             }
-                            "sum" | "min" | "max" => {
-                                if a.result_vars.len() != 1 {
-                                    return Err("sum/min/max must have exactly 1 result var");
-                                }
-                                if a.bound_vars.len() != 1 {
-                                    return Err("sum/min/max must have exactly 1 bound var");
-                                }
-                                for arg in &a.args {
-                                    if !matches!(arg, CAggArg::Var(_)) {
-                                        return Err("aggregation args must be plain variables");
-                                    }
-                                }
-                            }
-                            _ => return Err("unsupported aggregator in asm backend"),
                         }
-                    }
+                        "sum" | "min" | "max" => {
+                            if a.result_vars.len() != 1 {
+                                return Err("sum/min/max must have exactly 1 result var");
+                            }
+                            if a.bound_vars.len() != 1 {
+                                return Err("sum/min/max must have exactly 1 bound var");
+                            }
+                            for arg in &a.args {
+                                if !matches!(arg, CAggArg::Var(_)) {
+                                    return Err("aggregation args must be plain variables");
+                                }
+                            }
+                        }
+                        _ => return Err("unsupported aggregator in asm backend"),
+                    },
                     CBodyItem::Condition(CCondition::If(_)) => {}
                     _ => return Err("unsupported body item in pure-aggregation rule"),
                 }
@@ -222,7 +223,9 @@ impl JitCompiler {
         for (i, rule) in rules.iter().enumerate() {
             if let Err(reason) = Self::packed_eligible_reason_stage4(rule) {
                 if std::env::var("ASCENT_DUMP_JIT").is_ok() {
-                    eprintln!("JIT: stratum {stratum_key} rule {i} not eligible for stage4: {reason}");
+                    eprintln!(
+                        "JIT: stratum {stratum_key} rule {i} not eligible for stage4: {reason}"
+                    );
                 }
                 self.stratum_stage4_fn_cache.insert(stratum_key, None);
                 return None;
@@ -230,7 +233,13 @@ impl JitCompiler {
         }
 
         #[allow(clippy::type_complexity)]
-        let rule_data: Vec<(Vec<crate::eval::compiled::CClause>, Vec<crate::eval::compiled::CHeadClause>, Vec<crate::eval::compiled::CExpr>, Vec<CAggregation>, Vec<CAggregation>)> = rules
+        let rule_data: Vec<(
+            Vec<crate::eval::compiled::CClause>,
+            Vec<crate::eval::compiled::CHeadClause>,
+            Vec<crate::eval::compiled::CExpr>,
+            Vec<CAggregation>,
+            Vec<CAggregation>,
+        )> = rules
             .iter()
             .map(|rule| {
                 let clauses: Vec<crate::eval::compiled::CClause> = rule
@@ -253,9 +262,7 @@ impl JitCompiler {
                     .body
                     .iter()
                     .filter_map(|item| match item {
-                        CBodyItem::Aggregation(a) if a.aggregator_name == "not" => {
-                            Some(a.clone())
-                        }
+                        CBodyItem::Aggregation(a) if a.aggregator_name == "not" => Some(a.clone()),
                         _ => None,
                     })
                     .collect();
@@ -263,18 +270,30 @@ impl JitCompiler {
                     .body
                     .iter()
                     .filter_map(|item| match item {
-                        CBodyItem::Aggregation(a) if a.aggregator_name != "not" => {
-                            Some(a.clone())
-                        }
+                        CBodyItem::Aggregation(a) if a.aggregator_name != "not" => Some(a.clone()),
                         _ => None,
                     })
                     .collect();
-                (clauses, rule.heads.clone(), conditions, not_clauses, agg_clauses)
+                (
+                    clauses,
+                    rule.heads.clone(),
+                    conditions,
+                    not_clauses,
+                    agg_clauses,
+                )
             })
             .collect();
         let rules_refs: Vec<asm_codegen::AsmRuleRef<'_>> = rule_data
             .iter()
-            .map(|(c, h, conds, nots, aggs)| (c.as_slice(), h.as_slice(), conds.as_slice(), nots.as_slice(), aggs.as_slice()))
+            .map(|(c, h, conds, nots, aggs)| {
+                (
+                    c.as_slice(),
+                    h.as_slice(),
+                    conds.as_slice(),
+                    nots.as_slice(),
+                    aggs.as_slice(),
+                )
+            })
             .collect();
 
         match asm_codegen::codegen_stratum_asm(
@@ -290,7 +309,8 @@ impl JitCompiler {
             Ok(asm_stratum) => {
                 let fn_ptr = asm_stratum.fn_ptr;
                 self.asm_buffers.push(asm_stratum);
-                self.stratum_stage4_fn_cache.insert(stratum_key, Some(fn_ptr));
+                self.stratum_stage4_fn_cache
+                    .insert(stratum_key, Some(fn_ptr));
                 Some(fn_ptr)
             }
             Err(reason) => {
@@ -318,14 +338,21 @@ impl JitCompiler {
 
         // Native path does not support negation or aggregation.
         let has_negation_or_agg = rules.iter().any(|rule| {
-            rule.body.iter().any(|item| matches!(item, CBodyItem::Aggregation(_)))
+            rule.body
+                .iter()
+                .any(|item| matches!(item, CBodyItem::Aggregation(_)))
         });
         if has_negation_or_agg {
-            self.stratum_stage4_native_fn_cache.insert(stratum_key, None);
+            self.stratum_stage4_native_fn_cache
+                .insert(stratum_key, None);
             return None;
         }
 
-        let rule_data: Vec<(Vec<crate::eval::compiled::CClause>, Vec<crate::eval::compiled::CHeadClause>, Vec<crate::eval::compiled::CExpr>)> = rules
+        let rule_data: Vec<(
+            Vec<crate::eval::compiled::CClause>,
+            Vec<crate::eval::compiled::CHeadClause>,
+            Vec<crate::eval::compiled::CExpr>,
+        )> = rules
             .iter()
             .map(|rule| {
                 let clauses: Vec<crate::eval::compiled::CClause> = rule
@@ -347,7 +374,11 @@ impl JitCompiler {
                 (clauses, rule.heads.clone(), conditions)
             })
             .collect();
-        let rules_refs: Vec<(&[crate::eval::compiled::CClause], &[crate::eval::compiled::CHeadClause], &[crate::eval::compiled::CExpr])> = rule_data
+        let rules_refs: Vec<(
+            &[crate::eval::compiled::CClause],
+            &[crate::eval::compiled::CHeadClause],
+            &[crate::eval::compiled::CExpr],
+        )> = rule_data
             .iter()
             .map(|(c, h, conds)| (c.as_slice(), h.as_slice(), conds.as_slice()))
             .collect();
@@ -361,14 +392,16 @@ impl JitCompiler {
             Ok(asm_stratum) => {
                 let fn_ptr = asm_stratum.fn_ptr;
                 self.asm_buffers.push(asm_stratum);
-                self.stratum_stage4_native_fn_cache.insert(stratum_key, Some(fn_ptr));
+                self.stratum_stage4_native_fn_cache
+                    .insert(stratum_key, Some(fn_ptr));
                 Some(fn_ptr)
             }
             Err(reason) => {
                 if std::env::var("ASCENT_DUMP_JIT").is_ok() {
                     eprintln!("asm native backend skipped stratum {stratum_key}: {reason}");
                 }
-                self.stratum_stage4_native_fn_cache.insert(stratum_key, None);
+                self.stratum_stage4_native_fn_cache
+                    .insert(stratum_key, None);
                 None
             }
         }
@@ -380,12 +413,17 @@ impl JitCompiler {
 fn is_supported_packed_expr(expr: &CExpr) -> bool {
     match expr {
         CExpr::Var(_) | CExpr::DerefVar(_) => true,
-        CExpr::Literal(crate::eval::value::Value::I32(_)) | CExpr::Literal(crate::eval::value::Value::Bool(_)) => true,
+        CExpr::Literal(crate::eval::value::Value::I32(_))
+        | CExpr::Literal(crate::eval::value::Value::Bool(_)) => true,
         CExpr::VarBinVar(op, _, _) => is_supported_packed_binop(*op),
         CExpr::VarBinLit(op, _, crate::eval::value::Value::I32(_))
-        | CExpr::VarBinLit(op, _, crate::eval::value::Value::Bool(_)) => is_supported_packed_binop(*op),
+        | CExpr::VarBinLit(op, _, crate::eval::value::Value::Bool(_)) => {
+            is_supported_packed_binop(*op)
+        }
         CExpr::LitBinVar(op, crate::eval::value::Value::I32(_), _)
-        | CExpr::LitBinVar(op, crate::eval::value::Value::Bool(_), _) => is_supported_packed_binop(*op),
+        | CExpr::LitBinVar(op, crate::eval::value::Value::Bool(_), _) => {
+            is_supported_packed_binop(*op)
+        }
         CExpr::Binary(op, a, b) => {
             is_supported_packed_binop(*op)
                 && is_supported_packed_expr(a)

@@ -615,18 +615,51 @@ macro_rules! impl_checked_shift {
     ($method:ident, $checked_method:ident) => {
         pub fn $method(&self, other: &Value) -> Option<Value> {
             match (self, other) {
-                (Value::I8(a), Value::I8(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::I8),
-                (Value::I16(a), Value::I16(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::I16),
-                (Value::I32(a), Value::I32(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::I32),
-                (Value::I64(a), Value::I64(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::I64),
-                (Value::I128(a), Value::I128(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::I128),
-                (Value::Isize(a), Value::Isize(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::Isize),
-                (Value::U8(a), Value::U8(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::U8),
-                (Value::U16(a), Value::U16(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::U16),
+                (Value::I8(a), Value::I8(b)) => u32::try_from(*b)
+                    .ok()
+                    .and_then(|s| a.$checked_method(s))
+                    .map(Value::I8),
+                (Value::I16(a), Value::I16(b)) => u32::try_from(*b)
+                    .ok()
+                    .and_then(|s| a.$checked_method(s))
+                    .map(Value::I16),
+                (Value::I32(a), Value::I32(b)) => u32::try_from(*b)
+                    .ok()
+                    .and_then(|s| a.$checked_method(s))
+                    .map(Value::I32),
+                (Value::I64(a), Value::I64(b)) => u32::try_from(*b)
+                    .ok()
+                    .and_then(|s| a.$checked_method(s))
+                    .map(Value::I64),
+                (Value::I128(a), Value::I128(b)) => u32::try_from(*b)
+                    .ok()
+                    .and_then(|s| a.$checked_method(s))
+                    .map(Value::I128),
+                (Value::Isize(a), Value::Isize(b)) => u32::try_from(*b)
+                    .ok()
+                    .and_then(|s| a.$checked_method(s))
+                    .map(Value::Isize),
+                (Value::U8(a), Value::U8(b)) => u32::try_from(*b)
+                    .ok()
+                    .and_then(|s| a.$checked_method(s))
+                    .map(Value::U8),
+                (Value::U16(a), Value::U16(b)) => u32::try_from(*b)
+                    .ok()
+                    .and_then(|s| a.$checked_method(s))
+                    .map(Value::U16),
                 (Value::U32(a), Value::U32(b)) => a.$checked_method(*b).map(Value::U32),
-                (Value::U64(a), Value::U64(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::U64),
-                (Value::U128(a), Value::U128(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::U128),
-                (Value::Usize(a), Value::Usize(b)) => u32::try_from(*b).ok().and_then(|s| a.$checked_method(s)).map(Value::Usize),
+                (Value::U64(a), Value::U64(b)) => u32::try_from(*b)
+                    .ok()
+                    .and_then(|s| a.$checked_method(s))
+                    .map(Value::U64),
+                (Value::U128(a), Value::U128(b)) => u32::try_from(*b)
+                    .ok()
+                    .and_then(|s| a.$checked_method(s))
+                    .map(Value::U128),
+                (Value::Usize(a), Value::Usize(b)) => u32::try_from(*b)
+                    .ok()
+                    .and_then(|s| a.$checked_method(s))
+                    .map(Value::Usize),
                 _ => None,
             }
         }

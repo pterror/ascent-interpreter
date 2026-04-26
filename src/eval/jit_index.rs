@@ -46,7 +46,12 @@ const _: () = {
 
 impl Default for JitIndexEntry {
     fn default() -> Self {
-        JitIndexEntry { key: EMPTY_KEY, head: SENTINEL, count: 0, _pad1: 0 }
+        JitIndexEntry {
+            key: EMPTY_KEY,
+            head: SENTINEL,
+            count: 0,
+            _pad1: 0,
+        }
     }
 }
 
@@ -421,7 +426,11 @@ impl JitHashIndex {
         self.entries_ptr = self.entries.as_ptr();
         // Also pre-allocate values capacity (2 u32s per future tuple).
         self.values.reserve(n_tuples * 2);
-        self.values_ptr = if self.values.is_empty() { std::ptr::null() } else { self.values.as_ptr() };
+        self.values_ptr = if self.values.is_empty() {
+            std::ptr::null()
+        } else {
+            self.values.as_ptr()
+        };
     }
 
     /// Clear all entries for a full rebuild.
@@ -659,7 +668,9 @@ mod tests {
                 let mut slot = hash & (idx.mask as usize);
                 loop {
                     let entry = unsafe { &*idx.entries_ptr.add(slot) };
-                    if entry.key == EMPTY_KEY { return vec![]; }
+                    if entry.key == EMPTY_KEY {
+                        return vec![];
+                    }
                     if entry.key == key {
                         return walk_chain(idx.values_ptr, entry.head);
                     }
@@ -688,7 +699,9 @@ mod tests {
             let mut slot = hash & (idx.mask as usize);
             let found = loop {
                 let entry = unsafe { &*idx.entries_ptr.add(slot) };
-                if entry.key == EMPTY_KEY { break false; }
+                if entry.key == EMPTY_KEY {
+                    break false;
+                }
                 if entry.key == i {
                     let chain = walk_chain(idx.values_ptr, entry.head);
                     break chain.contains(&(i * 10));
@@ -725,7 +738,9 @@ pub fn jit_dedup_hash(packed: &[u32]) -> u32 {
     for &v in packed {
         h = h.wrapping_mul(0x9e3779b9).wrapping_add(v);
     }
-    if h == 0 { h = 1; }
+    if h == 0 {
+        h = 1;
+    }
     h
 }
 
@@ -806,7 +821,11 @@ impl JitDedupTable {
     pub fn new(arity: usize) -> Self {
         Self {
             entries_vec: Vec::new(),
-            handle: JitDedupHandle { entries: std::ptr::null_mut(), cap: 0, _pad: 0 },
+            handle: JitDedupHandle {
+                entries: std::ptr::null_mut(),
+                cap: 0,
+                _pad: 0,
+            },
             stride: arity + 1,
             count: 0,
         }
@@ -816,13 +835,17 @@ impl JitDedupTable {
     pub fn probe(&self, hash: u32, packed: &[u32]) -> bool {
         debug_assert_eq!(packed.len() + 1, self.stride);
         let cap = self.handle.cap as usize;
-        if cap == 0 { return false; }
+        if cap == 0 {
+            return false;
+        }
         let mask = cap - 1;
         let mut slot = (hash as usize) & mask;
         loop {
             let base = slot * self.stride;
             let h = self.entries_vec[base];
-            if h == JITDEDUP_EMPTY { return false; }
+            if h == JITDEDUP_EMPTY {
+                return false;
+            }
             if h == hash && self.entries_vec[base + 1..base + self.stride] == *packed {
                 return true;
             }
@@ -843,7 +866,9 @@ impl JitDedupTable {
             loop {
                 let base = slot * self.stride;
                 let h = self.entries_vec[base];
-                if h == JITDEDUP_EMPTY { break; }
+                if h == JITDEDUP_EMPTY {
+                    break;
+                }
                 if h == hash && self.entries_vec[base + 1..base + self.stride] == *packed {
                     return false;
                 }

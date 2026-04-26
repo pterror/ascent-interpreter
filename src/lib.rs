@@ -8,6 +8,6 @@
 //! evaluator. The `jit-asm` feature can still be enabled in `Cargo.toml` on
 //! non-x86-64 targets — it simply has no effect.
 
-pub mod syntax;
-pub mod ir;
 pub mod eval;
+pub mod ir;
+pub mod syntax;

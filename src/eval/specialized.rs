@@ -146,7 +146,6 @@ impl PackedType {
     }
 }
 
-
 /// Try to classify all columns as packable. Returns None if any column
 /// is unknown or not u32-representable.
 pub fn try_packed_col_types(col_types: &[Option<String>]) -> Option<Vec<PackedType>> {
@@ -272,9 +271,7 @@ impl PackedStorage {
     /// - `recent`: covers only the recent tuples (gathered from `self.recent` index list).
     /// - `new`:    empty write buffer with initial capacity 64 tuples.
     #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
-    pub(crate) fn build_native_projection(
-        &self,
-    ) -> crate::eval::jit::storage::JitNativeRelData {
+    pub(crate) fn build_native_projection(&self) -> crate::eval::jit::storage::JitNativeRelData {
         use crate::eval::jit::storage::{JitNativeRelData, JitRelData};
 
         let arity = self.arity;
@@ -313,7 +310,9 @@ impl PackedStorage {
                     recent_buf = {
                         let mut buf = Vec::with_capacity(n_recent * arity);
                         for &idx in &self.recent {
-                            buf.extend_from_slice(&self.packed_data[idx * arity..idx * arity + arity]);
+                            buf.extend_from_slice(
+                                &self.packed_data[idx * arity..idx * arity + arity],
+                            );
                         }
                         buf
                     };
@@ -368,7 +367,9 @@ impl PackedStorage {
                     recent_buf = {
                         let mut buf = Vec::with_capacity(n_recent * arity);
                         for &idx in &self.recent {
-                            buf.extend_from_slice(&self.packed_data[idx * arity..idx * arity + arity]);
+                            buf.extend_from_slice(
+                                &self.packed_data[idx * arity..idx * arity + arity],
+                            );
                         }
                         buf
                     };
@@ -541,7 +542,7 @@ impl PackedStorage {
         true
     }
 
-/// Insert a pre-packed tuple whose dedup entry has already been written by the JIT.
+    /// Insert a pre-packed tuple whose dedup entry has already been written by the JIT.
     ///
     /// Skips the `jit_dedup.insert_if_new` check (the JIT wrote to the dedup table inline).
     pub fn contains(&self, tuple: &[Value]) -> bool {
@@ -634,7 +635,11 @@ impl PackedStorage {
     /// Use this on the asm native path, which reads `JitColIndex` directly and never
     /// touches `jit_indices` / `jit_recent_indices`.
     #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
-    pub(crate) fn advance_jit_inner(&mut self, update_hash_indices: bool, rebuild_jit_native: bool) -> bool {
+    pub(crate) fn advance_jit_inner(
+        &mut self,
+        update_hash_indices: bool,
+        rebuild_jit_native: bool,
+    ) -> bool {
         // Flush any tuples the JIT wrote to jit_native.new into this relation's delta.
         // Takes only the `new` buffer from jit_native so we can update jit_native in-place
         // when nothing changed (avoids a full rebuild of total + recent).
@@ -656,9 +661,7 @@ impl PackedStorage {
                     // the native JIT. All tuples are guaranteed new (native JIT deduped
                     // via total.tuple_set which tracks the same set as jit_dedup), so
                     // use unconditional insert to skip the redundant probe.
-                    let data = unsafe {
-                        std::slice::from_raw_parts(data_ptr, new_len * arity)
-                    };
+                    let data = unsafe { std::slice::from_raw_parts(data_ptr, new_len * arity) };
                     // Batch flush: one extend for packed_data, one extend for delta,
                     // then a tight per-tuple loop for jit_dedup (unavoidable per-tuple
                     // hash+insert), eliminating per-tuple function call overhead.
@@ -770,7 +773,11 @@ impl PackedStorage {
                     // directly from the authoritative dedup table.
                     if is_sink_native {
                         let handle = &self.jit_dedup.handle;
-                        let mask = if handle.cap == 0 { 0 } else { (handle.cap - 1) as u64 };
+                        let mask = if handle.cap == 0 {
+                            0
+                        } else {
+                            (handle.cap - 1) as u64
+                        };
                         unsafe { native.total.alias_tuple_set(handle.entries, mask) };
                     }
                 }
@@ -812,8 +819,11 @@ impl PackedStorage {
                             &recent_buf
                         }
                     };
-                    native.recent =
-                        JitRelData::build_from_packed_no_tupleset(recent_data, arity, build_indices);
+                    native.recent = JitRelData::build_from_packed_no_tupleset(
+                        recent_data,
+                        arity,
+                        build_indices,
+                    );
                 }
             }
         }
@@ -906,8 +916,10 @@ impl PackedStorage {
                         // Col-value linked-list for arity-2 derived: store the other
                         // column's value directly, eliminating a packed_data_ptr call
                         // per inner-loop match in gen_index_scan_v3.
-                        self.jit_indices[0].insert(self.packed_data[base], self.packed_data[base + 1]);
-                        self.jit_indices[1].insert(self.packed_data[base + 1], self.packed_data[base]);
+                        self.jit_indices[0]
+                            .insert(self.packed_data[base], self.packed_data[base + 1]);
+                        self.jit_indices[1]
+                            .insert(self.packed_data[base + 1], self.packed_data[base]);
                     } else {
                         for col in 0..self.arity {
                             self.jit_indices[col].insert(self.packed_data[base + col], idx as u32);
@@ -923,11 +935,13 @@ impl PackedStorage {
         let arity = self.arity;
         let is_edb = self.jit_is_edb;
         if self.jit_recent_indices.len() != arity {
-            self.jit_recent_indices.resize_with(arity, crate::eval::jit_index::JitHashIndex::empty);
+            self.jit_recent_indices
+                .resize_with(arity, crate::eval::jit_index::JitHashIndex::empty);
         }
         if is_edb {
             for col in 0..arity {
-                let pairs: Vec<(u32, u32)> = self.recent
+                let pairs: Vec<(u32, u32)> = self
+                    .recent
                     .iter()
                     .map(|&idx| {
                         let key = self.packed_data[idx * arity + col];
@@ -950,11 +964,14 @@ impl PackedStorage {
                 let base = idx * arity;
                 if arity == 2 {
                     // Col-value linked-list for arity-2 derived (mirrors full index).
-                    self.jit_recent_indices[0].insert(self.packed_data[base], self.packed_data[base + 1]);
-                    self.jit_recent_indices[1].insert(self.packed_data[base + 1], self.packed_data[base]);
+                    self.jit_recent_indices[0]
+                        .insert(self.packed_data[base], self.packed_data[base + 1]);
+                    self.jit_recent_indices[1]
+                        .insert(self.packed_data[base + 1], self.packed_data[base]);
                 } else {
                     for col in 0..arity {
-                        self.jit_recent_indices[col].insert(self.packed_data[base + col], idx as u32);
+                        self.jit_recent_indices[col]
+                            .insert(self.packed_data[base + col], idx as u32);
                     }
                 }
             }
@@ -1006,7 +1023,8 @@ impl PackedStorage {
         }
         let needed_packed = n * self.arity;
         if self.packed_data.capacity() < needed_packed {
-            self.packed_data.reserve(needed_packed - self.packed_data.len());
+            self.packed_data
+                .reserve(needed_packed - self.packed_data.len());
         }
         if self.delta.capacity() < n {
             self.delta.reserve(n - self.delta.len());

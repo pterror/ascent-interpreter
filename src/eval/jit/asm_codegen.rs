@@ -52,12 +52,14 @@
 //!   - rbx is restored from level_dptr_save_slot(L)
 //!   - then loop back to level L's inner_hdr
 
-use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi, DynamicLabel};
 use dynasmrt::x64::Assembler;
+use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use rustc_hash::FxHashMap;
 
-use crate::eval::compiled::{CAggArg, CAggregation, CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CUnOp};
+use crate::eval::compiled::{
+    CAggArg, CAggregation, CBinOp, CClause, CClauseArg, CCondition, CExpr, CHeadClause, CUnOp,
+};
 use crate::eval::jit::packed_helpers::StratumStage4Fn;
 use crate::eval::jit::storage;
 use crate::eval::value::Value;
@@ -75,7 +77,10 @@ pub(crate) struct InternCmp {
 
 impl InternCmp {
     pub(crate) fn empty() -> Self {
-        InternCmp { vars: FxHashMap::default(), addr: 0 }
+        InternCmp {
+            vars: FxHashMap::default(),
+            addr: 0,
+        }
     }
 }
 
@@ -87,7 +92,13 @@ static EMPTY_INTERN_CMP: std::sync::LazyLock<InternCmp> =
 /// `(clauses, heads, conditions, not_clauses, agg_clauses)`.
 /// `not_clauses`: negation anti-joins (`aggregator_name == "not"`).
 /// `agg_clauses`: real aggregations (count/sum/min/max, pure-aggregation rules only).
-pub(crate) type AsmRuleRef<'a> = (&'a [CClause], &'a [CHeadClause], &'a [CExpr], &'a [CAggregation], &'a [CAggregation]);
+pub(crate) type AsmRuleRef<'a> = (
+    &'a [CClause],
+    &'a [CHeadClause],
+    &'a [CExpr],
+    &'a [CAggregation],
+    &'a [CAggregation],
+);
 
 /// A compiled stratum function produced by the asm backend.
 pub struct AsmStratum {
@@ -148,7 +159,9 @@ fn compute_var_locs(
     is_multi_clause: bool,
 ) -> Vec<VarLoc> {
     // Start with everything on the stack.
-    let mut locs: Vec<VarLoc> = (0..var_count as u32).map(|id| VarLoc::Stack(var_slot(id))).collect();
+    let mut locs: Vec<VarLoc> = (0..var_count as u32)
+        .map(|id| VarLoc::Stack(var_slot(id)))
+        .collect();
 
     // Build the list of available registers, priority-ordered.
     let mut available: Vec<u8> = Vec::new();
@@ -198,14 +211,24 @@ fn level_vptr_slot(level: usize, var_count: usize, max_head_arity: usize) -> i32
 
 /// Slot to save r15 (next_node for level L) before descending into level L+1.
 /// L >= 1.  Offset: base - MAX_DEPTH*8 - L*8
-fn level_node_save_slot(level: usize, var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 {
+fn level_node_save_slot(
+    level: usize,
+    var_count: usize,
+    max_head_arity: usize,
+    max_depth: usize,
+) -> i32 {
     debug_assert!(level >= 1);
     level_slots_base(var_count, max_head_arity) - (max_depth as i32) * 8 - (level as i32) * 8
 }
 
 /// Slot to save rbx (data_ptr for level L) before descending into level L+1.
 /// L >= 1.  Offset: base - 2*MAX_DEPTH*8 - L*8
-fn level_dptr_save_slot(level: usize, var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 {
+fn level_dptr_save_slot(
+    level: usize,
+    var_count: usize,
+    max_head_arity: usize,
+    max_depth: usize,
+) -> i32 {
     debug_assert!(level >= 1);
     level_slots_base(var_count, max_head_arity) - 2 * (max_depth as i32) * 8 - (level as i32) * 8
 }
@@ -214,7 +237,12 @@ fn level_dptr_save_slot(level: usize, var_count: usize, max_head_arity: usize, m
 /// Used only when the clause at level L has a contiguous index.
 /// Stores the u32 count loaded from entry.count (JitIndexEntry offset 8).
 /// L >= 1.  Offset: base - 3*MAX_DEPTH*8 - L*8
-fn level_count_slot(level: usize, var_count: usize, max_head_arity: usize, max_depth: usize) -> i32 {
+fn level_count_slot(
+    level: usize,
+    var_count: usize,
+    max_head_arity: usize,
+    max_depth: usize,
+) -> i32 {
     debug_assert!(level >= 1);
     level_slots_base(var_count, max_head_arity) - 3 * (max_depth as i32) * 8 - (level as i32) * 8
 }
@@ -321,10 +349,10 @@ macro_rules! load_rel_rdi {
 fn emit_load_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
     match var_locs[id as usize] {
         VarLoc::Stack(slot) => dynasm!(asm; mov eax, [rbp + slot]),
-        VarLoc::Reg(3)      => dynasm!(asm; mov eax, ebx),
-        VarLoc::Reg(13)     => dynasm!(asm; mov eax, r13d),
-        VarLoc::Reg(14)     => dynasm!(asm; mov eax, r14d),
-        VarLoc::Reg(r)      => panic!("emit_load_var: unexpected reg {r}"),
+        VarLoc::Reg(3) => dynasm!(asm; mov eax, ebx),
+        VarLoc::Reg(13) => dynasm!(asm; mov eax, r13d),
+        VarLoc::Reg(14) => dynasm!(asm; mov eax, r14d),
+        VarLoc::Reg(r) => panic!("emit_load_var: unexpected reg {r}"),
     }
 }
 
@@ -332,10 +360,10 @@ fn emit_load_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
 fn emit_load_var_ecx(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
     match var_locs[id as usize] {
         VarLoc::Stack(slot) => dynasm!(asm; mov ecx, [rbp + slot]),
-        VarLoc::Reg(3)      => dynasm!(asm; mov ecx, ebx),
-        VarLoc::Reg(13)     => dynasm!(asm; mov ecx, r13d),
-        VarLoc::Reg(14)     => dynasm!(asm; mov ecx, r14d),
-        VarLoc::Reg(r)      => panic!("emit_load_var_ecx: unexpected reg {r}"),
+        VarLoc::Reg(3) => dynasm!(asm; mov ecx, ebx),
+        VarLoc::Reg(13) => dynasm!(asm; mov ecx, r13d),
+        VarLoc::Reg(14) => dynasm!(asm; mov ecx, r14d),
+        VarLoc::Reg(r) => panic!("emit_load_var_ecx: unexpected reg {r}"),
     }
 }
 
@@ -343,10 +371,10 @@ fn emit_load_var_ecx(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
 fn emit_store_var(asm: &mut Assembler, var_locs: &[VarLoc], id: u32) {
     match var_locs[id as usize] {
         VarLoc::Stack(slot) => dynasm!(asm; mov [rbp + slot], edx),
-        VarLoc::Reg(3)      => dynasm!(asm; mov ebx, edx),
-        VarLoc::Reg(13)     => dynasm!(asm; mov r13d, edx),
-        VarLoc::Reg(14)     => dynasm!(asm; mov r14d, edx),
-        VarLoc::Reg(r)      => panic!("emit_store_var: unexpected reg {r}"),
+        VarLoc::Reg(3) => dynasm!(asm; mov ebx, edx),
+        VarLoc::Reg(13) => dynasm!(asm; mov r13d, edx),
+        VarLoc::Reg(14) => dynasm!(asm; mov r14d, edx),
+        VarLoc::Reg(r) => panic!("emit_store_var: unexpected reg {r}"),
     }
 }
 
@@ -434,20 +462,28 @@ fn emit_tuple_set_probe_scalar(
 
     // Load args AFTER rdi (safe: rdi no longer needed as pointer).
     load_arg!(asm, 0, edi);
-    if arity >= 2 { load_arg!(asm, 1, esi); }
-    if arity >= 3 { load_arg!(asm, 2, r11d); }
+    if arity >= 2 {
+        load_arg!(asm, 1, esi);
+    }
+    if arity >= 3 {
+        load_arg!(asm, 2, r11d);
+    }
 
     // Compute tuple_hash
     dynasm!(asm; mov eax, 0x9e3779b9u32 as i32);
     dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, edi);
-    if arity >= 2 { dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, esi); }
-    if arity >= 3 { dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, r11d); }
+    if arity >= 2 {
+        dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, esi);
+    }
+    if arity >= 3 {
+        dynasm!(asm; imul eax, eax, 0x9e3779b9u32 as i32; add eax, r11d);
+    }
     let hash_ok = asm.new_dynamic_label();
     dynasm!(asm; test eax, eax; jnz =>hash_ok; mov eax, 1; =>hash_ok);
     dynasm!(asm; mov edx, eax); // edx = hash_tag
     dynasm!(asm; mov r10, rax; and r10, r9); // r10 = slot
 
-    let probe_lp   = asm.new_dynamic_label();
+    let probe_lp = asm.new_dynamic_label();
     let probe_next = asm.new_dynamic_label();
     let probe_done = asm.new_dynamic_label();
 
@@ -465,8 +501,12 @@ fn emit_tuple_set_probe_scalar(
         ; jne =>probe_next
     );
     dynasm!(asm; cmp [r8 + rcx*4 + 4], edi; jne =>probe_next);
-    if arity >= 2 { dynasm!(asm; cmp [r8 + rcx*4 + 8], esi;   jne =>probe_next); }
-    if arity >= 3 { dynasm!(asm; cmp [r8 + rcx*4 + 12], r11d; jne =>probe_next); }
+    if arity >= 2 {
+        dynasm!(asm; cmp [r8 + rcx*4 + 8], esi;   jne =>probe_next);
+    }
+    if arity >= 3 {
+        dynasm!(asm; cmp [r8 + rcx*4 + 12], r11d; jne =>probe_next);
+    }
     dynasm!(asm; jmp =>probe_done);
     dynasm!(asm; =>probe_next; inc r10; and r10, r9; jmp =>probe_lp);
     dynasm!(asm; =>probe_done);
@@ -496,7 +536,11 @@ fn emit_tuple_set_probe(
             CClauseArg::Var(_) => {}
             CClauseArg::Expr(CExpr::Literal(crate::eval::value::Value::I32(_))) => {}
             CClauseArg::Expr(CExpr::Literal(crate::eval::value::Value::Bool(_))) => {}
-            _ => return Err(format!("emit_tuple_set_probe: unsupported arg type: {arg:?}")),
+            _ => {
+                return Err(format!(
+                    "emit_tuple_set_probe: unsupported arg type: {arg:?}"
+                ));
+            }
         }
     }
 
@@ -504,7 +548,14 @@ fn emit_tuple_set_probe(
     // The SIMD Swiss-table path (JitSwissTable, commit 3392df1) was measured to add
     // ~15 instructions of setup overhead vs no benefit for small hot tables that fit
     // in L1/L2 cache.  The scalar probe is faster in the common case.
-    emit_tuple_set_probe_scalar(asm, clause, handle_idx, when_exhausted, var_locs, native_probe)
+    emit_tuple_set_probe_scalar(
+        asm,
+        clause,
+        handle_idx,
+        when_exhausted,
+        var_locs,
+        native_probe,
+    )
 }
 
 // ─── EDB full-probe via JitColIndex scan ───────────────────────────────────
@@ -576,11 +627,7 @@ fn emit_native_edb_full_probe(
         CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
             dynasm!(asm; mov ecx, *n);
         }
-        _ => {
-            return Err(
-                "emit_native_edb_full_probe: unsupported primary arg type".to_string(),
-            )
-        }
+        _ => return Err("emit_native_edb_full_probe: unsupported primary arg type".to_string()),
     }
 
     // Hash-probe JitColIndex for primary key → start (esi), count (eax), vals (r11)
@@ -593,7 +640,7 @@ fn emit_native_edb_full_probe(
         ; mov r9, [r8]          // keys ptr
     );
 
-    let probe_lp  = asm.new_dynamic_label();
+    let probe_lp = asm.new_dynamic_label();
     let probe_hit = asm.new_dynamic_label();
 
     dynasm!(asm; =>probe_lp);
@@ -636,11 +683,7 @@ fn emit_native_edb_full_probe(
         CClauseArg::Expr(CExpr::Literal(Value::I32(n))) => {
             dynasm!(asm; mov r10d, *n);
         }
-        _ => {
-            return Err(
-                "emit_native_edb_full_probe: unsupported secondary arg type".to_string(),
-            )
-        }
+        _ => return Err("emit_native_edb_full_probe: unsupported secondary arg type".to_string()),
     }
 
     // Binary search: vals[lo..=hi] for secondary key (target = r10d).
@@ -657,7 +700,7 @@ fn emit_native_edb_full_probe(
     // terminates in ceil(log₂(count)) ≤ 7 iterations for count ≤ 99.
     // The ~400-byte slice for a fixed primary key is L1-resident after the
     // first probe, making each subsequent probe essentially free.
-    let bsearch_loop  = asm.new_dynamic_label();
+    let bsearch_loop = asm.new_dynamic_label();
     let bsearch_right = asm.new_dynamic_label();
     let bsearch_found = asm.new_dynamic_label();
 
@@ -749,8 +792,7 @@ fn detect_merge_pattern(p: &EmitParams<'_>, level: usize) -> Option<MergePattern
         }
         _ => return None,
     };
-    let scan_flat_idx =
-        p.rule_handle_base + level * 2 + if p.use_recent[level] { 1 } else { 0 };
+    let scan_flat_idx = p.rule_handle_base + level * 2 + if p.use_recent[level] { 1 } else { 0 };
     let exist_flat_idx = p.rule_handle_base + exist_level * 2; // total (use_recent=false)
     Some(MergePattern {
         scan_flat_idx,
@@ -815,7 +857,7 @@ fn emit_merge_scan_exist(
         ; and eax, edx                                 // slot = hash & mask
         ; mov r9, [r8]                                 // keys ptr
     );
-    let probe_a_lp  = asm.new_dynamic_label();
+    let probe_a_lp = asm.new_dynamic_label();
     let probe_a_hit = asm.new_dynamic_label();
     dynasm!(asm; =>probe_a_lp);
     dynasm!(asm
@@ -877,7 +919,7 @@ fn emit_merge_scan_exist(
         ; and eax, edx
         ; mov r9, [r8]
     );
-    let probe_b_lp  = asm.new_dynamic_label();
+    let probe_b_lp = asm.new_dynamic_label();
     let probe_b_hit = asm.new_dynamic_label();
     dynasm!(asm; =>probe_b_lp);
     dynasm!(asm
@@ -911,14 +953,14 @@ fn emit_merge_scan_exist(
     //   equal   → match: bind fresh_var, emit body, advance both
     //   b < a   → advance ptr_b (scan pointer)
     //   b > a   → advance ptr_a (exist pointer, in [rbp + ptr_a_slot])
-    let merge_loop  = asm.new_dynamic_label();
+    let merge_loop = asm.new_dynamic_label();
     let merge_adv_b = asm.new_dynamic_label();
     let merge_match = asm.new_dynamic_label();
-    let merge_cont  = asm.new_dynamic_label();
+    let merge_cont = asm.new_dynamic_label();
 
     dynasm!(asm; =>merge_loop);
     // Bounds checks
-    dynasm!(asm; cmp r15, rbx; jge =>when_exhausted);        // ptr_b >= end_b
+    dynasm!(asm; cmp r15, rbx; jge =>when_exhausted); // ptr_b >= end_b
     dynasm!(asm
         ; mov rax, [rbp + ptr_a_slot]
         ; cmp rax, [rbp + end_a_slot]
@@ -967,12 +1009,27 @@ fn emit_merge_scan_exist(
             dynasm!(asm; test eax, eax; jz =>merge_cont);
         }
         emit_not_probes(
-            asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, merge_cont,
+            asm,
+            p.negations,
+            p.clauses.len(),
+            p.rule_i,
+            p.var_locs,
+            merge_cont,
         )?;
         emit_heads(
-            asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth,
-            p.pti, p.var_locs, p.use_jit_native, p.rule_head_base,
-            p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp,
+            asm,
+            p.heads,
+            p.rule_i,
+            p.var_count,
+            p.max_head_arity,
+            p.max_depth,
+            p.pti,
+            p.var_locs,
+            p.use_jit_native,
+            p.rule_head_base,
+            p.jit_rel_data_grow_addr,
+            p.jit_tuple_set_grow_addr,
+            p.intern_cmp,
         )?;
     } else {
         // Non-terminal: recurse into deeper level (exist_level+1).
@@ -993,7 +1050,7 @@ fn emit_merge_scan_exist(
 
     // merge_cont: advance both pointers, then loop.
     dynasm!(asm; =>merge_cont);
-    dynasm!(asm; add r15, 4);                    // advance ptr_b
+    dynasm!(asm; add r15, 4); // advance ptr_b
     dynasm!(asm
         ; mov rax, [rbp + ptr_a_slot]
         ; add rax, 4
@@ -1009,9 +1066,9 @@ fn check_expr(expr: &CExpr) -> Result<(), String> {
     match expr {
         CExpr::Var(_) | CExpr::DerefVar(_) => Ok(()),
         CExpr::Literal(Value::I32(_)) | CExpr::Literal(Value::Bool(_)) => Ok(()),
-        CExpr::VarBinVar(op, _, _)
-        | CExpr::VarBinLit(op, _, _)
-        | CExpr::LitBinVar(op, _, _) => check_binop(*op),
+        CExpr::VarBinVar(op, _, _) | CExpr::VarBinLit(op, _, _) | CExpr::LitBinVar(op, _, _) => {
+            check_binop(*op)
+        }
         CExpr::Binary(op, a, b) => {
             check_binop(*op)?;
             check_expr(a)?;
@@ -1025,8 +1082,8 @@ fn check_expr(expr: &CExpr) -> Result<(), String> {
 fn check_binop(op: CBinOp) -> Result<(), String> {
     use CBinOp::*;
     match op {
-        Add | Sub | Mul | Div | Rem | Eq | Ne | Lt | Le | Gt | Ge
-        | And | Or | BitAnd | BitOr | BitXor | Shl | Shr => Ok(()),
+        Add | Sub | Mul | Div | Rem | Eq | Ne | Lt | Le | Gt | Ge | And | Or | BitAnd | BitOr
+        | BitXor | Shl | Shr => Ok(()),
     }
 }
 
@@ -1090,13 +1147,20 @@ fn find_interned_table_for_ordering(
 /// `jit_cmp_interned` instead of raw `cmp eax, ecx` (which would compare
 /// intern IDs rather than semantic values).
 #[allow(clippy::only_used_in_recursion)]
-fn emit_expr(asm: &mut Assembler, expr: &CExpr, var_locs: &[VarLoc], icmp: &InternCmp) -> Result<(), String> {
+fn emit_expr(
+    asm: &mut Assembler,
+    expr: &CExpr,
+    var_locs: &[VarLoc],
+    icmp: &InternCmp,
+) -> Result<(), String> {
     match expr {
         CExpr::Var(id) => emit_load_var(asm, var_locs, *id),
         CExpr::Literal(Value::I32(n)) => dynasm!(asm; mov eax, *n),
         CExpr::Literal(Value::Bool(b)) => dynasm!(asm; mov eax, if *b { 1i32 } else { 0i32 }),
         CExpr::VarBinVar(op, a, b) => {
-            if let Some((data, vtable)) = find_interned_table_for_ordering(*op, Some(*a), Some(*b), icmp) {
+            if let Some((data, vtable)) =
+                find_interned_table_for_ordering(*op, Some(*a), Some(*b), icmp)
+            {
                 emit_load_var(asm, var_locs, *a);
                 emit_load_var_ecx(asm, var_locs, *b);
                 emit_interned_cmp(asm, *op, data, vtable, icmp.addr);
@@ -1130,9 +1194,17 @@ fn emit_expr(asm: &mut Assembler, expr: &CExpr, var_locs: &[VarLoc], icmp: &Inte
             emit_expr(asm, a, var_locs, icmp)?;
             dynasm!(asm; pop rcx);
             // For Binary with ordering ops, check if sub-exprs reference interned vars.
-            let lhs_var = match a.as_ref() { CExpr::Var(id) | CExpr::DerefVar(id) => Some(*id), _ => None };
-            let rhs_var = match b.as_ref() { CExpr::Var(id) | CExpr::DerefVar(id) => Some(*id), _ => None };
-            if let Some((data, vtable)) = find_interned_table_for_ordering(*op, lhs_var, rhs_var, icmp) {
+            let lhs_var = match a.as_ref() {
+                CExpr::Var(id) | CExpr::DerefVar(id) => Some(*id),
+                _ => None,
+            };
+            let rhs_var = match b.as_ref() {
+                CExpr::Var(id) | CExpr::DerefVar(id) => Some(*id),
+                _ => None,
+            };
+            if let Some((data, vtable)) =
+                find_interned_table_for_ordering(*op, lhs_var, rhs_var, icmp)
+            {
                 emit_interned_cmp(asm, *op, data, vtable, icmp.addr);
             } else {
                 emit_binop(asm, *op)?;
@@ -1161,22 +1233,22 @@ fn emit_binop(asm: &mut Assembler, op: CBinOp) -> Result<(), String> {
         Sub => dynasm!(asm; sub eax, ecx),
         Mul => dynasm!(asm; imul eax, ecx),
         And => dynasm!(asm; and eax, ecx),
-        Or  => dynasm!(asm; or eax, ecx),
-        Eq     => dynasm!(asm; cmp eax, ecx; sete al; movzx eax, al),
-        Ne     => dynasm!(asm; cmp eax, ecx; setne al; movzx eax, al),
-        Lt     => dynasm!(asm; cmp eax, ecx; setl al; movzx eax, al),
-        Le     => dynasm!(asm; cmp eax, ecx; setle al; movzx eax, al),
-        Gt     => dynasm!(asm; cmp eax, ecx; setg al; movzx eax, al),
-        Ge     => dynasm!(asm; cmp eax, ecx; setge al; movzx eax, al),
+        Or => dynasm!(asm; or eax, ecx),
+        Eq => dynasm!(asm; cmp eax, ecx; sete al; movzx eax, al),
+        Ne => dynasm!(asm; cmp eax, ecx; setne al; movzx eax, al),
+        Lt => dynasm!(asm; cmp eax, ecx; setl al; movzx eax, al),
+        Le => dynasm!(asm; cmp eax, ecx; setle al; movzx eax, al),
+        Gt => dynasm!(asm; cmp eax, ecx; setg al; movzx eax, al),
+        Ge => dynasm!(asm; cmp eax, ecx; setge al; movzx eax, al),
         BitAnd => dynasm!(asm; and eax, ecx),
-        BitOr  => dynasm!(asm; or eax, ecx),
+        BitOr => dynasm!(asm; or eax, ecx),
         BitXor => dynasm!(asm; xor eax, ecx),
-        Shl    => dynasm!(asm; shl eax, cl),
-        Shr    => dynasm!(asm; sar eax, cl),
+        Shl => dynasm!(asm; shl eax, cl),
+        Shr => dynasm!(asm; sar eax, cl),
         // cdq sign-extends eax into edx:eax; idiv ecx: quotient→eax, remainder→edx.
         // rdx is documented as clobbered by emit_expr, so this is safe.
-        Div    => dynasm!(asm; cdq; idiv ecx),
-        Rem    => dynasm!(asm; cdq; idiv ecx; mov eax, edx),
+        Div => dynasm!(asm; cdq; idiv ecx),
+        Rem => dynasm!(asm; cdq; idiv ecx; mov eax, edx),
     }
     Ok(())
 }
@@ -1249,10 +1321,12 @@ fn emit_bind_col_value(
             let v = if *b { 1i32 } else { 0i32 };
             dynasm!(asm; cmp ecx, v; jne =>skip);
         }
-        _ => return Err(format!(
-            "asm: col_value: unsupported free col arg: {:?}",
-            &clause.args[free_col]
-        )),
+        _ => {
+            return Err(format!(
+                "asm: col_value: unsupported free col arg: {:?}",
+                &clause.args[free_col]
+            ));
+        }
     }
     Ok(())
 }
@@ -1285,8 +1359,16 @@ fn emit_heads(
     icmp: &InternCmp,
 ) -> Result<(), String> {
     // Precompute native ctx array-ptr cache slots (used throughout native write path).
-    let hr_slot  = if use_jit_native { native_head_rels_slot(var_count, max_head_arity, max_depth) } else { 0 };
-    let htr_slot = if use_jit_native { native_head_total_rels_slot(var_count, max_head_arity, max_depth) } else { 0 };
+    let hr_slot = if use_jit_native {
+        native_head_rels_slot(var_count, max_head_arity, max_depth)
+    } else {
+        0
+    };
+    let htr_slot = if use_jit_native {
+        native_head_total_rels_slot(var_count, max_head_arity, max_depth)
+    } else {
+        0
+    };
 
     for (hi, head) in heads.iter().enumerate() {
         let arity = head.args.len();
@@ -1377,7 +1459,7 @@ fn emit_heads(
                     ; mov r10, rdx                     // slot = hash & mask
                     ; and r10, r9
                 );
-                let total_probe_lp   = asm.new_dynamic_label();
+                let total_probe_lp = asm.new_dynamic_label();
                 let total_probe_next = asm.new_dynamic_label();
                 let total_probe_miss = asm.new_dynamic_label();
                 dynasm!(asm; =>total_probe_lp);
@@ -1417,7 +1499,7 @@ fn emit_heads(
                     ; mov r10, rdx                     // slot = hash & mask
                     ; and r10, r9
                 );
-                let probe_lp   = asm.new_dynamic_label();
+                let probe_lp = asm.new_dynamic_label();
                 let probe_next = asm.new_dynamic_label();
                 dynasm!(asm; =>probe_lp);
                 dynasm!(asm; imul rcx, r10, stride);
@@ -1506,8 +1588,8 @@ fn emit_heads(
                 ; mov r9, [rdi + 40]   // reload mask
             );
             // Write slot: slots[r10*stride + 0] = hash_tag; slots[r10*stride + k+1] = col[k]
-            dynasm!(asm; imul rcx, r10, stride);  // rcx = r10 * stride (word index)
-            dynasm!(asm; mov [r8 + rcx*4], edx);  // write hash_tag
+            dynasm!(asm; imul rcx, r10, stride); // rcx = r10 * stride (word index)
+            dynasm!(asm; mov [r8 + rcx*4], edx); // write hash_tag
             for col in 0..arity {
                 let field_off = ((1 + col) as i32) * 4;
                 dynasm!(asm
@@ -1712,14 +1794,20 @@ fn emit_not_probes(
     var_locs: &[VarLoc],
     skip_label: DynamicLabel,
 ) -> Result<(), String> {
-    use crate::eval::jit::packed_helpers::{check_not_packed_1, check_not_packed_2, check_not_packed_3};
+    use crate::eval::jit::packed_helpers::{
+        check_not_packed_1, check_not_packed_2, check_not_packed_3,
+    };
     for (neg_i, neg) in negations.iter().enumerate() {
         let arity = neg.args.len();
         // Extract var ids (eligibility already checked — all args are Var).
-        let var_ids: Vec<u32> = neg.args.iter().map(|arg| match arg {
-            CAggArg::Var(id) => Ok(*id),
-            CAggArg::Expr(_) => Err(format!("not-clause '{}' has non-var arg", neg.relation)),
-        }).collect::<Result<Vec<_>, _>>()?;
+        let var_ids: Vec<u32> = neg
+            .args
+            .iter()
+            .map(|arg| match arg {
+                CAggArg::Var(id) => Ok(*id),
+                CAggArg::Expr(_) => Err(format!("not-clause '{}' has non-var arg", neg.relation)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let check_fn: usize = match arity {
             1 => check_not_packed_1 as usize,
@@ -1786,7 +1874,11 @@ struct SimdFilter {
 ///   - `clause.args[free_col]` is a fresh variable (being bound by this scan).
 ///   - One of `clause.conditions` is `CCondition::If(VarBinVar(Lt|Gt, ...) | VarBinLit(...) | LitBinVar(...))`.
 ///   - The comparand is a bound variable on the stack or an i32 literal.
-fn detect_simd_filter(clause: &CClause, free_col: usize, var_locs: &[VarLoc]) -> Option<SimdFilter> {
+fn detect_simd_filter(
+    clause: &CClause,
+    free_col: usize,
+    var_locs: &[VarLoc],
+) -> Option<SimdFilter> {
     // Only applicable when the free column arg is a fresh variable.
     let free_var = match &clause.args[free_col] {
         CClauseArg::Var(vid) if clause.fresh_cols.iter().any(|&(c, _)| c == free_col) => *vid,
@@ -1831,7 +1923,11 @@ fn detect_simd_filter(clause: &CClause, free_col: usize, var_locs: &[VarLoc]) ->
             _ => None,
         };
         if let Some((comparand, elements_gt)) = result {
-            return Some(SimdFilter { comparand, elements_gt, skip_cond: idx });
+            return Some(SimdFilter {
+                comparand,
+                elements_gt,
+                skip_cond: idx,
+            });
         }
     }
     None
@@ -1929,7 +2025,9 @@ fn emit_col_value_simd_prefix(
 
     // Emit conditions, skipping the one already handled by SIMD.
     for (idx, cond) in clause.conditions.iter().enumerate() {
-        if idx == filter.skip_cond { continue; }
+        if idx == filter.skip_cond {
+            continue;
+        }
         if let CCondition::If(expr) = cond {
             emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
             dynasm!(asm; test eax, eax; jz =>simd_elem_continue);
@@ -1942,8 +2040,29 @@ fn emit_col_value_simd_prefix(
             emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
             dynasm!(asm; test eax, eax; jz =>simd_elem_continue);
         }
-        emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, simd_elem_continue)?;
-        emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
+        emit_not_probes(
+            asm,
+            p.negations,
+            p.clauses.len(),
+            p.rule_i,
+            p.var_locs,
+            simd_elem_continue,
+        )?;
+        emit_heads(
+            asm,
+            p.heads,
+            p.rule_i,
+            p.var_count,
+            p.max_head_arity,
+            p.max_depth,
+            p.pti,
+            p.var_locs,
+            p.use_jit_native,
+            p.rule_head_base,
+            p.jit_rel_data_grow_addr,
+            p.jit_tuple_set_grow_addr,
+            p.intern_cmp,
+        )?;
     } else {
         let simd_sub_exhausted = asm.new_dynamic_label();
         emit_clause_level(asm, p, level + 1, outer_exit, simd_sub_exhausted)?;
@@ -2031,9 +2150,9 @@ fn emit_clause_level(
             if use_recent {
                 // Pointer-based outer loop: r13 = current_ptr, r12 = end_ptr.
                 // r14 is freed — available for variable assignment in compute_var_locs.
-                dynasm!(asm; mov r13, [rdi]);               // r13 = data (start_ptr)
-                dynasm!(asm; imul r12, r12, stride);        // r12 = len * stride
-                dynasm!(asm; add r12, r13);                 // r12 = end_ptr
+                dynasm!(asm; mov r13, [rdi]); // r13 = data (start_ptr)
+                dynasm!(asm; imul r12, r12, stride); // r12 = len * stride
+                dynasm!(asm; add r12, r13); // r12 = end_ptr
             } else {
                 // Index-based outer loop: r12 = count, r14 = counter.
                 // r13 may hold a variable — cache data_ptr in a stack slot instead.
@@ -2042,7 +2161,7 @@ fn emit_clause_level(
                     ; mov rax, [rdi]                    // JitRelData.data @ 0
                     ; mov [rbp + dp0], rax              // cache data_ptr
                 );
-                dynasm!(asm; xor r14d, r14d);           // i = 0
+                dynasm!(asm; xor r14d, r14d); // i = 0
             }
 
             let loop_hdr = asm.new_dynamic_label();
@@ -2053,7 +2172,7 @@ fn emit_clause_level(
             if use_recent {
                 // Pointer-based: compare current_ptr against end_ptr.
                 dynasm!(asm; cmp r13, r12; jge =>outer_exit);
-                dynasm!(asm; mov rax, r13);             // rax = current tuple_ptr
+                dynasm!(asm; mov rax, r13); // rax = current tuple_ptr
             } else {
                 // Index-based: compare counter against count.
                 dynasm!(asm; cmp r14, r12; jge =>outer_exit);
@@ -2081,8 +2200,29 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                     dynasm!(asm; test eax, eax; jz =>outer_continue);
                 }
-                emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, outer_continue)?;
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
+                emit_not_probes(
+                    asm,
+                    p.negations,
+                    p.clauses.len(),
+                    p.rule_i,
+                    p.var_locs,
+                    outer_continue,
+                )?;
+                emit_heads(
+                    asm,
+                    p.heads,
+                    p.rule_i,
+                    p.var_count,
+                    p.max_head_arity,
+                    p.max_depth,
+                    p.pti,
+                    p.var_locs,
+                    p.use_jit_native,
+                    p.rule_head_base,
+                    p.jit_rel_data_grow_addr,
+                    p.jit_tuple_set_grow_addr,
+                    p.intern_cmp,
+                )?;
             } else {
                 emit_clause_level(asm, p, 1, outer_exit, outer_continue)?;
             }
@@ -2094,76 +2234,96 @@ fn emit_clause_level(
                 dynasm!(asm; inc r14; jmp =>loop_hdr);
             }
         } else {
-        // ── Old path: use packed_count / packed_recent_ptr / packed_data_ptr callbacks ──
+            // ── Old path: use packed_count / packed_recent_ptr / packed_data_ptr callbacks ──
 
-        // Count
-        load_rel_rdi!(asm, p.rule_i, 0usize);
-        dynasm!(asm; mov esi, uri32);
-        call_abs!(asm, p.pcount);
-        dynasm!(asm; mov r12, rax; test r12, r12; jz =>outer_exit);
-
-        // Recent ptr (stable across loop; r13 = recent_ptr)
-        if use_recent {
+            // Count
             load_rel_rdi!(asm, p.rule_i, 0usize);
-            call_abs!(asm, p.prptr);
-            dynasm!(asm; mov r13, rax);
-        }
+            dynasm!(asm; mov esi, uri32);
+            call_abs!(asm, p.pcount);
+            dynasm!(asm; mov r12, rax; test r12, r12; jz =>outer_exit);
 
-        dynasm!(asm; xor r14d, r14d);  // i = 0
-
-        let loop_hdr = asm.new_dynamic_label();
-        let outer_continue = asm.new_dynamic_label();
-
-        dynasm!(asm; =>loop_hdr);
-        dynasm!(asm; cmp r14, r12; jge =>outer_exit);
-
-        // tuple_idx → rbx (survives the data_ptr call since rbx is callee-saved)
-        if use_recent {
-            dynasm!(asm; mov rbx, [r13 + r14*8]);
-        } else {
-            dynasm!(asm; mov rbx, r14);
-        }
-
-        // data_ptr for clause0
-        load_rel_rdi!(asm, p.rule_i, 0usize);
-        call_abs!(asm, p.pdptr);
-        // rax = data_ptr, rbx = tuple_idx
-
-        dynasm!(asm
-            ; imul rcx, rbx, stride
-            ; add rax, rcx             // rax = tuple_ptr
-        );
-
-        // Bind clause0 cols
-        emit_bind_cols(asm, clause, outer_continue, p.var_locs)?;
-
-        // Clause0 conditions
-        for cond in &clause.conditions {
-            if let CCondition::If(expr) = cond {
-                emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
-                dynasm!(asm; test eax, eax; jz =>outer_continue);
+            // Recent ptr (stable across loop; r13 = recent_ptr)
+            if use_recent {
+                load_rel_rdi!(asm, p.rule_i, 0usize);
+                call_abs!(asm, p.prptr);
+                dynasm!(asm; mov r13, rax);
             }
-        }
 
-        if p.clauses.len() == 1 {
-            // 1-clause rule: emit rule conditions and heads here
-            for expr in p.rule_conds {
-                emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
-                dynasm!(asm; test eax, eax; jz =>outer_continue);
+            dynasm!(asm; xor r14d, r14d); // i = 0
+
+            let loop_hdr = asm.new_dynamic_label();
+            let outer_continue = asm.new_dynamic_label();
+
+            dynasm!(asm; =>loop_hdr);
+            dynasm!(asm; cmp r14, r12; jge =>outer_exit);
+
+            // tuple_idx → rbx (survives the data_ptr call since rbx is callee-saved)
+            if use_recent {
+                dynasm!(asm; mov rbx, [r13 + r14*8]);
+            } else {
+                dynasm!(asm; mov rbx, r14);
             }
-            emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, outer_continue)?;
-            emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
-        } else {
-            // Multi-clause: recurse into level 1.
-            // The level-1 code is emitted inline here; it ends by jumping to
-            // outer_continue when exhausted.
-            emit_clause_level(asm, p, 1, outer_exit, outer_continue)?;
-        }
 
-        dynasm!(asm; =>outer_continue);
-        dynasm!(asm; inc r14; jmp =>loop_hdr);
+            // data_ptr for clause0
+            load_rel_rdi!(asm, p.rule_i, 0usize);
+            call_abs!(asm, p.pdptr);
+            // rax = data_ptr, rbx = tuple_idx
+
+            dynasm!(asm
+                ; imul rcx, rbx, stride
+                ; add rax, rcx             // rax = tuple_ptr
+            );
+
+            // Bind clause0 cols
+            emit_bind_cols(asm, clause, outer_continue, p.var_locs)?;
+
+            // Clause0 conditions
+            for cond in &clause.conditions {
+                if let CCondition::If(expr) = cond {
+                    emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
+                    dynasm!(asm; test eax, eax; jz =>outer_continue);
+                }
+            }
+
+            if p.clauses.len() == 1 {
+                // 1-clause rule: emit rule conditions and heads here
+                for expr in p.rule_conds {
+                    emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
+                    dynasm!(asm; test eax, eax; jz =>outer_continue);
+                }
+                emit_not_probes(
+                    asm,
+                    p.negations,
+                    p.clauses.len(),
+                    p.rule_i,
+                    p.var_locs,
+                    outer_continue,
+                )?;
+                emit_heads(
+                    asm,
+                    p.heads,
+                    p.rule_i,
+                    p.var_count,
+                    p.max_head_arity,
+                    p.max_depth,
+                    p.pti,
+                    p.var_locs,
+                    p.use_jit_native,
+                    p.rule_head_base,
+                    p.jit_rel_data_grow_addr,
+                    p.jit_tuple_set_grow_addr,
+                    p.intern_cmp,
+                )?;
+            } else {
+                // Multi-clause: recurse into level 1.
+                // The level-1 code is emitted inline here; it ends by jumping to
+                // outer_continue when exhausted.
+                emit_clause_level(asm, p, 1, outer_exit, outer_continue)?;
+            }
+
+            dynasm!(asm; =>outer_continue);
+            dynasm!(asm; inc r14; jmp =>loop_hdr);
         } // end old path
-
     } else {
         // ── Level >= 1: hash probe + inner scan ────────────────────────────
         //
@@ -2198,8 +2358,10 @@ fn emit_clause_level(
         // regardless of which path was taken at this level.
         if level >= 2 {
             let save_level = level - 1;
-            let node_slot = level_node_save_slot(save_level, p.var_count, p.max_head_arity, p.max_depth);
-            let dptr_slot = level_dptr_save_slot(save_level, p.var_count, p.max_head_arity, p.max_depth);
+            let node_slot =
+                level_node_save_slot(save_level, p.var_count, p.max_head_arity, p.max_depth);
+            let dptr_slot =
+                level_dptr_save_slot(save_level, p.var_count, p.max_head_arity, p.max_depth);
             dynasm!(asm
                 ; mov [rbp + node_slot], r15
                 ; mov [rbp + dptr_slot], rbx
@@ -2222,8 +2384,8 @@ fn emit_clause_level(
             // primary key is L1-resident across all inner iterations.  JitTupleSet at
             // large n (96KB for n=100) spills to L2 (~10 cycles/miss), making the
             // binary search faster despite more instructions.
-            let use_col_scan = p.use_jit_native && !is_rec && arity == 2
-                && !clause.bound_cols.is_empty();
+            let use_col_scan =
+                p.use_jit_native && !is_rec && arity == 2 && !clause.bound_cols.is_empty();
             if use_col_scan {
                 emit_native_edb_full_probe(asm, p, level, clause, when_exhausted)?;
                 for cond in &clause.conditions {
@@ -2237,8 +2399,29 @@ fn emit_clause_level(
                         emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                         dynasm!(asm; test eax, eax; jz =>when_exhausted);
                     }
-                    emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, when_exhausted)?;
-                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
+                    emit_not_probes(
+                        asm,
+                        p.negations,
+                        p.clauses.len(),
+                        p.rule_i,
+                        p.var_locs,
+                        when_exhausted,
+                    )?;
+                    emit_heads(
+                        asm,
+                        p.heads,
+                        p.rule_i,
+                        p.var_count,
+                        p.max_head_arity,
+                        p.max_depth,
+                        p.pti,
+                        p.var_locs,
+                        p.use_jit_native,
+                        p.rule_head_base,
+                        p.jit_rel_data_grow_addr,
+                        p.jit_tuple_set_grow_addr,
+                        p.intern_cmp,
+                    )?;
                     dynasm!(asm; jmp =>when_exhausted);
                 } else {
                     emit_clause_level(asm, p, level + 1, outer_exit, when_exhausted)?;
@@ -2248,9 +2431,23 @@ fn emit_clause_level(
             // Non-native or IDB or arity != 2: fall back to JitTupleSet hash probe.
             let handle_idx_in_buf = flat_idx;
             let native_total_for_probe = if p.use_jit_native {
-                Some((total_flat_idx, native_total_rels_slot(p.var_count, p.max_head_arity, p.max_depth)))
-            } else { None };
-            if emit_tuple_set_probe(asm, clause, handle_idx_in_buf, when_exhausted, p.var_locs, native_total_for_probe).is_ok() {
+                Some((
+                    total_flat_idx,
+                    native_total_rels_slot(p.var_count, p.max_head_arity, p.max_depth),
+                ))
+            } else {
+                None
+            };
+            if emit_tuple_set_probe(
+                asm,
+                clause,
+                handle_idx_in_buf,
+                when_exhausted,
+                p.var_locs,
+                native_total_for_probe,
+            )
+            .is_ok()
+            {
                 // Probe succeeded (emitted inline code). Fall through means found.
                 for cond in &clause.conditions {
                     if let CCondition::If(expr) = cond {
@@ -2263,8 +2460,29 @@ fn emit_clause_level(
                         emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                         dynasm!(asm; test eax, eax; jz =>when_exhausted);
                     }
-                    emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, when_exhausted)?;
-                    emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
+                    emit_not_probes(
+                        asm,
+                        p.negations,
+                        p.clauses.len(),
+                        p.rule_i,
+                        p.var_locs,
+                        when_exhausted,
+                    )?;
+                    emit_heads(
+                        asm,
+                        p.heads,
+                        p.rule_i,
+                        p.var_count,
+                        p.max_head_arity,
+                        p.max_depth,
+                        p.pti,
+                        p.var_locs,
+                        p.use_jit_native,
+                        p.rule_head_base,
+                        p.jit_rel_data_grow_addr,
+                        p.jit_tuple_set_grow_addr,
+                        p.intern_cmp,
+                    )?;
                     dynasm!(asm; jmp =>when_exhausted);
                 } else {
                     emit_clause_level(asm, p, level + 1, outer_exit, when_exhausted)?;
@@ -2391,76 +2609,76 @@ fn emit_clause_level(
             );
             // rdi still = *mut JitRelData for this scan slot
         } else {
-        // ── Old path: probe JitLookupHandle (JitHashIndex) ──────────────────
+            // ── Old path: probe JitLookupHandle (JitHashIndex) ──────────────────
 
-        // Probe: handle_off uses (clause_seq * 2 + use_recent) * 24 (JitLookupHandle stride)
-        let handle_off: i32 = ((level * 2 + if use_recent { 1 } else { 0 }) * 24) as i32;
-        load_rule_ctx!(asm, p.rule_i);
-        dynasm!(asm
-            ; mov rax, [rax + 24i8]   // lookup_handles ptr
-            ; add rax, handle_off
-            ; mov r8,  [rax]          // entries_ptr (offset  0)
-            ; mov r11, [rax + 8i8]   // values_ptr  (offset  8)
-            ; mov r10d, [rax + 16i8] // mask        (offset 16)
-        );
+            // Probe: handle_off uses (clause_seq * 2 + use_recent) * 24 (JitLookupHandle stride)
+            let handle_off: i32 = ((level * 2 + if use_recent { 1 } else { 0 }) * 24) as i32;
+            load_rule_ctx!(asm, p.rule_i);
+            dynasm!(asm
+                ; mov rax, [rax + 24i8]   // lookup_handles ptr
+                ; add rax, handle_off
+                ; mov r8,  [rax]          // entries_ptr (offset  0)
+                ; mov r11, [rax + 8i8]   // values_ptr  (offset  8)
+                ; mov r10d, [rax + 16i8] // mask        (offset 16)
+            );
 
-        // Hash: slot = (key * KNUTH32) & mask  (ecx = key)
-        dynasm!(asm
-            ; mov eax, ecx
-            ; imul eax, eax, 0x9e3779b1u32 as i32
-            ; mov edx, eax
-            ; and rdx, r10
-        );
+            // Hash: slot = (key * KNUTH32) & mask  (ecx = key)
+            dynasm!(asm
+                ; mov eax, ecx
+                ; imul eax, eax, 0x9e3779b1u32 as i32
+                ; mov edx, eax
+                ; and rdx, r10
+            );
 
-        let probe_lp  = asm.new_dynamic_label();
-        let probe_ok  = asm.new_dynamic_label();
-        let probe_ovf = asm.new_dynamic_label();
-        let after_probe = asm.new_dynamic_label();
+            let probe_lp = asm.new_dynamic_label();
+            let probe_ok = asm.new_dynamic_label();
+            let probe_ovf = asm.new_dynamic_label();
+            let after_probe = asm.new_dynamic_label();
 
-        // probe_loop: load entries_ptr[slot*16].key (offset 0, u32)
-        // JitIndexEntry: key@0, head@4, count@8, _pad@12 (16 bytes total)
-        // x86 doesn't support *16 scale; use shl+add to compute slot*16.
-        dynasm!(asm; =>probe_lp);
-        dynasm!(asm
-            ; mov rax, rdx
-            ; shl rax, 4              // rax = slot * 16
-            ; add rax, r8             // rax = entries_ptr + slot*16
-            ; mov esi, [rax]          // esi = entry.key (offset 0)
-            ; cmp esi, -1i32
-            ; je =>probe_ovf
-            ; cmp esi, ecx
-            ; je =>probe_ok
-            ; inc rdx
-            ; and rdx, r10
-            ; jmp =>probe_lp
-        );
+            // probe_loop: load entries_ptr[slot*16].key (offset 0, u32)
+            // JitIndexEntry: key@0, head@4, count@8, _pad@12 (16 bytes total)
+            // x86 doesn't support *16 scale; use shl+add to compute slot*16.
+            dynasm!(asm; =>probe_lp);
+            dynasm!(asm
+                ; mov rax, rdx
+                ; shl rax, 4              // rax = slot * 16
+                ; add rax, r8             // rax = entries_ptr + slot*16
+                ; mov esi, [rax]          // esi = entry.key (offset 0)
+                ; cmp esi, -1i32
+                ; je =>probe_ovf
+                ; cmp esi, ecx
+                ; je =>probe_ok
+                ; inc rdx
+                ; and rdx, r10
+                ; jmp =>probe_lp
+            );
 
-        // probe_ok: entry.head @ offset 4, entry.count @ offset 8
-        dynasm!(asm; =>probe_ok);
-        dynasm!(asm
-            ; mov rax, rdx
-            ; shl rax, 4
-            ; add rax, r8             // rax = entries_ptr + slot*16
-            ; mov esi, [rax + 4i8]   // esi = entry.head (start)
-            ; mov eax, [rax + 8i8]   // eax = entry.count
-            ; jmp =>after_probe
-        );
+            // probe_ok: entry.head @ offset 4, entry.count @ offset 8
+            dynasm!(asm; =>probe_ok);
+            dynasm!(asm
+                ; mov rax, rdx
+                ; shl rax, 4
+                ; add rax, r8             // rax = entries_ptr + slot*16
+                ; mov esi, [rax + 4i8]   // esi = entry.head (start)
+                ; mov eax, [rax + 8i8]   // eax = entry.count
+                ; jmp =>after_probe
+            );
 
-        // probe_ovf: overflow slot at entries_ptr[(mask+1)*16]
-        dynasm!(asm; =>probe_ovf);
-        dynasm!(asm
-            ; lea rdx, [r10 + 1]     // overflow slot index = mask + 1
-            ; mov rax, rdx
-            ; shl rax, 4
-            ; add rax, r8             // rax = entries_ptr + (mask+1)*16
-            ; mov esi, [rax]          // entry.key
-            ; cmp esi, ecx
-            ; jne =>when_exhausted   // key not found → exhaust this level
-            ; mov esi, [rax + 4i8]   // entry.head (start)
-            ; mov eax, [rax + 8i8]   // entry.count
-        );
+            // probe_ovf: overflow slot at entries_ptr[(mask+1)*16]
+            dynasm!(asm; =>probe_ovf);
+            dynasm!(asm
+                ; lea rdx, [r10 + 1]     // overflow slot index = mask + 1
+                ; mov rax, rdx
+                ; shl rax, 4
+                ; add rax, r8             // rax = entries_ptr + (mask+1)*16
+                ; mov esi, [rax]          // entry.key
+                ; cmp esi, ecx
+                ; jne =>when_exhausted   // key not found → exhaust this level
+                ; mov esi, [rax + 4i8]   // entry.head (start)
+                ; mov eax, [rax + 8i8]   // entry.count
+            );
 
-        dynasm!(asm; =>after_probe);
+            dynasm!(asm; =>after_probe);
         } // end old path hash probe
 
         // Dispatch to contiguous scan or linked-list traversal.
@@ -2508,7 +2726,7 @@ fn emit_clause_level(
                 if p.use_jit_native {
                     // Native path: load data_ptr directly from JitRelData.data (offset 0)
                     // rdi still = *mut JitRelData for this scan slot (set during hash probe)
-                    dynasm!(asm; mov rbx, [rdi]);  // JitRelData.data @ 0
+                    dynasm!(asm; mov rbx, [rdi]); // JitRelData.data @ 0
                 } else {
                     load_rel_rdi!(asm, p.rule_i, level);
                     call_abs!(asm, p.pdptr);
@@ -2579,8 +2797,29 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
-                emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, inner_continue)?;
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
+                emit_not_probes(
+                    asm,
+                    p.negations,
+                    p.clauses.len(),
+                    p.rule_i,
+                    p.var_locs,
+                    inner_continue,
+                )?;
+                emit_heads(
+                    asm,
+                    p.heads,
+                    p.rule_i,
+                    p.var_count,
+                    p.max_head_arity,
+                    p.max_depth,
+                    p.pti,
+                    p.var_locs,
+                    p.use_jit_native,
+                    p.rule_head_base,
+                    p.jit_rel_data_grow_addr,
+                    p.jit_tuple_set_grow_addr,
+                    p.intern_cmp,
+                )?;
                 if is_col_value && clause.fresh_cols.is_empty() {
                     dynasm!(asm; jmp =>when_exhausted);
                 }
@@ -2589,8 +2828,10 @@ fn emit_clause_level(
                 emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
 
                 dynasm!(asm; =>sub_exhausted);
-                let node_slot = level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
-                let dptr_slot = level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+                let node_slot =
+                    level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+                let dptr_slot =
+                    level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
                 dynasm!(asm
                     ; mov r15, [rbp + node_slot]
                     ; mov rbx, [rbp + dptr_slot]
@@ -2683,15 +2924,38 @@ fn emit_clause_level(
                     emit_expr(asm, expr, p.var_locs, p.intern_cmp)?;
                     dynasm!(asm; test eax, eax; jz =>inner_continue);
                 }
-                emit_not_probes(asm, p.negations, p.clauses.len(), p.rule_i, p.var_locs, inner_continue)?;
-                emit_heads(asm, p.heads, p.rule_i, p.var_count, p.max_head_arity, p.max_depth, p.pti, p.var_locs, p.use_jit_native, p.rule_head_base, p.jit_rel_data_grow_addr, p.jit_tuple_set_grow_addr, p.intern_cmp)?;
+                emit_not_probes(
+                    asm,
+                    p.negations,
+                    p.clauses.len(),
+                    p.rule_i,
+                    p.var_locs,
+                    inner_continue,
+                )?;
+                emit_heads(
+                    asm,
+                    p.heads,
+                    p.rule_i,
+                    p.var_count,
+                    p.max_head_arity,
+                    p.max_depth,
+                    p.pti,
+                    p.var_locs,
+                    p.use_jit_native,
+                    p.rule_head_base,
+                    p.jit_rel_data_grow_addr,
+                    p.jit_tuple_set_grow_addr,
+                    p.intern_cmp,
+                )?;
             } else {
                 let sub_exhausted = asm.new_dynamic_label();
                 emit_clause_level(asm, p, level + 1, outer_exit, sub_exhausted)?;
 
                 dynasm!(asm; =>sub_exhausted);
-                let node_slot = level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
-                let dptr_slot = level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+                let node_slot =
+                    level_node_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
+                let dptr_slot =
+                    level_dptr_save_slot(level, p.var_count, p.max_head_arity, p.max_depth);
                 dynasm!(asm
                     ; mov r15, [rbp + node_slot]
                     ; mov rbx, [rbp + dptr_slot]
@@ -2721,10 +2985,14 @@ fn emit_aggregations(
     rule_i: usize,
     variant_exit: DynamicLabel,
 ) -> Result<(), String> {
-    use crate::eval::jit::packed_helpers::{AGG_EMPTY, packed_agg_count, packed_agg_max_i32, packed_agg_min_i32, packed_agg_sum_i32};
+    use crate::eval::jit::packed_helpers::{
+        AGG_EMPTY, packed_agg_count, packed_agg_max_i32, packed_agg_min_i32, packed_agg_sum_i32,
+    };
     for (agg_i, agg) in aggregations.iter().enumerate() {
         let rel_seq = num_pos_clauses + num_nots + agg_i;
-        let result_var = *agg.result_vars.first()
+        let result_var = *agg
+            .result_vars
+            .first()
             .ok_or_else(|| format!("agg '{}': no result vars", agg.aggregator_name))?;
         match agg.aggregator_name.as_str() {
             "count" => {
@@ -2734,9 +3002,14 @@ fn emit_aggregations(
                 dynasm!(asm; mov [rbp + var_slot(result_var)], eax);
             }
             name @ ("sum" | "min" | "max") => {
-                let bv = *agg.bound_vars.first()
+                let bv = *agg
+                    .bound_vars
+                    .first()
                     .ok_or_else(|| format!("agg '{name}': no bound vars"))?;
-                let col = agg.args.iter().position(|a| matches!(a, CAggArg::Var(v) if *v == bv))
+                let col = agg
+                    .args
+                    .iter()
+                    .position(|a| matches!(a, CAggArg::Var(v) if *v == bv))
                     .ok_or_else(|| format!("agg '{name}': bound var not found in args"))?;
                 let fn_addr = match name {
                     "sum" => packed_agg_sum_i32 as usize,
@@ -2800,9 +3073,7 @@ fn emit_rule_variant(
     };
     let var_locs = compute_var_locs(var_count, &outer_fresh_ids, use_recent0, is_multi_clause);
 
-    let use_recent_vec: Vec<bool> = (0..clauses.len())
-        .map(|i| recent_idx == Some(i))
-        .collect();
+    let use_recent_vec: Vec<bool> = (0..clauses.len()).map(|i| recent_idx == Some(i)).collect();
     let is_rec_vec: Vec<bool> = clauses
         .iter()
         .map(|c| heads.iter().any(|h| h.relation == c.relation))
@@ -2814,8 +3085,8 @@ fn emit_rule_variant(
     // Must be done BEFORE the clauses.is_empty() early return, because emit_heads
     // reads hr_slot / htr_slot for inline JitRelData writes.
     if use_jit_native {
-        let tr_slot  = native_total_rels_slot(var_count, max_head_arity, max_depth);
-        let hr_slot  = native_head_rels_slot(var_count, max_head_arity, max_depth);
+        let tr_slot = native_total_rels_slot(var_count, max_head_arity, max_depth);
+        let hr_slot = native_head_rels_slot(var_count, max_head_arity, max_depth);
         let htr_slot = native_head_total_rels_slot(var_count, max_head_arity, max_depth);
         dynasm!(asm
             ; mov r8, [rbp + CTX_SLOT]
@@ -2835,7 +3106,21 @@ fn emit_rule_variant(
         }
         emit_not_probes(asm, negations, 0, rule_i, &var_locs, variant_exit)?;
         emit_aggregations(asm, aggs, 0, negations.len(), rule_i, variant_exit)?;
-        emit_heads(asm, heads, rule_i, var_count, max_head_arity, max_depth, pti, &var_locs, use_jit_native, rule_head_base, jit_rel_data_grow_addr, jit_tuple_set_grow_addr, intern_cmp)?;
+        emit_heads(
+            asm,
+            heads,
+            rule_i,
+            var_count,
+            max_head_arity,
+            max_depth,
+            pti,
+            &var_locs,
+            use_jit_native,
+            rule_head_base,
+            jit_rel_data_grow_addr,
+            jit_tuple_set_grow_addr,
+            intern_cmp,
+        )?;
         dynasm!(asm; =>variant_exit);
         return Ok(());
     }
@@ -2899,35 +3184,49 @@ fn codegen_stratum_asm_inner(
 ) -> Result<AsmStratum, String> {
     // ── Eligibility ──────────────────────────────────────────────────────────
     if var_count > 10_000 {
-        return Err(format!("asm: var_count {var_count} exceeds limit of 10000; stack frame would be too large"));
+        return Err(format!(
+            "asm: var_count {var_count} exceeds limit of 10000; stack frame would be too large"
+        ));
     }
     for (ri, (clauses, heads, conds, nots, aggs)) in rules.iter().enumerate() {
         // Native path does not support negation or aggregation.
         if use_jit_native && (!nots.is_empty() || !aggs.is_empty()) {
-            return Err(format!("asm native: rule {ri} has negation clauses (unsupported)"));
+            return Err(format!(
+                "asm native: rule {ri} has negation clauses (unsupported)"
+            ));
         }
         for head in *heads {
             if head.args.len() > 8 {
                 return Err(format!("asm: rule {ri} head arity {} > 8", head.args.len()));
             }
-            for arg in &head.args { check_expr(arg)?; }
+            for arg in &head.args {
+                check_expr(arg)?;
+            }
         }
-        for cond in *conds { check_expr(cond)?; }
+        for cond in *conds {
+            check_expr(cond)?;
+        }
         for clause in *clauses {
             for cond in &clause.conditions {
-                if let CCondition::If(e) = cond { check_expr(e)?; }
+                if let CCondition::If(e) = cond {
+                    check_expr(e)?;
+                }
             }
         }
         // clause0 must have no bound cols (full scan)
         if let Some(c0) = clauses.first()
             && !c0.bound_cols.is_empty()
         {
-            return Err(format!("asm: rule {ri} clause0 has bound_cols; unsupported"));
+            return Err(format!(
+                "asm: rule {ri} clause0 has bound_cols; unsupported"
+            ));
         }
         // clauses 1..N must have at least one bound col for index probe
         for (ci, c) in clauses.iter().enumerate().skip(1) {
             if c.bound_cols.is_empty() {
-                return Err(format!("asm: rule {ri} clause{ci} has no bound_cols; unsupported"));
+                return Err(format!(
+                    "asm: rule {ri} clause{ci} has no bound_cols; unsupported"
+                ));
             }
         }
         // IDB inner clauses are handled correctly by the non-native asm linked-list path.
@@ -3010,10 +3309,21 @@ fn codegen_stratum_asm_inner(
     for (rule_i, (clauses, heads, conds, nots, aggs)) in rules.iter().enumerate() {
         let icmp = intern_cmps.get(rule_i).unwrap_or(&EMPTY_INTERN_CMP);
         emit_rule_variant(
-            &mut asm, rule_i, clauses, heads, conds, nots, aggs, None,
-            var_count, max_head_arity, max_depth,
-            packed_try_insert_addr, packed_count_addr,
-            packed_data_ptr_addr, packed_recent_ptr_addr,
+            &mut asm,
+            rule_i,
+            clauses,
+            heads,
+            conds,
+            nots,
+            aggs,
+            None,
+            var_count,
+            max_head_arity,
+            max_depth,
+            packed_try_insert_addr,
+            packed_count_addr,
+            packed_data_ptr_addr,
+            packed_recent_ptr_addr,
             rule_handle_bases[rule_i],
             rule_head_bases[rule_i],
             use_jit_native,
@@ -3036,10 +3346,21 @@ fn codegen_stratum_asm_inner(
         let icmp = intern_cmps.get(rule_i).unwrap_or(&EMPTY_INTERN_CMP);
         for clause_seq in 0..clauses.len() {
             emit_rule_variant(
-                &mut asm, rule_i, clauses, heads, conds, nots, aggs, Some(clause_seq),
-                var_count, max_head_arity, max_depth,
-                packed_try_insert_addr, packed_count_addr,
-                packed_data_ptr_addr, packed_recent_ptr_addr,
+                &mut asm,
+                rule_i,
+                clauses,
+                heads,
+                conds,
+                nots,
+                aggs,
+                Some(clause_seq),
+                var_count,
+                max_head_arity,
+                max_depth,
+                packed_try_insert_addr,
+                packed_count_addr,
+                packed_data_ptr_addr,
+                packed_recent_ptr_addr,
                 rule_handle_bases[rule_i],
                 rule_head_bases[rule_i],
                 use_jit_native,
@@ -3067,9 +3388,14 @@ fn codegen_stratum_asm_inner(
         ; ret
     );
 
-    let buffer = asm.finalize().map_err(|_| "asm finalize: reloc error".to_string())?;
+    let buffer = asm
+        .finalize()
+        .map_err(|_| "asm finalize: reloc error".to_string())?;
     let fn_ptr: StratumStage4Fn = unsafe { std::mem::transmute(buffer.ptr(fn_start)) };
-    Ok(AsmStratum { _buffer: buffer, fn_ptr })
+    Ok(AsmStratum {
+        _buffer: buffer,
+        fn_ptr,
+    })
 }
 
 /// Old (non-native) entry point: uses `packed_count`/`packed_data_ptr`/`packed_recent_ptr`
@@ -3089,7 +3415,8 @@ pub fn codegen_stratum_asm(
     intern_cmps: &[InternCmp],
 ) -> Result<AsmStratum, String> {
     codegen_stratum_asm_inner(
-        rules, var_count,
+        rules,
+        var_count,
         advance_s4_addr,
         packed_try_insert_addr,
         packed_count_addr,
@@ -3124,7 +3451,8 @@ pub fn codegen_stratum_asm_native(
         .map(|(c, h, e)| (*c, *h, *e, &[] as &[CAggregation], &[] as &[CAggregation]))
         .collect();
     codegen_stratum_asm_inner(
-        &rules_with_nots, var_count,
+        &rules_with_nots,
+        var_count,
         advance_native_addr,
         0, // packed_try_insert_addr unused in native path (Step 5)
         0, // packed_count_addr unused in native path

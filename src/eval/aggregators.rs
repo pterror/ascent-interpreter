@@ -210,10 +210,7 @@ mod tests {
 
     #[test]
     fn test_mean_inexact_int() {
-        let values: Vec<Vec<Value>> = vec![
-            vec![Value::I32(1)],
-            vec![Value::I32(2)],
-        ];
+        let values: Vec<Vec<Value>> = vec![vec![Value::I32(1)], vec![Value::I32(2)]];
         let result = agg_mean(values.iter().map(|v| v.as_slice()));
         assert_eq!(result.len(), 1);
         if let Value::F64(crate::eval::value::OrderedFloat(v)) = result[0][0] {

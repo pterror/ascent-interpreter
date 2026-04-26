@@ -3,8 +3,8 @@
 
 #![cfg(feature = "jit")]
 
-use ascent_interpreter::eval::value::Value;
 use ascent_interpreter::eval::Engine;
+use ascent_interpreter::eval::value::Value;
 use ascent_interpreter::ir::Program;
 use ascent_interpreter::syntax::AscentProgram as AstProgram;
 
@@ -74,7 +74,16 @@ fn test_jit_tc_chain_30_standalone() {
                relation path(i32, i32);\n\
                path(x, y) <-- edge(x, y);\n\
                path(x, z) <-- edge(x, y), path(y, z);";
-    let results = jit_run(src, &[("edge", (1..=30).map(|i| vec![Value::I32(i), Value::I32(i + 1)]).collect())], "path");
+    let results = jit_run(
+        src,
+        &[(
+            "edge",
+            (1..=30)
+                .map(|i| vec![Value::I32(i), Value::I32(i + 1)])
+                .collect(),
+        )],
+        "path",
+    );
     assert_eq!(results.len(), 465, "TC chain-30 should produce 465 pairs");
 }
 
@@ -170,7 +179,11 @@ fn test_macro_parity_triangle_k30() {
     jit_results.sort();
 
     let expected = (n * (n - 1) * (n - 2) / 6) as usize;
-    assert_eq!(jit_results.len(), expected, "K_{n}: expected C({n},3) = {expected}");
+    assert_eq!(
+        jit_results.len(),
+        expected,
+        "K_{n}: expected C({n},3) = {expected}"
+    );
     assert_eq!(
         jit_results, macro_results,
         "JIT triangle K_{n} differs from ascent_macro"
@@ -323,11 +336,14 @@ fn test_macro_parity_negation() {
         .map(|&v| vec![Value::I32(v)])
         .collect();
     let parents: Vec<Vec<Value>> = [2, 3, 5].iter().map(|&v| vec![Value::I32(v)]).collect();
-    let mut jit_results: Vec<(i32,)> =
-        jit_run(src, &[("person", persons), ("has_parent", parents)], "orphan")
-            .iter()
-            .map(|t| extract_i32_single(t))
-            .collect();
+    let mut jit_results: Vec<(i32,)> = jit_run(
+        src,
+        &[("person", persons), ("has_parent", parents)],
+        "orphan",
+    )
+    .iter()
+    .map(|t| extract_i32_single(t))
+    .collect();
     jit_results.sort();
 
     assert_eq!(jit_results.len(), 2, "Negation: expected 2 orphans");
@@ -540,7 +556,10 @@ fn test_macro_parity_diamond() {
     );
     // Verify (1,4) appears exactly once
     assert_eq!(
-        jit_results.iter().filter(|&&(a, b)| a == 1 && b == 4).count(),
+        jit_results
+            .iter()
+            .filter(|&&(a, b)| a == 1 && b == 4)
+            .count(),
         1,
         "path(1,4) should appear exactly once (dedup)"
     );

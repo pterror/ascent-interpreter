@@ -64,7 +64,10 @@ impl BytecodeProgram {
         }
         let idx = self.constants.len();
         if idx > u16::MAX as usize {
-            panic!("bytecode constant pool overflow: more than {} constants", u16::MAX);
+            panic!(
+                "bytecode constant pool overflow: more than {} constants",
+                u16::MAX
+            );
         }
         self.constants.push(val);
         idx as u16

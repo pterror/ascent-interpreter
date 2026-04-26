@@ -16,10 +16,10 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 
 use crate::syntax::syn_utils::{expr_get_vars, pattern_get_vars};
+use crate::syntax::utils::{expr_to_ident, is_wildcard};
 use crate::syntax::{
     AggClauseNode, AscentProgram, BodyClauseArg, BodyClauseNode, BodyItemNode, CondClause, RuleNode,
 };
-use crate::syntax::utils::{expr_to_ident, is_wildcard};
 
 /// Generator for unique identifiers.
 #[derive(Clone)]
@@ -145,9 +145,8 @@ pub fn desugar_pattern_args(rule: RuleNode) -> RuleNode {
                 BodyClauseArg::Pat(pat) => {
                     let pattern = pat.pattern;
                     let ident = gensym.next_ident("__pat", pattern.span());
-                    let new_cond_clause: CondClause =
-                        parse2(quote! { if let #pattern = #ident })
-                            .expect("internal: generated syntax must parse");
+                    let new_cond_clause: CondClause = parse2(quote! { if let #pattern = #ident })
+                        .expect("internal: generated syntax must parse");
                     new_cond_clauses.push(new_cond_clause);
                     BodyClauseArg::Expr(
                         parse2(quote! { #ident }).expect("internal: generated syntax must parse"),
@@ -238,11 +237,10 @@ pub fn desugar_repeated_vars(mut rule: RuleNode) -> RuleNode {
                             parse2(quote_spanned! {expr.span()=> if #new_ident == #expr })
                                 .expect("internal: generated syntax must parse");
                         new_cond_clauses.push(check);
-                        cl.args[arg_ind] =
-                            BodyClauseArg::Expr(
-                                parse2(quote! { #new_ident })
-                                    .expect("internal: generated syntax must parse"),
-                            );
+                        cl.args[arg_ind] = BodyClauseArg::Expr(
+                            parse2(quote! { #new_ident })
+                                .expect("internal: generated syntax must parse"),
+                        );
                     } else if let Some(ident) = expr_to_ident(expr) {
                         grounded_vars.entry(ident).or_insert(i);
                     }

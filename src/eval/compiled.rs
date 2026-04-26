@@ -219,9 +219,9 @@ fn compile_clause(clause: &Clause, interner: &VarInterner) -> CClause {
             .iter()
             .map(|c| compile_condition(c, interner))
             .collect(),
-        all_args_bound: false,         // computed by optimize_body
-        bound_cols: Vec::new(),        // computed by optimize_body
-        fresh_cols: Vec::new(),        // computed by optimize_body
+        all_args_bound: false,             // computed by optimize_body
+        bound_cols: Vec::new(),            // computed by optimize_body
+        fresh_cols: Vec::new(),            // computed by optimize_body
         meaningful_fresh_cols: Vec::new(), // computed by optimize_body
     }
 }
@@ -413,7 +413,9 @@ fn body_item_all_vars(item: &CBodyItem, vars: &mut FxHashSet<VarId>) {
             }
             for cond in &c.conditions {
                 match cond {
-                    CCondition::If(e) | CCondition::IfLet { expr: e, .. } | CCondition::Let { expr: e, .. } => {
+                    CCondition::If(e)
+                    | CCondition::IfLet { expr: e, .. }
+                    | CCondition::Let { expr: e, .. } => {
                         cexpr_referenced_vars(e, vars);
                     }
                 }
@@ -425,13 +427,13 @@ fn body_item_all_vars(item: &CBodyItem, vars: &mut FxHashSet<VarId>) {
             }
             cexpr_referenced_vars(&g.expr, vars);
         }
-        CBodyItem::Condition(cond) => {
-            match cond {
-                CCondition::If(e) | CCondition::IfLet { expr: e, .. } | CCondition::Let { expr: e, .. } => {
-                    cexpr_referenced_vars(e, vars);
-                }
+        CBodyItem::Condition(cond) => match cond {
+            CCondition::If(e)
+            | CCondition::IfLet { expr: e, .. }
+            | CCondition::Let { expr: e, .. } => {
+                cexpr_referenced_vars(e, vars);
             }
-        }
+        },
         CBodyItem::Aggregation(a) => {
             for &id in &a.bound_vars {
                 vars.insert(id);
@@ -648,24 +650,37 @@ fn compile_expr_inner(expr: &IrExpr, interner: &VarInterner) -> CExpr {
             end: Box::new(compile_expr_inner(end, interner)),
             inclusive: *inclusive,
         },
-        IrExpr::Tuple(elems) => {
-            CExpr::Tuple(elems.iter().map(|e| compile_expr_inner(e, interner)).collect())
-        }
+        IrExpr::Tuple(elems) => CExpr::Tuple(
+            elems
+                .iter()
+                .map(|e| compile_expr_inner(e, interner))
+                .collect(),
+        ),
         IrExpr::Call(name, args) => {
-            let args: Vec<CExpr> = args.iter().map(|a| compile_expr_inner(a, interner)).collect();
+            let args: Vec<CExpr> = args
+                .iter()
+                .map(|a| compile_expr_inner(a, interner))
+                .collect();
             CExpr::Call(name.clone(), args)
         }
         IrExpr::MethodCall(receiver, method, args) => {
             let receiver = compile_expr_inner(receiver, interner);
-            let args: Vec<CExpr> = args.iter().map(|a| compile_expr_inner(a, interner)).collect();
+            let args: Vec<CExpr> = args
+                .iter()
+                .map(|a| compile_expr_inner(a, interner))
+                .collect();
             CExpr::MethodCall(Box::new(receiver), method.clone(), args)
         }
-        IrExpr::Cast(inner, target) => {
-            CExpr::Cast(Box::new(compile_expr_inner(inner, interner)), target.clone())
-        }
-        IrExpr::Array(elems) => {
-            CExpr::Array(elems.iter().map(|e| compile_expr_inner(e, interner)).collect())
-        }
+        IrExpr::Cast(inner, target) => CExpr::Cast(
+            Box::new(compile_expr_inner(inner, interner)),
+            target.clone(),
+        ),
+        IrExpr::Array(elems) => CExpr::Array(
+            elems
+                .iter()
+                .map(|e| compile_expr_inner(e, interner))
+                .collect(),
+        ),
         IrExpr::Raw(raw) => {
             // Re-parse to syn::Expr for Dynamic fallback
             match syn::parse_str::<syn::Expr>(raw) {
@@ -702,7 +717,7 @@ pub(crate) fn ir_lit_to_value(lit: &IrLit) -> Value {
                     Value::I128(*n)
                 }
             }
-        }
+        },
         IrLit::Float(f) => Value::F64(crate::eval::value::OrderedFloat(*f)),
         IrLit::Bool(b) => Value::Bool(*b),
         IrLit::Char(c) => Value::Char(*c),

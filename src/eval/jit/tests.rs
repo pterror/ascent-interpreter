@@ -333,9 +333,9 @@ fn test_packed_jit_condition_comparison() {
         &[(
             "r",
             vec![
-                vec![Value::I32(5), Value::I32(3)],  // 5 > 3: included
-                vec![Value::I32(1), Value::I32(2)],  // 1 > 2: excluded
-                vec![Value::I32(4), Value::I32(4)],  // 4 > 4: excluded
+                vec![Value::I32(5), Value::I32(3)], // 5 > 3: included
+                vec![Value::I32(1), Value::I32(2)], // 1 > 2: excluded
+                vec![Value::I32(4), Value::I32(4)], // 4 > 4: excluded
             ],
         )],
         "s",
@@ -355,9 +355,9 @@ fn test_packed_jit_literal_clause_arg() {
         &[(
             "edge",
             vec![
-                vec![Value::I32(0), Value::I32(10)],  // matches literal 0
-                vec![Value::I32(1), Value::I32(20)],  // doesn't match
-                vec![Value::I32(0), Value::I32(30)],  // matches literal 0
+                vec![Value::I32(0), Value::I32(10)], // matches literal 0
+                vec![Value::I32(1), Value::I32(20)], // doesn't match
+                vec![Value::I32(0), Value::I32(30)], // matches literal 0
             ],
         )],
         "reachable",
@@ -377,9 +377,9 @@ fn test_packed_jit_arithmetic_condition() {
         &[(
             "r",
             vec![
-                vec![Value::I32(1), Value::I32(2)],  // 1+1==2: included
-                vec![Value::I32(3), Value::I32(4)],  // 3+1==4: included
-                vec![Value::I32(5), Value::I32(7)],  // 5+1!=7: excluded
+                vec![Value::I32(1), Value::I32(2)], // 1+1==2: included
+                vec![Value::I32(3), Value::I32(4)], // 3+1==4: included
+                vec![Value::I32(5), Value::I32(7)], // 5+1!=7: excluded
             ],
         )],
         "s",
@@ -835,10 +835,7 @@ fn test_packed_jit_negation() {
                     vec![Value::I32(5)],
                 ],
             ),
-            (
-                "excluded",
-                vec![vec![Value::I32(2)], vec![Value::I32(4)]],
-            ),
+            ("excluded", vec![vec![Value::I32(2)], vec![Value::I32(4)]]),
         ],
         "filtered",
     );

@@ -5,7 +5,6 @@ use std::fmt;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 use std::sync::{Arc, Mutex};
 
-
 use crate::ir::{BodyItem, Program};
 use petgraph::algo::{condensation, toposort};
 use petgraph::graph::DiGraph;
@@ -295,7 +294,8 @@ pub(crate) struct StratumStage4Runtime {
 #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
 impl std::fmt::Debug for StratumStage4Runtime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StratumStage4Runtime").finish_non_exhaustive()
+        f.debug_struct("StratumStage4Runtime")
+            .finish_non_exhaustive()
     }
 }
 
@@ -400,7 +400,7 @@ impl Engine {
                 Err(e) => {
                     return Err(crate::eval::error::EvalError::Jit(format!(
                         "JIT init failed: {e}"
-                    )))
+                    )));
                 }
             }
         }
@@ -786,8 +786,7 @@ impl Engine {
     /// Ensure the stratification cache is populated.
     fn ensure_stratification(&mut self) {
         if self.stratification.is_none() {
-            self.stratification =
-                Some(Stratification::build(&self.program, &self.var_interner));
+            self.stratification = Some(Stratification::build(&self.program, &self.var_interner));
         }
     }
 
@@ -811,7 +810,9 @@ impl Engine {
             self.relations
                 .entry(name.clone())
                 .or_insert_with(|| Relation::new_auto(arity, rel.is_lattice, &types));
-            self.column_types.entry(name.clone()).or_insert_with(|| types);
+            self.column_types
+                .entry(name.clone())
+                .or_insert_with(|| types);
         }
         self.program = program;
     }
@@ -888,7 +889,12 @@ impl Engine {
     ///
     /// Returns `true` if successful, `false` to fall back to interpreted.
     #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
-    fn try_run_stratum_stage4(&mut self, rules: &[&CRule], scc_key: usize, _rule_indices: &[usize]) -> bool {
+    fn try_run_stratum_stage4(
+        &mut self,
+        rules: &[&CRule],
+        scc_key: usize,
+        _rule_indices: &[usize],
+    ) -> bool {
         if rules.is_empty() {
             return false;
         }
@@ -934,9 +940,15 @@ impl Engine {
                 let program_body_rels: rustc_hash::FxHashSet<&str> = strat
                     .compiled
                     .iter()
-                    .flat_map(|r| r.body.iter().filter_map(|item| {
-                        if let CBodyItem::Clause(c) = item { Some(c.relation.as_str()) } else { None }
-                    }))
+                    .flat_map(|r| {
+                        r.body.iter().filter_map(|item| {
+                            if let CBodyItem::Clause(c) = item {
+                                Some(c.relation.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                    })
                     .collect();
                 for rel_name in &head_rels {
                     if let Some(Relation::Packed(ps)) = self.relations.get_mut(*rel_name) {
@@ -977,31 +989,37 @@ impl Engine {
             use crate::eval::jit::asm_codegen::InternCmp;
             use crate::eval::specialized::PackedType;
             let cmp_addr = crate::eval::jit::packed_helpers::jit_cmp_interned as usize;
-            rules.iter().map(|rule| {
-                let mut vars = FxHashMap::default();
-                for item in &rule.body {
-                    if let CBodyItem::Clause(clause) = item
-                        && let Some(Relation::Packed(ps)) = self.relations.get(&clause.relation)
-                    {
-                        for &(col, var_id) in &clause.fresh_cols {
-                            if col < ps.col_types.len()
-                                && let PackedType::Interned(table) = &ps.col_types[col]
-                            {
-                                let raw: *const dyn crate::eval::value::InternTable =
-                                    std::rc::Rc::as_ptr(table);
-                                let (data, vtable) = unsafe {
-                                    std::mem::transmute::<
-                                        *const dyn crate::eval::value::InternTable,
-                                        (usize, usize),
-                                    >(raw)
-                                };
-                                vars.insert(var_id, (data, vtable));
+            rules
+                .iter()
+                .map(|rule| {
+                    let mut vars = FxHashMap::default();
+                    for item in &rule.body {
+                        if let CBodyItem::Clause(clause) = item
+                            && let Some(Relation::Packed(ps)) = self.relations.get(&clause.relation)
+                        {
+                            for &(col, var_id) in &clause.fresh_cols {
+                                if col < ps.col_types.len()
+                                    && let PackedType::Interned(table) = &ps.col_types[col]
+                                {
+                                    let raw: *const dyn crate::eval::value::InternTable =
+                                        std::rc::Rc::as_ptr(table);
+                                    let (data, vtable) = unsafe {
+                                        std::mem::transmute::<
+                                            *const dyn crate::eval::value::InternTable,
+                                            (usize, usize),
+                                        >(raw)
+                                    };
+                                    vars.insert(var_id, (data, vtable));
+                                }
                             }
                         }
                     }
-                }
-                InternCmp { vars, addr: cmp_addr }
-            }).collect()
+                    InternCmp {
+                        vars,
+                        addr: cmp_addr,
+                    }
+                })
+                .collect()
         };
 
         // Step 1: compile the Stage 4 stratum function (eligibility checked inside)
@@ -1090,9 +1108,7 @@ impl Engine {
                 use crate::eval::relation::Relation;
                 for rule in rules {
                     for head in &rule.heads {
-                        if let Some(Relation::Packed(ps)) =
-                            self.relations.get_mut(&head.relation)
-                        {
+                        if let Some(Relation::Packed(ps)) = self.relations.get_mut(&head.relation) {
                             if let Some(&dedup_hint) =
                                 jit.dedup_cap_hints.get(head.relation.as_str())
                             {
@@ -1132,7 +1148,8 @@ impl Engine {
             // The native fn takes *mut StratumStage4NativeCtx, but StratumStage4Fn
             // is typed as *mut StratumStage4Ctx. Both are opaque pointers at the ABI
             // level; transmute is safe here since we know which ctx the fn expects.
-            type NativeFn = unsafe extern "C" fn(*mut crate::eval::jit::packed_helpers::StratumStage4NativeCtx);
+            type NativeFn =
+                unsafe extern "C" fn(*mut crate::eval::jit::packed_helpers::StratumStage4NativeCtx);
             let native_fn_typed: NativeFn = unsafe { std::mem::transmute(native_fn) };
             unsafe { native_fn_typed(&raw mut *native_runtime.ctx) };
             // Update dedup capacity hints after the native path run.
@@ -1154,7 +1171,9 @@ impl Engine {
     /// preserves the capacity allocation — so `handle.cap` is the peak capacity.
     #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
     fn update_dedup_cap_hints(&self, rules: &[&crate::eval::compiled::CRule]) {
-        let Some(jit_cell) = self.jit.as_ref() else { return };
+        let Some(jit_cell) = self.jit.as_ref() else {
+            return;
+        };
         use crate::eval::relation::Relation;
         let mut hints: Vec<(String, u32, u32)> = Vec::new(); // (name, dedup_cap, tuple_count)
         for rule in rules {
@@ -1188,7 +1207,11 @@ impl Engine {
     ///
     /// Returns `None` if any rule doesn't have all-packed clause or head relations.
     #[cfg(all(feature = "jit", feature = "specialized", target_arch = "x86_64"))]
-    fn build_stratum_stage4_runtime(&mut self, rules: &[&CRule], native_fn_available: bool) -> Option<StratumStage4Runtime> {
+    fn build_stratum_stage4_runtime(
+        &mut self,
+        rules: &[&CRule],
+        native_fn_available: bool,
+    ) -> Option<StratumStage4Runtime> {
         use crate::eval::jit::packed_helpers::{LookupSpec, PackedJitContextV3, StratumStage4Ctx};
         use crate::eval::jit_index::JitLookupHandle;
         use crate::eval::relation::Relation;
@@ -1228,12 +1251,17 @@ impl Engine {
 
         for rule in rules {
             // Clause rel pointers (with parallel name collection for pool refresh).
-            let (mut clause_rel_names_rule, mut clause_rels): (Vec<String>, Vec<*const PackedStorage>) = rule
+            let (mut clause_rel_names_rule, mut clause_rels): (
+                Vec<String>,
+                Vec<*const PackedStorage>,
+            ) = rule
                 .body
                 .iter()
                 .filter_map(|item| match item {
                     CBodyItem::Clause(c) => match self.relations.get(&c.relation)? {
-                        Relation::Packed(p) => Some((c.relation.clone(), p as *const PackedStorage)),
+                        Relation::Packed(p) => {
+                            Some((c.relation.clone(), p as *const PackedStorage))
+                        }
                         Relation::Generic(_) => None,
                     },
                     _ => None,
@@ -1252,12 +1280,15 @@ impl Engine {
 
             // Append negation relation pointers after clause rels.
             // The asm backend accesses these as rels[clause_count + neg_i].
-            let not_count_expected = rule.body.iter()
+            let not_count_expected = rule
+                .body
+                .iter()
                 .filter(|i| matches!(i, CBodyItem::Aggregation(a) if a.aggregator_name == "not"))
                 .count();
             for item in &rule.body {
                 if let CBodyItem::Aggregation(a) = item
-                    && a.aggregator_name == "not" {
+                    && a.aggregator_name == "not"
+                {
                     match self.relations.get(&a.relation) {
                         Some(Relation::Packed(p)) => {
                             clause_rels.push(p as *const PackedStorage);
@@ -1273,12 +1304,15 @@ impl Engine {
 
             // Append real aggregation relation pointers after negation rels.
             // The asm backend accesses these as rels[clause_count + not_count + agg_i].
-            let agg_count_expected = rule.body.iter()
+            let agg_count_expected = rule
+                .body
+                .iter()
                 .filter(|i| matches!(i, CBodyItem::Aggregation(a) if a.aggregator_name != "not"))
                 .count();
             for item in &rule.body {
                 if let CBodyItem::Aggregation(a) = item
-                    && a.aggregator_name != "not" {
+                    && a.aggregator_name != "not"
+                {
                     match self.relations.get(&a.relation) {
                         Some(Relation::Packed(p)) => {
                             clause_rels.push(p as *const PackedStorage);
@@ -1297,9 +1331,10 @@ impl Engine {
                 .heads
                 .iter()
                 .filter_map(|head| match self.relations.get(&head.relation)? {
-                    Relation::Packed(p) => {
-                        Some((head.relation.clone(), p as *const PackedStorage as *mut PackedStorage))
-                    }
+                    Relation::Packed(p) => Some((
+                        head.relation.clone(),
+                        p as *const PackedStorage as *mut PackedStorage,
+                    )),
                     Relation::Generic(_) => None,
                 })
                 .unzip();
@@ -1383,8 +1418,7 @@ impl Engine {
                 jit_rels: std::ptr::null(), // fixed up below
             });
 
-            rule_ctx_ptrs_vec
-                .push(&*ctx as *const PackedJitContextV3 as *mut PackedJitContextV3);
+            rule_ctx_ptrs_vec.push(&*ctx as *const PackedJitContextV3 as *mut PackedJitContextV3);
 
             per_rule_clause_rels.push(clause_rels_box);
             per_rule_head_rels.push(head_rels_box);
@@ -1408,7 +1442,10 @@ impl Engine {
             .relations
             .iter()
             .filter_map(|(name, rel)| match rel {
-                Relation::Packed(p) => Some((name.clone(), p as *const PackedStorage as *mut PackedStorage)),
+                Relation::Packed(p) => Some((
+                    name.clone(),
+                    p as *const PackedStorage as *mut PackedStorage,
+                )),
                 Relation::Generic(_) => None,
             })
             .unzip();
@@ -1487,7 +1524,9 @@ impl Engine {
         use crate::eval::jit_index::JitLookupHandle;
         use crate::eval::relation::Relation;
 
-        let Some(info) = rt.refresh_info.as_ref() else { return false; };
+        let Some(info) = rt.refresh_info.as_ref() else {
+            return false;
+        };
 
         // 1. Update _all_rels
         for (slot, name) in rt._all_rels.iter_mut().zip(info.all_rel_names.iter()) {
@@ -1500,7 +1539,11 @@ impl Engine {
         // stage4_ctx.all_rels already points into _all_rels (Box didn't move). ✓
 
         // 2. Update _lookup_specs.rel
-        for (spec, name) in rt._lookup_specs.iter_mut().zip(info.lookup_spec_rel_names.iter()) {
+        for (spec, name) in rt
+            ._lookup_specs
+            .iter_mut()
+            .zip(info.lookup_spec_rel_names.iter())
+        {
             if let Some(Relation::Packed(ps)) = self.relations.get(name.as_str()) {
                 spec.rel = ps as *const _;
             } else {
@@ -1511,7 +1554,10 @@ impl Engine {
         // 3. Update _per_rule_clause_rels and _per_rule_head_rels and _per_rule_dedup_handles
         for rule_i in 0..rt._per_rule_clause_rels.len() {
             let clause_names = &info.clause_rel_names[rule_i];
-            for (slot, name) in rt._per_rule_clause_rels[rule_i].iter_mut().zip(clause_names.iter()) {
+            for (slot, name) in rt._per_rule_clause_rels[rule_i]
+                .iter_mut()
+                .zip(clause_names.iter())
+            {
                 if let Some(Relation::Packed(ps)) = self.relations.get(name.as_str()) {
                     *slot = ps as *const _;
                 } else {
@@ -1521,7 +1567,10 @@ impl Engine {
             // ctx.rels already points into clause_rels_box (Box didn't move). ✓
 
             let head_names = &info.head_rel_names[rule_i];
-            for (slot, name) in rt._per_rule_head_rels[rule_i].iter_mut().zip(head_names.iter()) {
+            for (slot, name) in rt._per_rule_head_rels[rule_i]
+                .iter_mut()
+                .zip(head_names.iter())
+            {
                 if let Some(Relation::Packed(ps)) = self.relations.get(name.as_str()) {
                     *slot = ps as *const _ as *mut _;
                 } else {
@@ -1626,10 +1675,16 @@ impl Engine {
             let all_rels: Vec<String> = rules
                 .iter()
                 .flat_map(|r| {
-                    r.body.iter().filter_map(|item| {
-                        if let CBodyItem::Clause(c) = item { Some(c.relation.clone()) } else { None }
-                    })
-                    .chain(r.heads.iter().map(|h| h.relation.clone()))
+                    r.body
+                        .iter()
+                        .filter_map(|item| {
+                            if let CBodyItem::Clause(c) = item {
+                                Some(c.relation.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .chain(r.heads.iter().map(|h| h.relation.clone()))
                 })
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
@@ -1728,12 +1783,12 @@ impl Engine {
             }
         }
 
-        let mut scan_rels_vec:        Vec<*mut JitRelData>   = Vec::new();
-        let mut total_rels_vec:       Vec<*mut JitRelData>   = Vec::new();
-        let mut head_rels_vec:        Vec<*mut JitRelData>   = Vec::new();
-        let mut head_total_rels_vec:  Vec<*mut JitRelData>   = Vec::new();
-        let mut scan_specs_vec:       Vec<NativeScanSpec>    = Vec::new();
-        let mut head_specs_vec:       Vec<NativeHeadSpec>    = Vec::new();
+        let mut scan_rels_vec: Vec<*mut JitRelData> = Vec::new();
+        let mut total_rels_vec: Vec<*mut JitRelData> = Vec::new();
+        let mut head_rels_vec: Vec<*mut JitRelData> = Vec::new();
+        let mut head_total_rels_vec: Vec<*mut JitRelData> = Vec::new();
+        let mut scan_specs_vec: Vec<NativeScanSpec> = Vec::new();
+        let mut head_specs_vec: Vec<NativeHeadSpec> = Vec::new();
 
         for rule in rules {
             // Collect clause packed relations in order.
@@ -1758,13 +1813,21 @@ impl Engine {
                 let total_ptr = native.total.as_ref() as *const JitRelData as *mut JitRelData;
                 scan_rels_vec.push(total_ptr);
                 total_rels_vec.push(total_ptr);
-                scan_specs_vec.push(NativeScanSpec { rel: ps_ptr, use_recent: 0, _pad: 0 });
+                scan_specs_vec.push(NativeScanSpec {
+                    rel: ps_ptr,
+                    use_recent: 0,
+                    _pad: 0,
+                });
 
                 // use_recent = 1 (recent scan)
                 let recent_ptr = native.recent.as_ref() as *const JitRelData as *mut JitRelData;
                 scan_rels_vec.push(recent_ptr);
                 total_rels_vec.push(total_ptr);
-                scan_specs_vec.push(NativeScanSpec { rel: ps_ptr, use_recent: 1, _pad: 0 });
+                scan_specs_vec.push(NativeScanSpec {
+                    rel: ps_ptr,
+                    use_recent: 1,
+                    _pad: 0,
+                });
             }
 
             // Collect head packed relations.
@@ -1775,7 +1838,7 @@ impl Engine {
                 };
                 let native = ps.jit_native.as_ref()?;
                 let ps_ptr = ps as *const PackedStorage as *mut PackedStorage;
-                let new_ptr   = native.new.as_ref()   as *const JitRelData as *mut JitRelData;
+                let new_ptr = native.new.as_ref() as *const JitRelData as *mut JitRelData;
                 let total_ptr = native.total.as_ref() as *const JitRelData as *mut JitRelData;
                 head_rels_vec.push(new_ptr);
                 head_total_rels_vec.push(total_ptr);
@@ -1807,39 +1870,40 @@ impl Engine {
         let n_head_rels = head_rels_vec.len() as u32;
         let n_advance_rels = advance_rels_vec.len() as u32;
 
-        let mut scan_rels_buf:         Box<[*mut JitRelData]>    = scan_rels_vec.into_boxed_slice();
-        let mut total_rels_buf:        Box<[*mut JitRelData]>    = total_rels_vec.into_boxed_slice();
-        let mut head_rels_buf:         Box<[*mut JitRelData]>    = head_rels_vec.into_boxed_slice();
-        let mut head_total_rels_buf:   Box<[*mut JitRelData]>    = head_total_rels_vec.into_boxed_slice();
-        let     advance_rels_buf:      Box<[*mut PackedStorage]> = advance_rels_vec.into_boxed_slice();
-        let     scan_specs_buf:        Box<[NativeScanSpec]>     = scan_specs_vec.into_boxed_slice();
-        let     head_specs_buf:        Box<[NativeHeadSpec]>     = head_specs_vec.into_boxed_slice();
+        let mut scan_rels_buf: Box<[*mut JitRelData]> = scan_rels_vec.into_boxed_slice();
+        let mut total_rels_buf: Box<[*mut JitRelData]> = total_rels_vec.into_boxed_slice();
+        let mut head_rels_buf: Box<[*mut JitRelData]> = head_rels_vec.into_boxed_slice();
+        let mut head_total_rels_buf: Box<[*mut JitRelData]> =
+            head_total_rels_vec.into_boxed_slice();
+        let advance_rels_buf: Box<[*mut PackedStorage]> = advance_rels_vec.into_boxed_slice();
+        let scan_specs_buf: Box<[NativeScanSpec]> = scan_specs_vec.into_boxed_slice();
+        let head_specs_buf: Box<[NativeHeadSpec]> = head_specs_vec.into_boxed_slice();
 
         let ctx = Box::new(StratumStage4NativeCtx {
-            scan_rels:        scan_rels_buf.as_mut_ptr(),
-            total_rels:       total_rels_buf.as_mut_ptr(),
+            scan_rels: scan_rels_buf.as_mut_ptr(),
+            total_rels: total_rels_buf.as_mut_ptr(),
             n_scan_rels,
             _pad0: 0,
-            head_rels:        head_rels_buf.as_mut_ptr(),
+            head_rels: head_rels_buf.as_mut_ptr(),
             n_head_rels,
             _pad1: 0,
-            advance_rels:     advance_rels_buf.as_ptr(),
+            advance_rels: advance_rels_buf.as_ptr(),
             n_advance_rels,
             _pad2: 0,
-            head_total_rels:  head_total_rels_buf.as_mut_ptr(),
-            scan_specs:       scan_specs_buf.as_ptr(),
-            head_specs:       head_specs_buf.as_ptr(),
+            head_total_rels: head_total_rels_buf.as_mut_ptr(),
+            scan_specs: scan_specs_buf.as_ptr(),
+            head_specs: head_specs_buf.as_ptr(),
         });
 
         Some(StratumStage4NativeRuntime {
             ctx,
-            _scan_rels_buf:       scan_rels_buf,
-            _total_rels_buf:      total_rels_buf,
-            _head_rels_buf:       head_rels_buf,
+            _scan_rels_buf: scan_rels_buf,
+            _total_rels_buf: total_rels_buf,
+            _head_rels_buf: head_rels_buf,
             _head_total_rels_buf: head_total_rels_buf,
-            _advance_rels_buf:    advance_rels_buf,
-            _scan_specs_buf:      scan_specs_buf,
-            _head_specs_buf:      head_specs_buf,
+            _advance_rels_buf: advance_rels_buf,
+            _scan_specs_buf: scan_specs_buf,
+            _head_specs_buf: head_specs_buf,
         })
     }
 
@@ -1966,7 +2030,6 @@ impl Engine {
     /// Uses recursive body processing with undo log to avoid materializing
     /// intermediate `Vec<Bindings>` between body items.
     fn derive_tuples<'a>(&self, rule: &'a CRule, use_recent: bool) -> Vec<(&'a str, Tuple)> {
-
         let mut results = Vec::new();
         let mut binding = Bindings::new(self.var_count);
         let mut undo = UndoLog::new();
@@ -2579,10 +2642,7 @@ impl Engine {
         if let Some(flat) = self.collect_agg_flat_vars(agg, binding) {
             let stride = agg.bound_vars.len().max(1);
             _flat_storage = flat;
-            agg_results = apply_aggregator(
-                &agg.aggregator_name,
-                _flat_storage.chunks(stride),
-            );
+            agg_results = apply_aggregator(&agg.aggregator_name, _flat_storage.chunks(stride));
         } else {
             _flat_storage = Vec::new();
             let mut collected: Vec<Vec<Value>> = Vec::new();
@@ -2634,10 +2694,8 @@ impl Engine {
                 }
             }
 
-            agg_results = apply_aggregator(
-                &agg.aggregator_name,
-                collected.iter().map(|v| v.as_slice()),
-            );
+            agg_results =
+                apply_aggregator(&agg.aggregator_name, collected.iter().map(|v| v.as_slice()));
         }
 
         // Apply aggregator and recurse for each result
@@ -2690,7 +2748,9 @@ impl Engine {
             .args
             .iter()
             .map(|arg| {
-                let CAggArg::Var(var_id) = arg else { unreachable!() };
+                let CAggArg::Var(var_id) = arg else {
+                    unreachable!()
+                };
                 if let Some(val) = binding.get(var_id) {
                     ColPlan::Filter(val.clone())
                 } else if let Some(pos) = agg.bound_vars.iter().position(|v| v == var_id) {
@@ -3818,14 +3878,18 @@ mod tests {
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
 
-        engine.insert(
-            "point",
-            vec![Value::I32(1), Value::custom(Point { x: 10, y: 20 })],
-        ).unwrap();
-        engine.insert(
-            "point",
-            vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })],
-        ).unwrap();
+        engine
+            .insert(
+                "point",
+                vec![Value::I32(1), Value::custom(Point { x: 10, y: 20 })],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "point",
+                vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })],
+            )
+            .unwrap();
         engine.run().unwrap();
 
         let hp = engine.relation("has_point").unwrap();
@@ -3933,14 +3997,18 @@ mod tests {
         let mut engine = Engine::new(program);
         register_point(&mut engine);
 
-        engine.insert(
-            "data",
-            vec![Value::I32(1), Value::custom(Point { x: 10, y: 20 })],
-        ).unwrap();
-        engine.insert(
-            "data",
-            vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })],
-        ).unwrap();
+        engine
+            .insert(
+                "data",
+                vec![Value::I32(1), Value::custom(Point { x: 10, y: 20 })],
+            )
+            .unwrap();
+        engine
+            .insert(
+                "data",
+                vec![Value::I32(2), Value::custom(Point { x: 30, y: 40 })],
+            )
+            .unwrap();
         engine.run().unwrap();
 
         let coords = engine.relation("coords").unwrap();
@@ -3964,10 +4032,12 @@ mod tests {
         let mut engine = Engine::new(program);
         register_point(&mut engine);
 
-        engine.insert(
-            "data",
-            vec![Value::I32(1), Value::custom(Point { x: 5, y: 15 })],
-        ).unwrap();
+        engine
+            .insert(
+                "data",
+                vec![Value::I32(1), Value::custom(Point { x: 5, y: 15 })],
+            )
+            .unwrap();
         engine.run().unwrap();
 
         let coords = engine.relation("coords").unwrap();
@@ -3990,10 +4060,12 @@ mod tests {
         let mut engine = Engine::new(program);
         register_point(&mut engine);
 
-        engine.insert(
-            "data",
-            vec![Value::I32(1), Value::custom(Point { x: 7, y: 99 })],
-        ).unwrap();
+        engine
+            .insert(
+                "data",
+                vec![Value::I32(1), Value::custom(Point { x: 7, y: 99 })],
+            )
+            .unwrap();
         engine.run().unwrap();
 
         let x_only = engine.relation("x_only").unwrap();
@@ -4017,7 +4089,9 @@ mod tests {
         register_point(&mut engine);
 
         // Insert a plain i32 instead of a Point — should not match
-        engine.insert("data", vec![Value::I32(1), Value::I32(42)]).unwrap();
+        engine
+            .insert("data", vec![Value::I32(1), Value::I32(42)])
+            .unwrap();
         engine.run().unwrap();
 
         let coords = engine.relation("coords").unwrap();
@@ -4109,11 +4183,12 @@ mod tests {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
-        engine.insert("edge", vec![Value::I32(1), Value::I32(2)]).unwrap();
+        engine
+            .insert("edge", vec![Value::I32(1), Value::I32(2)])
+            .unwrap();
         engine.run().unwrap();
 
-        let rederived =
-            engine.run_incremental(&[], &[]).unwrap();
+        let rederived = engine.run_incremental(&[], &[]).unwrap();
         assert!(rederived.is_empty());
         // path should still have its data
         assert_eq!(engine.relation("path").unwrap().len(), 1);
@@ -4234,13 +4309,19 @@ mod tests {
         let ast: AscentProgram = syn::parse_str(input).unwrap();
         let program = Program::from_ast(ast).expect("lowering should succeed");
         let mut engine = Engine::new(program);
-        engine.insert("edge", vec![Value::I32(1), Value::I32(2)]).unwrap();
-        engine.insert("edge", vec![Value::I32(2), Value::I32(3)]).unwrap();
+        engine
+            .insert("edge", vec![Value::I32(1), Value::I32(2)])
+            .unwrap();
+        engine
+            .insert("edge", vec![Value::I32(2), Value::I32(3)])
+            .unwrap();
         engine.run().unwrap();
         assert_eq!(engine.relation("path").unwrap().len(), 3); // (1,2), (2,3), (1,3)
 
         // Add a new edge — old paths should be preserved, new ones derived
-        engine.insert("edge", vec![Value::I32(3), Value::I32(4)]).unwrap();
+        engine
+            .insert("edge", vec![Value::I32(3), Value::I32(4)])
+            .unwrap();
         engine.run_incremental(&["edge"], &[]).unwrap();
 
         let path = engine.relation("path").unwrap();
@@ -4385,8 +4466,8 @@ mod tests {
 #[allow(unused_must_use)]
 mod jit_hot_tests {
     use super::*;
-    use crate::syntax::AscentProgram;
     use crate::ir::Program;
+    use crate::syntax::AscentProgram;
 
     fn run_shared_jit(source: &str) {
         let ast: AscentProgram = syn::parse_str(source).unwrap();
@@ -4405,7 +4486,9 @@ mod jit_hot_tests {
     #[test]
     fn tc_shared_jit() {
         let mut source = String::from("relation edge(i32,i32);\nrelation path(i32,i32);\n");
-        for i in 1..10 { source.push_str(&format!("edge({},{});\n", i, i+1)); }
+        for i in 1..10 {
+            source.push_str(&format!("edge({},{});\n", i, i + 1));
+        }
         source.push_str("path(x,y) <-- edge(x,y);\npath(x,z) <-- edge(x,y),path(y,z);\n");
         run_shared_jit(&source);
     }
@@ -4431,7 +4514,9 @@ mod jit_hot_tests {
             let mut engine = Engine::new(program.clone());
             engine.set_jit_compiler(jit.clone());
             for i in 1..n {
-                engine.insert("edge", vec![Value::I32(i), Value::I32(i + 1)]).unwrap();
+                engine
+                    .insert("edge", vec![Value::I32(i), Value::I32(i + 1)])
+                    .unwrap();
             }
             engine.run().unwrap();
             let rel = engine.relation("path").unwrap();
@@ -4443,7 +4528,6 @@ mod jit_hot_tests {
             );
         }
     }
-
 }
 
 /// Return Stage 4 runtimes to the JIT pool when an engine is dropped.

@@ -159,13 +159,9 @@ fn eval_binary(
         syn::BinOp::Eq(_) => Some(Value::Bool(left == right)),
         syn::BinOp::Ne(_) => Some(Value::Bool(left != right)),
         syn::BinOp::Lt(_) => left.try_cmp(&right).map(|o| Value::Bool(o.is_lt())),
-        syn::BinOp::Le(_) => left
-            .try_cmp(&right)
-            .map(|o| Value::Bool(!o.is_gt())),
+        syn::BinOp::Le(_) => left.try_cmp(&right).map(|o| Value::Bool(!o.is_gt())),
         syn::BinOp::Gt(_) => left.try_cmp(&right).map(|o| Value::Bool(o.is_gt())),
-        syn::BinOp::Ge(_) => left
-            .try_cmp(&right)
-            .map(|o| Value::Bool(!o.is_lt())),
+        syn::BinOp::Ge(_) => left.try_cmp(&right).map(|o| Value::Bool(!o.is_lt())),
         syn::BinOp::BitAnd(_) => left.bitand(&right),
         syn::BinOp::BitOr(_) => left.bitor(&right),
         syn::BinOp::BitXor(_) => left.bitxor(&right),

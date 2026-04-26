@@ -48,8 +48,8 @@ fn run_file(path: &str) {
 }
 
 fn eval_source(source: &str) -> Result<Engine, ascent_interpreter::eval::EvalError> {
-    let ast: AscentProgram =
-        syn::parse_str(source).map_err(|e| ascent_interpreter::eval::EvalError::Parse(e.to_string()))?;
+    let ast: AscentProgram = syn::parse_str(source)
+        .map_err(|e| ascent_interpreter::eval::EvalError::Parse(e.to_string()))?;
     let program = Program::from_ast(ast).map_err(ascent_interpreter::eval::EvalError::Lowering)?;
     let mut engine = Engine::new(program);
     engine.run()?;
@@ -285,10 +285,7 @@ fn repl() {
                     eprintln!("evaluation error: {e}");
                 }
                 source = candidate;
-                show_changes(
-                    engine.as_mut().unwrap(),
-                    &mut prev_counts,
-                );
+                show_changes(engine.as_mut().unwrap(), &mut prev_counts);
             }
             Err(e) => eprintln!("error: {e}"),
         }

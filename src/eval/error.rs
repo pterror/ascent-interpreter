@@ -61,7 +61,10 @@ impl fmt::Display for EvalError {
                 relation,
                 expected,
                 got,
-            } => write!(f, "arity mismatch for {relation}: expected {expected}, got {got}"),
+            } => write!(
+                f,
+                "arity mismatch for {relation}: expected {expected}, got {got}"
+            ),
             Self::UnknownAggregator(name) => write!(f, "unknown aggregator: {name}"),
             Self::IterationLimitExceeded { limit } => {
                 write!(f, "fixpoint iteration limit exceeded ({limit})")

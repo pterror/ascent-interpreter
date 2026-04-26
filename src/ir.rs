@@ -276,9 +276,7 @@ pub fn lower_pattern(pat: syn::Pat) -> IrPattern {
             if name == "_" {
                 return IrPattern::Wild;
             }
-            let sub = ident
-                .subpat
-                .map(|(_, sub)| Box::new(lower_pattern(*sub)));
+            let sub = ident.subpat.map(|(_, sub)| Box::new(lower_pattern(*sub)));
             IrPattern::Var(name, sub)
         }
         syn::Pat::Lit(lit) => {

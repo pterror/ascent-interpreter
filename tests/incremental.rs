@@ -48,12 +48,16 @@ fn additive_facts() {
     "#;
     let program = parse(src);
     let mut engine = Engine::new(program);
-    engine.insert("edge", vec![Value::I32(1), Value::I32(2)]).unwrap();
+    engine
+        .insert("edge", vec![Value::I32(1), Value::I32(2)])
+        .unwrap();
     engine.run().unwrap();
     assert_eq!(collect_rel(&engine, "path").len(), 1); // (1,2)
 
     // Add a new fact and re-run.
-    engine.insert("edge", vec![Value::I32(2), Value::I32(3)]).unwrap();
+    engine
+        .insert("edge", vec![Value::I32(2), Value::I32(3)])
+        .unwrap();
     engine.run().unwrap();
     assert_eq!(collect_rel(&engine, "path").len(), 3); // (1,2), (2,3), (1,3)
 }
@@ -146,9 +150,15 @@ fn source_insert_and_retract() {
     let s1 = engine.intern_source("file_a");
     let s2 = engine.intern_source("file_b");
 
-    engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s1).unwrap();
-    engine.insert_with_source("edge", vec![Value::I32(3), Value::I32(4)], s2).unwrap();
-    engine.insert_with_source("edge", vec![Value::I32(5), Value::I32(6)], s1).unwrap();
+    engine
+        .insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s1)
+        .unwrap();
+    engine
+        .insert_with_source("edge", vec![Value::I32(3), Value::I32(4)], s2)
+        .unwrap();
+    engine
+        .insert_with_source("edge", vec![Value::I32(5), Value::I32(6)], s1)
+        .unwrap();
     assert_eq!(engine.relation("edge").unwrap().len(), 3);
 
     // Retract source s1 — should remove 2 tuples, leave 1
@@ -176,8 +186,12 @@ fn source_retract_and_rederive() {
     let s2 = engine.intern_source("file_b");
 
     // file_a contributes edge(1,2), file_b contributes edge(2,3)
-    engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s1).unwrap();
-    engine.insert_with_source("edge", vec![Value::I32(2), Value::I32(3)], s2).unwrap();
+    engine
+        .insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s1)
+        .unwrap();
+    engine
+        .insert_with_source("edge", vec![Value::I32(2), Value::I32(3)], s2)
+        .unwrap();
     engine.run().unwrap();
 
     assert_eq!(collect_rel(&engine, "path").len(), 3); // (1,2), (2,3), (1,3)
@@ -249,7 +263,9 @@ fn source_derived_facts_stay_anonymous() {
     let mut engine = Engine::new(program);
 
     let s = engine.intern_source("my_file");
-    engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s).unwrap();
+    engine
+        .insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s)
+        .unwrap();
     engine.set_source(s);
     engine.run().unwrap();
 
@@ -274,10 +290,18 @@ fn source_multiple_sources_independent() {
     let b = engine.intern_source("b");
     let c = engine.intern_source("c");
 
-    engine.insert_with_source("fact", vec![Value::I32(1)], a).unwrap();
-    engine.insert_with_source("fact", vec![Value::I32(2)], b).unwrap();
-    engine.insert_with_source("fact", vec![Value::I32(3)], c).unwrap();
-    engine.insert_with_source("fact", vec![Value::I32(4)], a).unwrap();
+    engine
+        .insert_with_source("fact", vec![Value::I32(1)], a)
+        .unwrap();
+    engine
+        .insert_with_source("fact", vec![Value::I32(2)], b)
+        .unwrap();
+    engine
+        .insert_with_source("fact", vec![Value::I32(3)], c)
+        .unwrap();
+    engine
+        .insert_with_source("fact", vec![Value::I32(4)], a)
+        .unwrap();
 
     assert_eq!(engine.relation("fact").unwrap().len(), 4);
 
@@ -302,14 +326,18 @@ fn source_retract_then_reinsert() {
     let mut engine = Engine::new(program);
 
     let s = engine.intern_source("file");
-    engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s).unwrap();
+    engine
+        .insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s)
+        .unwrap();
     assert_eq!(engine.relation("edge").unwrap().len(), 1);
 
     // Retract and re-insert the same fact
     engine.retract_source(s);
     assert_eq!(engine.relation("edge").unwrap().len(), 0);
 
-    engine.insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s).unwrap();
+    engine
+        .insert_with_source("edge", vec![Value::I32(1), Value::I32(2)], s)
+        .unwrap();
     assert_eq!(engine.relation("edge").unwrap().len(), 1);
 }
 
@@ -325,7 +353,9 @@ fn source_untagged_facts_survive_retraction() {
 
     // Mix tagged and untagged inserts
     engine.insert("node", vec![Value::I32(1)]).unwrap(); // anonymous
-    engine.insert_with_source("node", vec![Value::I32(2)], s).unwrap(); // tagged
+    engine
+        .insert_with_source("node", vec![Value::I32(2)], s)
+        .unwrap(); // tagged
     engine.insert("node", vec![Value::I32(3)]).unwrap(); // anonymous
 
     assert_eq!(engine.relation("node").unwrap().len(), 3);
@@ -350,11 +380,21 @@ fn source_batch_retract() {
     let b = engine.intern_source("b");
     let c = engine.intern_source("c");
 
-    engine.insert_with_source("fact", vec![Value::I32(1)], a).unwrap();
-    engine.insert_with_source("fact", vec![Value::I32(2)], b).unwrap();
-    engine.insert_with_source("fact", vec![Value::I32(3)], c).unwrap();
-    engine.insert_with_source("fact", vec![Value::I32(4)], a).unwrap();
-    engine.insert_with_source("fact", vec![Value::I32(5)], b).unwrap();
+    engine
+        .insert_with_source("fact", vec![Value::I32(1)], a)
+        .unwrap();
+    engine
+        .insert_with_source("fact", vec![Value::I32(2)], b)
+        .unwrap();
+    engine
+        .insert_with_source("fact", vec![Value::I32(3)], c)
+        .unwrap();
+    engine
+        .insert_with_source("fact", vec![Value::I32(4)], a)
+        .unwrap();
+    engine
+        .insert_with_source("fact", vec![Value::I32(5)], b)
+        .unwrap();
     assert_eq!(engine.relation("fact").unwrap().len(), 5);
 
     // Retract a and b in one pass — single rebuild per relation

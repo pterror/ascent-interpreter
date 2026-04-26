@@ -36,8 +36,8 @@
 pub mod aggregators;
 mod bytecode;
 mod compiled;
-pub mod error;
 mod engine;
+pub mod error;
 pub mod expr;
 pub mod intern;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -51,9 +51,9 @@ pub mod serde_bridge;
 mod specialized;
 pub mod value;
 
-pub use error::EvalError;
-pub use engine::{Engine, TypeRegistry, ValueDestructor};
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub use engine::SharedJitCompiler;
+pub use engine::{Engine, TypeRegistry, ValueDestructor};
+pub use error::EvalError;
 pub use relation::{Relation, SourceId};
 pub use value::{DynValue, OrderedFloat, Tuple, Value};

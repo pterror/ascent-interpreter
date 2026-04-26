@@ -51,12 +51,16 @@ impl StringTable {
 
     /// Resolve a u32 id back to its `&'static str`. Panics on invalid id.
     pub fn resolve(&self, id: u32) -> &'static str {
-        self.to_val.borrow().get(id as usize).copied().unwrap_or_else(|| {
-            panic!(
-                "invalid intern id {id}: StringTable contains {} entries",
-                self.to_val.borrow().len()
-            )
-        })
+        self.to_val
+            .borrow()
+            .get(id as usize)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "invalid intern id {id}: StringTable contains {} entries",
+                    self.to_val.borrow().len()
+                )
+            })
     }
 }
 

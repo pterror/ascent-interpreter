@@ -21,11 +21,11 @@
 //! assert_eq!(program.rules.len(), 2);
 //! ```
 
+mod ast;
 pub mod desugar;
 mod syn_utils;
-mod ast;
 mod utils;
 
-pub use syn_utils::*;
 pub use ast::*;
+pub use syn_utils::*;
 pub use utils::{expr_to_ident, is_wildcard, pat_to_ident};

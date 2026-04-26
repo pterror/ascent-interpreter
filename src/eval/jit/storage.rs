@@ -10,7 +10,7 @@
 // Not all storage types/methods are used yet — dead_code allowed intentionally.
 #![allow(dead_code)]
 
-use std::alloc::{alloc_zeroed, dealloc, realloc, Layout};
+use std::alloc::{Layout, alloc_zeroed, dealloc, realloc};
 use std::ptr;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -95,7 +95,6 @@ fn next_pow2_min16(n: usize) -> usize {
     }
     cap
 }
-
 
 // ─── JitColIndex ────────────────────────────────────────────────────────────
 
@@ -275,7 +274,13 @@ impl JitColIndex {
             ptr::copy_nonoverlapping(self.ranges, ranges, cap);
             ptr::copy_nonoverlapping(self.vals, vals, n_vals.max(1));
         }
-        Box::new(JitColIndex { keys, ranges, vals, mask: self.mask, len: self.len })
+        Box::new(JitColIndex {
+            keys,
+            ranges,
+            vals,
+            mask: self.mask,
+            len: self.len,
+        })
     }
 }
 
@@ -547,11 +552,20 @@ impl JitRelData {
     /// Use this for `recent` buffers that are only iterated over, never probed as a
     /// membership set (the JIT only probes `total.tuple_set` for head dedup, not
     /// `recent.tuple_set`).
-    pub fn build_from_packed_no_tupleset(data: &[u32], arity: usize, build_indices: bool) -> Box<Self> {
+    pub fn build_from_packed_no_tupleset(
+        data: &[u32],
+        arity: usize,
+        build_indices: bool,
+    ) -> Box<Self> {
         Self::build_from_packed_impl(data, arity, build_indices, false)
     }
 
-    fn build_from_packed_impl(data: &[u32], arity: usize, build_indices: bool, build_tuple_set: bool) -> Box<Self> {
+    fn build_from_packed_impl(
+        data: &[u32],
+        arity: usize,
+        build_indices: bool,
+        build_tuple_set: bool,
+    ) -> Box<Self> {
         let n_tuples = if arity == 0 { 0 } else { data.len() / arity };
 
         // ── data array ───────────────────────────────────────────────────
@@ -587,8 +601,7 @@ impl JitRelData {
         let ptr_bytes = arity * std::mem::size_of::<*mut JitColIndex>();
         let col_indices_ptr: *mut *mut JitColIndex = if arity > 0 {
             // Allocate as bytes via a u8 layout for exact sizing.
-            let layout =
-                Layout::array::<*mut JitColIndex>(arity).expect("layout overflow");
+            let layout = Layout::array::<*mut JitColIndex>(arity).expect("layout overflow");
             let raw = unsafe { alloc_zeroed(layout) } as *mut *mut JitColIndex;
             assert!(!raw.is_null(), "allocation failed");
             if build_indices {
@@ -724,7 +737,8 @@ impl JitRelData {
     /// owned by a `JitDedupTable` that outlives `self`.
     pub unsafe fn alias_tuple_set(&mut self, entries: *mut u32, mask: u64) {
         // Free any previously owned tuple_set allocation.
-        if !self.tuple_set.slots.is_null() && self.tuple_set.mask > 0
+        if !self.tuple_set.slots.is_null()
+            && self.tuple_set.mask > 0
             && self._ts_slots_words != usize::MAX
         {
             unsafe { free_u32_slice(self.tuple_set.slots, self._ts_slots_words) };
@@ -768,8 +782,8 @@ impl JitRelData {
             while new_cap < new_len {
                 new_cap *= 2;
             }
-            let old_layout = Layout::array::<u32>((self.cap as usize) * arity_max1)
-                .expect("layout overflow");
+            let old_layout =
+                Layout::array::<u32>((self.cap as usize) * arity_max1).expect("layout overflow");
             let new_ptr = unsafe {
                 realloc(
                     self.data as *mut u8,
@@ -777,7 +791,10 @@ impl JitRelData {
                     new_cap * arity_max1 * std::mem::size_of::<u32>(),
                 ) as *mut u32
             };
-            assert!(!new_ptr.is_null(), "extend_and_rebuild_indices: realloc failed");
+            assert!(
+                !new_ptr.is_null(),
+                "extend_and_rebuild_indices: realloc failed"
+            );
             // Zero-initialize newly added region.
             unsafe {
                 std::ptr::write_bytes(
@@ -820,9 +837,8 @@ impl JitRelData {
                 let slots = self.tuple_set.slots;
                 let mask = self.tuple_set.mask;
                 for i in old_len..new_len {
-                    let tuple = unsafe {
-                        std::slice::from_raw_parts(self.data.add(i * arity), arity)
-                    };
+                    let tuple =
+                        unsafe { std::slice::from_raw_parts(self.data.add(i * arity), arity) };
                     unsafe { jit_tuple_set_insert_unchecked(slots, mask, tuple) };
                 }
                 self.tuple_set.len = new_len as u64;
@@ -841,9 +857,8 @@ impl JitRelData {
                 self.tuple_set.len = 0;
                 // Reinsert all new_len tuples into the fresh set.
                 for i in 0..new_len {
-                    let tuple = unsafe {
-                        std::slice::from_raw_parts(self.data.add(i * arity), arity)
-                    };
+                    let tuple =
+                        unsafe { std::slice::from_raw_parts(self.data.add(i * arity), arity) };
                     unsafe { jit_tuple_set_insert_unchecked(new_slots, mask, tuple) };
                 }
                 self.tuple_set.len = new_len as u64;
@@ -855,8 +870,7 @@ impl JitRelData {
         }
 
         // Rebuild all column indices from the full extended data.
-        let full_slice =
-            unsafe { std::slice::from_raw_parts(self.data, new_len * arity) };
+        let full_slice = unsafe { std::slice::from_raw_parts(self.data, new_len * arity) };
         let col_indices_ptr = self.col_indices;
         for col in 0..arity {
             // Drop old index.
@@ -898,7 +912,8 @@ impl Drop for JitRelData {
 
         // Free tuple_set slots (only if owned — not an alias into jit_dedup).
         // _ts_slots_words == usize::MAX is the sentinel meaning "aliased, do not free".
-        if !self.tuple_set.slots.is_null() && self.tuple_set.mask > 0
+        if !self.tuple_set.slots.is_null()
+            && self.tuple_set.mask > 0
             && self._ts_slots_words != usize::MAX
         {
             let stride = arity + 1;
@@ -974,7 +989,8 @@ pub(crate) unsafe fn clone_jit_rel_data_with_indices(
         && arity > 0
         && !src.tuple_set.slots.is_null()
         && src.tuple_set.mask > 0
-        && src._ts_slots_words != usize::MAX // not aliased
+        && src._ts_slots_words != usize::MAX
+    // not aliased
     {
         let stride = arity + 1;
         let cap = (src.tuple_set.mask + 1) as usize;
@@ -987,9 +1003,7 @@ pub(crate) unsafe fn clone_jit_rel_data_with_indices(
     };
 
     // ── col_indices ──────────────────────────────────────────────────────────
-    let col_indices_ptr: *mut *mut JitColIndex = if arity > 0
-        && !src.col_indices.is_null()
-    {
+    let col_indices_ptr: *mut *mut JitColIndex = if arity > 0 && !src.col_indices.is_null() {
         let layout = Layout::array::<*mut JitColIndex>(arity).expect("layout overflow");
         let raw = unsafe { alloc_zeroed(layout) } as *mut *mut JitColIndex;
         assert!(!raw.is_null(), "allocation failed");
@@ -1012,7 +1026,11 @@ pub(crate) unsafe fn clone_jit_rel_data_with_indices(
         len: src.len,
         cap: data_cap as u64,
         col_indices: col_indices_ptr,
-        tuple_set: JitTupleSet { slots: ts_slots, mask: ts_mask, len: ts_len },
+        tuple_set: JitTupleSet {
+            slots: ts_slots,
+            mask: ts_mask,
+            len: ts_len,
+        },
         arity: src.arity,
         _pad: 0,
         _ts_slots_words: ts_slots_words,
@@ -1086,9 +1104,8 @@ pub unsafe extern "C" fn jit_rel_data_grow(rel: *mut JitRelData) {
     let old_layout = Layout::array::<u32>(old_words).expect("layout overflow");
     let new_layout = Layout::array::<u32>(new_words).expect("layout overflow");
 
-    let new_ptr = unsafe {
-        realloc(rel.data as *mut u8, old_layout, new_layout.size()) as *mut u32
-    };
+    let new_ptr =
+        unsafe { realloc(rel.data as *mut u8, old_layout, new_layout.size()) as *mut u32 };
     assert!(!new_ptr.is_null(), "jit_rel_data_grow: allocation failed");
 
     // Zero-initialise the newly added region so stale bytes are not visible.

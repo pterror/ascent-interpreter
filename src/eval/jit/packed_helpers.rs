@@ -69,8 +69,11 @@ pub unsafe extern "C" fn jit_cmp_interned(
     data_ptr: usize,
     vtable_ptr: usize,
 ) -> i32 {
-    let table: &dyn crate::eval::value::InternTable =
-        unsafe { &*std::mem::transmute::<(usize, usize), *const dyn crate::eval::value::InternTable>((data_ptr, vtable_ptr)) };
+    let table: &dyn crate::eval::value::InternTable = unsafe {
+        &*std::mem::transmute::<(usize, usize), *const dyn crate::eval::value::InternTable>((
+            data_ptr, vtable_ptr,
+        ))
+    };
     match table.cmp_ids(id_a, id_b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -214,7 +217,9 @@ pub unsafe extern "C" fn packed_agg_count(rel: *const PackedStorage) -> u32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn packed_agg_sum_i32(rel: *const PackedStorage, col: u32) -> i64 {
     let rel = unsafe { &*rel };
-    if rel.count == 0 { return AGG_EMPTY; }
+    if rel.count == 0 {
+        return AGG_EMPTY;
+    }
     let col = col as usize;
     let arity = rel.arity;
     let mut acc: i64 = 0;
@@ -232,13 +237,17 @@ pub unsafe extern "C" fn packed_agg_sum_i32(rel: *const PackedStorage, col: u32)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn packed_agg_max_i32(rel: *const PackedStorage, col: u32) -> i64 {
     let rel = unsafe { &*rel };
-    if rel.count == 0 { return AGG_EMPTY; }
+    if rel.count == 0 {
+        return AGG_EMPTY;
+    }
     let col = col as usize;
     let arity = rel.arity;
     let mut best = rel.packed_data[col] as i32;
     for i in 1..rel.count {
         let v = rel.packed_data[i * arity + col] as i32;
-        if v > best { best = v; }
+        if v > best {
+            best = v;
+        }
     }
     best as i64
 }
@@ -251,13 +260,17 @@ pub unsafe extern "C" fn packed_agg_max_i32(rel: *const PackedStorage, col: u32)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn packed_agg_min_i32(rel: *const PackedStorage, col: u32) -> i64 {
     let rel = unsafe { &*rel };
-    if rel.count == 0 { return AGG_EMPTY; }
+    if rel.count == 0 {
+        return AGG_EMPTY;
+    }
     let col = col as usize;
     let arity = rel.arity;
     let mut best = rel.packed_data[col] as i32;
     for i in 1..rel.count {
         let v = rel.packed_data[i * arity + col] as i32;
-        if v < best { best = v; }
+        if v < best {
+            best = v;
+        }
     }
     best as i64
 }
@@ -684,26 +697,26 @@ unsafe impl Sync for NativeHeadSpec {}
 pub struct StratumStage4NativeCtx {
     /// Mutable flat array: `scan_rels[rule_handle_start + clause_i * 2 + use_recent]`
     /// = `*mut JitRelData` to scan. Refreshed by `jit_advance_native` each iteration.
-    pub scan_rels: *mut *mut JitRelData,      // @ 0
+    pub scan_rels: *mut *mut JitRelData, // @ 0
     /// Parallel to scan_rels: total-version `JitRelData` for existence probes.
-    pub total_rels: *mut *mut JitRelData,     // @ 8
+    pub total_rels: *mut *mut JitRelData, // @ 8
     /// Number of entries in scan_rels / total_rels.
-    pub n_scan_rels: u32,                     // @ 16
-    pub _pad0: u32,                           // @ 20
+    pub n_scan_rels: u32, // @ 16
+    pub _pad0: u32, // @ 20
     /// Mutable flat array: `head_rels[rule_head_start + head_i]` = `*mut JitRelData` to write.
     /// Refreshed by `jit_advance_native` each iteration.
-    pub head_rels: *mut *mut JitRelData,      // @ 24
+    pub head_rels: *mut *mut JitRelData, // @ 24
     /// Total number of head slots.
-    pub n_head_rels: u32,                     // @ 32
-    pub _pad1: u32,                           // @ 36
+    pub n_head_rels: u32, // @ 32
+    pub _pad1: u32, // @ 36
     /// All relations for advance: `advance_rels[i]` = `*mut PackedStorage`.
     pub advance_rels: *const *mut PackedStorage, // @ 40
-    pub n_advance_rels: u32,                  // @ 48
-    pub _pad2: u32,                           // @ 52
+    pub n_advance_rels: u32, // @ 48
+    pub _pad2: u32, // @ 52
     /// Parallel to head_rels: total-version `*mut JitRelData` for cross-iteration dedup.
     /// `head_total_rels[i]` = the total JitRelData for the same relation as `head_rels[i]`.
     /// Refreshed by `jit_advance_native` each iteration.
-    pub head_total_rels: *mut *mut JitRelData,  // @ 56
+    pub head_total_rels: *mut *mut JitRelData, // @ 56
     // ── private: not JIT-visible ────────────────────────────────────────────
     /// Parallel to scan_rels / total_rels: tells `jit_advance_native` which
     /// `PackedStorage` and `use_recent` flag maps to each slot so the buffer
@@ -741,13 +754,13 @@ const _: () = {
 pub struct StratumStage4NativeRuntime {
     pub ctx: Box<StratumStage4NativeCtx>,
     // Keep all the Boxes alive so pointers remain valid:
-    pub(crate) _scan_rels_buf:        Box<[*mut JitRelData]>,
-    pub(crate) _total_rels_buf:       Box<[*mut JitRelData]>,
-    pub(crate) _head_rels_buf:        Box<[*mut JitRelData]>,
-    pub(crate) _head_total_rels_buf:  Box<[*mut JitRelData]>,
-    pub(crate) _advance_rels_buf:     Box<[*mut PackedStorage]>,
-    pub(crate) _scan_specs_buf:       Box<[NativeScanSpec]>,
-    pub(crate) _head_specs_buf:       Box<[NativeHeadSpec]>,
+    pub(crate) _scan_rels_buf: Box<[*mut JitRelData]>,
+    pub(crate) _total_rels_buf: Box<[*mut JitRelData]>,
+    pub(crate) _head_rels_buf: Box<[*mut JitRelData]>,
+    pub(crate) _head_total_rels_buf: Box<[*mut JitRelData]>,
+    pub(crate) _advance_rels_buf: Box<[*mut PackedStorage]>,
+    pub(crate) _scan_specs_buf: Box<[NativeScanSpec]>,
+    pub(crate) _head_specs_buf: Box<[NativeHeadSpec]>,
 }
 
 /// Called from JIT once per fixpoint iteration.
@@ -810,7 +823,7 @@ pub unsafe extern "C" fn jit_advance_native(ctx: *mut StratumStage4NativeCtx) ->
     for (i, spec) in head_specs.iter().enumerate() {
         let ps = unsafe { &*spec.rel };
         if let Some(native) = ps.jit_native.as_ref() {
-            let new_ptr   = native.new.as_ref()   as *const JitRelData as *mut JitRelData;
+            let new_ptr = native.new.as_ref() as *const JitRelData as *mut JitRelData;
             let total_ptr = native.total.as_ref() as *const JitRelData as *mut JitRelData;
             unsafe { *ctx.head_rels.add(i) = new_ptr };
             unsafe { *ctx.head_total_rels.add(i) = total_ptr };
