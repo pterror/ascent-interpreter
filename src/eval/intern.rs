@@ -1,69 +1,70 @@
-//! String interning via a global `StringTable`.
+//! String interning via a global, thread-safe `StringTable`.
 //!
 //! `Value::Interned(Arc<dyn InternTable>, u32)` is the universal representation
 //! for interned values. Strings use this module's `StringTable`; other types
 //! use `specialized::HashInternTable`.
+//!
+//! The global `StringTable` is shared across all threads. A single `Mutex`
+//! guards both the `to_id` map and `to_val` vector together so that
+//! `intern()` is atomic: no TOCTOU window exists between computing a new id
+//! and inserting it.
 
 use std::cmp::Ordering;
 use std::fmt;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rustc_hash::FxHashMap;
 
 use crate::eval::value::{InternTable, Value};
 
+struct StringTableInner {
+    to_id: FxHashMap<&'static str, u32>,
+    to_val: Vec<&'static str>,
+}
+
 /// Global intern table for strings.
 ///
 /// Uses `Box::leak` for zero-copy `&'static str` resolution. All threads share
 /// one table so `Value::Interned` ids are consistent across thread boundaries.
+/// A single `Mutex` over both fields ensures `intern()` is atomic.
 ///
 /// **Memory lifecycle:** Interned strings are intentionally leaked and never freed.
 pub struct StringTable {
-    to_id: RwLock<FxHashMap<&'static str, u32>>,
-    to_val: RwLock<Vec<&'static str>>,
+    inner: Mutex<StringTableInner>,
 }
 
 impl StringTable {
     fn new() -> Self {
         Self {
-            to_id: RwLock::new(FxHashMap::default()),
-            to_val: RwLock::new(Vec::new()),
+            inner: Mutex::new(StringTableInner {
+                to_id: FxHashMap::default(),
+                to_val: Vec::new(),
+            }),
         }
     }
 
     /// Intern a string and return its u32 id.
     pub fn intern(&self, s: &str) -> u32 {
-        // Fast path: already interned
-        if let Some(&id) = self.to_id.read().unwrap().get(s) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(&id) = g.to_id.get(s) {
             return id;
         }
-        // Slow path: acquire write locks and insert
         let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-        let mut id_guard = self.to_id.write().unwrap();
-        // Re-check under write lock (another thread may have won the race)
-        if let Some(&id) = id_guard.get(leaked) {
-            return id;
-        }
-        let mut val_guard = self.to_val.write().unwrap();
-        let id = val_guard.len() as u32;
-        val_guard.push(leaked);
-        id_guard.insert(leaked, id);
+        let id = g.to_val.len() as u32;
+        g.to_val.push(leaked);
+        g.to_id.insert(leaked, id);
         id
     }
 
     /// Resolve a u32 id back to its `&'static str`. Panics on invalid id.
     pub fn resolve(&self, id: u32) -> &'static str {
-        self.to_val
-            .read()
-            .unwrap()
-            .get(id as usize)
-            .copied()
-            .unwrap_or_else(|| {
-                panic!(
-                    "invalid intern id {id}: StringTable contains {} entries",
-                    self.to_val.read().unwrap().len()
-                )
-            })
+        let g = self.inner.lock().unwrap();
+        *g.to_val.get(id as usize).unwrap_or_else(|| {
+            panic!(
+                "invalid intern id {id}: StringTable contains {} entries",
+                g.to_val.len()
+            )
+        })
     }
 }
 

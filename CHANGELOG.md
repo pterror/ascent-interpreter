@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-26
+
+### Fixed
+
+- Fix race condition in `StringTable::intern()` — two separate `RwLock`s for `to_id` and `to_val` allowed a TOCTOU window between computing a new ID and inserting it; replaced with a single `Mutex<StringTableInner>`.
+
 ## [0.2.0] - 2026-04-26
 
 ### Added
