@@ -1002,7 +1002,7 @@ impl Engine {
                                     && let PackedType::Interned(table) = &ps.col_types[col]
                                 {
                                     let raw: *const dyn crate::eval::value::InternTable =
-                                        std::rc::Rc::as_ptr(table);
+                                        std::sync::Arc::as_ptr(table);
                                     let (data, vtable) = unsafe {
                                         std::mem::transmute::<
                                             *const dyn crate::eval::value::InternTable,

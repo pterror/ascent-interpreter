@@ -6,10 +6,9 @@
 //! faster hashing and comparison, while a parallel `Vec<Value>` buffer
 //! maintains compatibility with the generic evaluation loop.
 
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
-use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 
 use hashbrown::HashTable;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -28,8 +27,8 @@ use crate::eval::value::{InternTable, Tuple, Value};
 #[allow(dead_code)]
 pub struct HashInternTable {
     filter: fn(&Value) -> bool,
-    to_id: RefCell<FxHashMap<Value, u32>>,
-    to_val: RefCell<Vec<Value>>,
+    to_id: RwLock<FxHashMap<Value, u32>>,
+    to_val: RwLock<Vec<Value>>,
 }
 
 #[allow(dead_code)]
@@ -38,8 +37,8 @@ impl HashInternTable {
     pub fn new(filter: fn(&Value) -> bool) -> Self {
         Self {
             filter,
-            to_id: RefCell::new(FxHashMap::default()),
-            to_val: RefCell::new(Vec::new()),
+            to_id: RwLock::new(FxHashMap::default()),
+            to_val: RwLock::new(Vec::new()),
         }
     }
 }
@@ -49,25 +48,31 @@ impl InternTable for HashInternTable {
         if !(self.filter)(val) {
             return None;
         }
-        if let Some(&id) = self.to_id.borrow().get(val) {
+        if let Some(&id) = self.to_id.read().unwrap().get(val) {
             return Some(id);
         }
-        let id = self.to_val.borrow().len() as u32;
-        self.to_val.borrow_mut().push(val.clone());
-        self.to_id.borrow_mut().insert(val.clone(), id);
+        let mut id_guard = self.to_id.write().unwrap();
+        // Re-check under write lock
+        if let Some(&id) = id_guard.get(val) {
+            return Some(id);
+        }
+        let mut val_guard = self.to_val.write().unwrap();
+        let id = val_guard.len() as u32;
+        val_guard.push(val.clone());
+        id_guard.insert(val.clone(), id);
         Some(id)
     }
 
     fn fmt_display(&self, id: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", &self.to_val.borrow()[id as usize])
+        write!(f, "{}", &self.to_val.read().unwrap()[id as usize])
     }
 
     fn fmt_debug(&self, id: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", &self.to_val.borrow()[id as usize])
+        write!(f, "{:?}", &self.to_val.read().unwrap()[id as usize])
     }
 
     fn cmp_ids(&self, a: u32, b: u32) -> Ordering {
-        let vals = self.to_val.borrow();
+        let vals = self.to_val.read().unwrap();
         vals[a as usize]
             .try_cmp(&vals[b as usize])
             .unwrap_or(Ordering::Equal)
@@ -82,7 +87,7 @@ pub enum PackedType {
     Bool,
     /// Any type backed by an intern table.
     /// Strings use `intern::StringTable`; other types use `HashInternTable`.
-    Interned(Rc<dyn InternTable>),
+    Interned(Arc<dyn InternTable>),
 }
 
 impl std::fmt::Debug for PackedType {

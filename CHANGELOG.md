@@ -1,6 +1,8 @@
 # Changelog
 
-## [0.2.0-alpha.1] - 2026-04-26
+## [Unreleased]
+
+## [0.2.0] - 2026-04-26
 
 ### Added
 
@@ -34,6 +36,7 @@
 
 ### Fixed
 
+- **Thread-safety of `StringTable`** — replaced `thread_local! { Rc<StringTable> }` with a global `OnceLock<Arc<StringTable>>` and `RwLock<>` internals. `Value::Interned` now carries `Arc<dyn InternTable>` instead of `Rc<dyn InternTable>`, making values `Send + Sync`. Fixes panic "invalid intern id N: StringTable contains M entries" when interned values created on one tokio worker thread are resolved on another. `HashInternTable` likewise upgraded from `RefCell` to `RwLock`.
 - Multi-rule stratum SIGSEGV in native JIT when EDB relations are shared across rules.
 - Ordering comparisons on interned columns now use a `jit_cmp_interned` trampoline (raw u32 ID comparison gave wrong results for `Lt`/`Le`/`Gt`/`Ge`).
 - Fully-bound existence check paths now emit `clause.conditions` (previously dropped conditions merged by `optimize_body` Phase 2, silently breaking `if a < b` guards).

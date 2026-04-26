@@ -35,7 +35,7 @@ use std::any::Any;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Intern table for packing/unpacking values to/from u32 identifiers.
 ///
@@ -43,7 +43,7 @@ use std::rc::Rc;
 /// [`crate::eval::specialized::HashInternTable`] for arbitrary `Hash + Eq` types.
 /// Values that carry their own intern id (i.e. `Value::Interned`) use the
 /// table for display, comparison, and packed-storage round-trips.
-pub trait InternTable {
+pub trait InternTable: Send + Sync {
     /// Pack a `Value` to its u32 id. Returns `None` on type mismatch.
     fn pack(&self, val: &Value) -> Option<u32>;
     /// Write the display representation of the value with the given id.
@@ -168,9 +168,9 @@ pub enum Value {
     ///
     /// **Users should not match on this variant directly.** Use accessor
     /// methods like [`Value::as_str`] or [`Value::type_name`] instead.
-    Interned(Rc<dyn InternTable>, u32),
+    Interned(Arc<dyn InternTable>, u32),
     /// Tuple of values.
-    Tuple(Rc<Vec<Value>>),
+    Tuple(Arc<Vec<Value>>),
     /// Option type.
     Option(Option<Box<Value>>),
     /// Dual lattice wrapper (reverses ordering for lattice join).
@@ -300,7 +300,7 @@ impl PartialEq for Value {
             (Value::F64(a), Value::F64(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Interned(t1, id1), Value::Interned(t2, id2)) => {
-                Rc::ptr_eq(t1, t2) && id1 == id2
+                Arc::ptr_eq(t1, t2) && id1 == id2
             }
             (Value::Tuple(a), Value::Tuple(b)) => a == b,
             (Value::Option(a), Value::Option(b)) => a == b,
@@ -337,7 +337,7 @@ impl Hash for Value {
             Value::Interned(table, id) => {
                 // Mix in the table's identity (data pointer) so values from
                 // different tables with the same id don't collide.
-                (Rc::as_ptr(table) as *const () as usize).hash(state);
+                (Arc::as_ptr(table) as *const () as usize).hash(state);
                 id.hash(state);
             }
             Value::Tuple(v) => v.hash(state),
@@ -430,7 +430,7 @@ pub type Tuple = Vec<Value>;
 impl Value {
     /// Create a tuple value.
     pub fn tuple(values: Vec<Value>) -> Self {
-        Value::Tuple(Rc::new(values))
+        Value::Tuple(Arc::new(values))
     }
 
     /// Create a custom value from any type implementing the required traits.
@@ -744,12 +744,12 @@ impl Value {
             (Value::F64(a), Value::F64(b)) => Some(a.cmp(b)),
             (Value::Char(a), Value::Char(b)) => Some(a.cmp(b)),
             (Value::Interned(t1, a), Value::Interned(t2, b)) => {
-                if Rc::ptr_eq(t1, t2) {
+                if Arc::ptr_eq(t1, t2) {
                     Some(t1.cmp_ids(*a, *b))
                 } else {
                     // Cross-table: stable but arbitrary ordering by table address.
-                    let p1 = Rc::as_ptr(t1) as *const () as usize;
-                    let p2 = Rc::as_ptr(t2) as *const () as usize;
+                    let p1 = Arc::as_ptr(t1) as *const () as usize;
+                    let p2 = Arc::as_ptr(t2) as *const () as usize;
                     Some(p1.cmp(&p2).then(a.cmp(b)))
                 }
             }
