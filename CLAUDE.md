@@ -8,7 +8,24 @@ Interpreter and JIT compiler for [Ascent](https://github.com/s-arash/ascent) Dat
 
 ## Architecture
 
-<!-- Project-specific architecture notes -->
+- Single-crate layout. Modules: `syntax/` (parse + desugar, `derive-syn-parse` + `syn`), `ir.rs` + `ir/` (lowered IR), `eval/` (semi-naive engine + expression evaluator), `main.rs` (REPL/CLI).
+- Negation lowers directly to a `not` `Aggregation` in IR (`src/ir.rs` around `BodyItemNode::Negation`) — not via `::ascent::aggregators::not`.
+- Stratification: simple 2-stratum (base rules → aggregation rules) handles common cases; full SCC-based stratification is needed for the general case. Aggregation gating must check both `Clause` and `Aggregation` body items.
+- `syn::parse_str::<AscentProgram>(input)` works outside proc-macro context — that is how the interpreter front-ends the macro grammar.
+- `#[peek_with(...)]` from `derive-syn-parse` requires standalone `fn`s, not closures.
+- `PackedType::Interned(table)` (see `src/eval/specialized.rs`) hashes through an `InternTable` at pack time. String is just `Interned(string_table())` — there is no separate zero-cost `String` variant.
+
+## Publishing
+
+- Only the `ascent-interpreter` crate is published. The `ascent` namespace is not ours; do not try to publish `ascent-syntax`/`ascent-ir`/`ascent-eval` as separate crates. The binary is named `interpreter` (see `[[bin]]` in `Cargo.toml`).
+
+## REPL Contract
+
+- REPL prompts, status, errors, and `:command` feedback go to **stderr**. Relation/data output goes to **stdout**. This lets `ascent-interpreter foo.ascent | …` pipe cleanly. Preserve the split when adding new REPL output.
+
+## Rust Edition
+
+- `gen` is a reserved keyword in Rust 2024. Use `generator` (or another name) for any such identifier.
 
 ## Development
 
