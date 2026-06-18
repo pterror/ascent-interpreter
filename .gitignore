@@ -14,3 +14,8 @@ docs/.vitepress/dist/
 .idea/
 .vscode/
 *.swp
+
+# Normalize
+.normalize/*
+!.normalize/config.toml
+!.normalize/memory/
